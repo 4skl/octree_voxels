@@ -17,12 +17,11 @@ use std::time::Instant;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use glam::{Vec3, Mat4};
-use block_mesh::{greedy_quads, GreedyQuadsBuffer, Voxel, VoxelVisibility, MergeVoxel, RIGHT_HANDED_Y_UP_CONFIG};
+use block_mesh::{visible_block_faces, UnitQuadBuffer, Voxel, VoxelVisibility, MergeVoxel, RIGHT_HANDED_Y_UP_CONFIG};
 use ndshape::{ConstShape, ConstShape3u32};
 use noise::{NoiseFn, Fbm, Perlin};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-// Ajout du padding pour le chunk (32 + 2 = 34) afin d'éviter le "wrapping" des index aux bordures
 type ChunkShape = ConstShape3u32<34, 34, 34>; 
 type ChunkPos = (i32, i32, i32);
 
@@ -136,15 +135,11 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
     }
 
     let mut voxels = vec![Block(0); ChunkShape::SIZE as usize];
-    // Décalage de [1, 1, 1] pour éviter l'out-of-bounds et générer un culling valide via le padding vide
     octree.flatten_into(octree.root_index as usize, 1, 1, 1, 32, &mut voxels);
 
-    let mut buffer = GreedyQuadsBuffer::new(voxels.len());
-    // greedy_quads(min, max) attend un max INCLUSIF et applique lui-même un padding(-1)
-    // interne. Le contenu réel occupe [1..33) dans le chunk 34^3, donc il faut donner
-    // [0..34) pour que toute la zone de contenu soit mouchée (les faces bordures contre
-    // le padding vide sont conservées, ce qui évite d'avoir besoin des chunks voisins).
-    greedy_quads(&voxels, &ChunkShape {}, [0, 0, 0], [33, 33, 33], &RIGHT_HANDED_Y_UP_CONFIG.faces, &mut buffer);
+    let mut buffer = UnitQuadBuffer::new();
+    // Utilisation de visible_block_faces au lieu de greedy_quads pour l'AO per-vertex
+    visible_block_faces(&voxels, &ChunkShape {}, [0, 0, 0], [33, 33, 33], &RIGHT_HANDED_Y_UP_CONFIG.faces, &mut buffer);
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -152,14 +147,14 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
     let offset_y = (chunk_pos.1 * 32) as f32;
     let offset_z = (chunk_pos.2 * 32) as f32;
 
-    for (group, face) in buffer.quads.groups.iter().zip(RIGHT_HANDED_Y_UP_CONFIG.faces.into_iter()) {
+    for (group, face) in buffer.groups.iter().zip(RIGHT_HANDED_Y_UP_CONFIG.faces.into_iter()) {
         let n = face.signed_normal();
         let normal = [n.x as f32, n.y as f32, n.z as f32];
 
         for quad in group.into_iter() {
             let start_index = vertices.len() as u32;
 
-            // 1. On cherche le voxel adjacent du côté positif de la frontière (+1)
+            // Identification du voxel solide
             let pos1 = quad.minimum;
             let mut pos2 = quad.minimum;
             if n.x != 0 { pos2[0] += 1; }
@@ -168,12 +163,21 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
 
             let id1 = voxels[ChunkShape::linearize(pos1) as usize].0;
             let id2 = voxels[ChunkShape::linearize(pos2) as usize].0;
-
-            // Sélection du voxel solide
             let mat_id = if id1 != 0 { id1 } else { id2 };
+            
             let color = match mat_id { 2 => [0.2, 0.7, 0.3], _ => [0.5, 0.5, 0.5] };
+            let generic_quad = block_mesh::UnorientedQuad {
+                minimum: quad.minimum,
+                width: 1,
+                height: 1,
+            };
 
-            for corner in face.quad_mesh_positions(quad, 1.0) {
+            // Utilisez ce nouveau quad pour récupérer les positions
+            for corner in face.quad_mesh_positions(&generic_quad, 1.0) {
+                // Application d'une Occlusion Ambiante directionnelle basique
+                let is_bottom_corner = corner[1] < (quad.minimum[1] as f32 + 0.5);
+                let ao_multiplier = if is_bottom_corner && n.y == 0 { 0.65 } else { 1.0 };
+                
                 vertices.push(Vertex {
                     position: [
                         corner[0] - 1.0 + offset_x, 
@@ -181,11 +185,15 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
                         corner[2] - 1.0 + offset_z
                     ],
                     normal,
-                    color,
+                    color: [
+                        color[0] * ao_multiplier,
+                        color[1] * ao_multiplier,
+                        color[2] * ao_multiplier,
+                    ],
                 });
             }
             
-            // 2. On conserve l'ordre natif CCW sans condition .swap()
+            // L'ordre des indices natifs CCW est conservé sans inversion conditionnelle
             let quad_indices = face.quad_mesh_indices(start_index);
             indices.extend_from_slice(&quad_indices);
         }
@@ -235,7 +243,6 @@ impl ChunkManager {
 
         while let Ok((pos, payload)) = self.rx.try_recv() {
             self.loading_chunks.remove(&pos);
-            // wgpu panics on zero-size buffers — skip chunks with no visible geometry
             if payload.vertices.is_empty() || payload.indices.is_empty() {
                 continue;
             }
@@ -327,14 +334,9 @@ impl State {
             apply_limit_buckets: false,
         }).await.expect("Adaptateur compatible introuvable");
 
-        let info = adapter.get_info();
-        println!("GPU actif : {} ({:?}) via {:?}", info.name, info.device_type, info.backend);
-
         let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.unwrap();
 
-        let mut config = surface.get_default_config(&adapter, size.width, size.height)
-            .expect("La surface n'est pas supportée par cet adaptateur");
-
+        let mut config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
         let surface_caps = surface.get_capabilities(&adapter);
         if surface_caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
@@ -380,7 +382,7 @@ impl State {
             }),
             primitive: wgpu::PrimitiveState { 
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back), // Backface Culling correctement activé
+                cull_mode: Some(wgpu::Face::Back), 
                 ..Default::default() 
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -598,9 +600,6 @@ pub fn main() {
 mod tests {
     use super::*;
 
-    /// Vérifie que pour chaque face, le winding produit par `quad_mesh_indices`
-    /// est CCW vu de l'extérieur (la normale calculée du triangle pointe dans le
-    /// sens de la normale de la face), sinon la face serait éliminée par le culling.
     #[test]
     fn all_faces_are_wound_front_facing() {
         for face in RIGHT_HANDED_Y_UP_CONFIG.faces {
@@ -625,9 +624,6 @@ mod tests {
         }
     }
 
-    /// Vérifie que le mesh couvre TOUT le chunk jusqu'aux bords (position 32) :
-    /// avec l'ancien appel greedy_quads([1,1,1],[32,32,32]), la colonne/rangee 32
-    /// (voxel monde 31) n'etait jamais mouchée, d'ou les vides entre chunks.
     #[test]
     fn mesh_reaches_chunk_boundaries() {
         let payload = generate_chunk((0, 0, 0));
