@@ -25,6 +25,18 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 type ChunkShape = ConstShape3u32<34, 34, 34>; 
 type ChunkPos = (i32, i32, i32);
 
+pub const PALETTE: [(u16, [f32; 3]); 5] = [
+    (1, [0.5, 0.5, 0.5]),    // Pierre (Gris)
+    (2, [0.2, 0.7, 0.3]),    // Herbe (Vert)
+    (3, [0.8, 0.2, 0.2]),    // Brique (Rouge)
+    (4, [0.2, 0.45, 0.85]),  // Eau / Lapis (Bleu)
+    (5, [0.95, 0.75, 0.2]),  // Sable / Or (Jaune)
+];
+
+pub fn material_color(id: u16) -> [f32; 3] {
+    PALETTE.iter().find(|(m, _)| *m == id).map(|(_, c)| *c).unwrap_or([0.5, 0.5, 0.5])
+}
+
 #[derive(PartialEq)]
 pub enum PlayMode { Flying, Real }
 
@@ -160,7 +172,7 @@ fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos) -> MeshPayload {
             let id2 = voxels[ChunkShape::linearize(pos2) as usize].0;
             let mat_id = if id1 != 0 { id1 } else { id2 };
             
-            let color = match mat_id { 2 => [0.2, 0.7, 0.3], 3 => [0.8, 0.2, 0.2], _ => [0.5, 0.5, 0.5] };
+            let color = material_color(mat_id);
             let generic_quad = block_mesh::UnorientedQuad { minimum: quad.minimum, width: 1, height: 1 };
 
             for corner in face.quad_mesh_positions(&generic_quad, 1.0) {
@@ -282,10 +294,10 @@ impl Vertex {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct UIVertex { position: [f32; 2], color: [f32; 3] }
+struct UIVertex { position: [f32; 2], color: [f32; 4] }
 
 impl UIVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<UIVertex>() as wgpu::BufferAddress,
@@ -317,36 +329,140 @@ impl Camera {
 #[derive(Default)]
 struct InputState { forward: bool, backward: bool, left: bool, right: bool, up: bool, down: bool, action_add: bool, action_remove: bool }
 
-fn build_ui_vertices(selected: u16) -> Vec<UIVertex> {
+fn add_quad(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 4]) {
+    verts.extend_from_slice(&[
+        UIVertex { position: [x0, y0], color },
+        UIVertex { position: [x1, y0], color },
+        UIVertex { position: [x1, y1], color },
+        UIVertex { position: [x0, y0], color },
+        UIVertex { position: [x1, y1], color },
+        UIVertex { position: [x0, y1], color },
+    ]);
+}
+
+// Matrice 3x5 pour dessiner du texte sans texture
+fn get_glyph(c: char) -> [u8; 5] {
+    match c {
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
+        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        'M' => [0b101, 0b111, 0b101, 0b101, 0b101],
+        'Q' => [0b010, 0b101, 0b101, 0b110, 0b011],
+        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        _ => [0; 5],
+    }
+}
+
+fn draw_text(verts: &mut Vec<UIVertex>, text: &str, start_x: f32, start_y: f32, pixel_w: f32, pixel_h: f32, color: [f32; 4]) {
+    let mut cursor_x = start_x;
+    for c in text.chars() {
+        let glyph = get_glyph(c);
+        for row in 0..5 {
+            let line = glyph[row];
+            let y1 = start_y + (4 - row) as f32 * pixel_h;
+            let y0 = y1 - pixel_h;
+            for col in 0..3 {
+                if (line & (1 << (2 - col))) != 0 {
+                    let x0 = cursor_x + col as f32 * pixel_w;
+                    let x1 = x0 + pixel_w;
+                    add_quad(verts, x0, y0, x1, y1, color);
+                }
+            }
+        }
+        cursor_x += 4.0 * pixel_w; // 3 pixels + 1 espace
+    }
+}
+
+fn build_ui_vertices(selected: u16, menu_open: bool) -> Vec<UIVertex> {
     let mut verts = Vec::new();
-    let num_slots = 3;
-    let slot_width = 0.1;
-    let slot_spacing = 0.05;
+    let num_slots = PALETTE.len();
+    let slot_width = 0.08;
+    let slot_spacing = 0.02;
     let total_width = num_slots as f32 * slot_width + (num_slots - 1) as f32 * slot_spacing;
     let start_x = -total_width / 2.0;
     let y_bottom = -0.95;
     let y_top = -0.85;
 
-    for i in 0..num_slots {
-        let id = i as u16 + 1;
-        let base_color = match id { 1 => [0.5, 0.5, 0.5], 2 => [0.2, 0.7, 0.3], _ => [0.8, 0.2, 0.2] };
-        
+    // Hotbar
+    for (i, &(id, rgb)) in PALETTE.iter().enumerate() {
         let x0 = start_x + i as f32 * (slot_width + slot_spacing);
         let x1 = x0 + slot_width;
 
         if selected == id {
-            let hl = [1.0, 1.0, 0.0];
-            verts.extend_from_slice(&[
-                UIVertex { position: [x0-0.01, y_bottom-0.01], color: hl }, UIVertex { position: [x1+0.01, y_bottom-0.01], color: hl }, UIVertex { position: [x1+0.01, y_top+0.01], color: hl },
-                UIVertex { position: [x0-0.01, y_bottom-0.01], color: hl }, UIVertex { position: [x1+0.01, y_top+0.01], color: hl }, UIVertex { position: [x0-0.01, y_top+0.01], color: hl },
-            ]);
+            add_quad(&mut verts, x0 - 0.01, y_bottom - 0.01, x1 + 0.01, y_top + 0.01, [1.0, 1.0, 0.0, 1.0]);
+        } else {
+            add_quad(&mut verts, x0 - 0.005, y_bottom - 0.005, x1 + 0.005, y_top + 0.005, [0.2, 0.2, 0.2, 0.8]);
+        }
+        add_quad(&mut verts, x0, y_bottom, x1, y_top, [rgb[0], rgb[1], rgb[2], 1.0]);
+    }
+
+    if !menu_open {
+        // Viseur / Crosshair au centre de l'écran
+        let ch_color = [1.0, 1.0, 1.0, 0.85];
+        let ch_outline = [0.0, 0.0, 0.0, 0.6];
+        
+        // Bordures noires
+        add_quad(&mut verts, -0.016, -0.0035, 0.016, 0.0035, ch_outline);
+        add_quad(&mut verts, -0.0035, -0.026, 0.0035, 0.026, ch_outline);
+        
+        // Barres blanches centrales
+        add_quad(&mut verts, -0.014, -0.002, 0.014, 0.002, ch_color);
+        add_quad(&mut verts, -0.002, -0.024, 0.002, 0.024, ch_color);
+    } else {
+        // Menu Pause
+        add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.0, 0.0, 0.0, 0.65]);
+
+        let px0 = -0.45; let px1 = 0.45;
+        let py0 = -0.35; let py1 = 0.35;
+        add_quad(&mut verts, px0 - 0.008, py0 - 0.008, px1 + 0.008, py1 + 0.008, [0.4, 0.4, 0.45, 1.0]);
+        add_quad(&mut verts, px0, py0, px1, py1, [0.12, 0.12, 0.15, 0.95]);
+
+        // Sélecteur de couleurs
+        let swatch_w = 0.1;
+        let swatch_gap = 0.03;
+        let swatches_total = num_slots as f32 * swatch_w + (num_slots - 1) as f32 * swatch_gap;
+        let s_start_x = -swatches_total / 2.0;
+        let sy0 = 0.1;
+        let sy1 = 0.24;
+
+        for (i, &(id, rgb)) in PALETTE.iter().enumerate() {
+            let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
+            let sx1 = sx0 + swatch_w;
+
+            if selected == id {
+                add_quad(&mut verts, sx0 - 0.012, sy0 - 0.012, sx1 + 0.012, sy1 + 0.012, [1.0, 1.0, 0.2, 1.0]);
+            } else {
+                add_quad(&mut verts, sx0 - 0.006, sy0 - 0.006, sx1 + 0.006, sy1 + 0.006, [0.25, 0.25, 0.3, 1.0]);
+            }
+            add_quad(&mut verts, sx0, sy0, sx1, sy1, [rgb[0], rgb[1], rgb[2], 1.0]);
         }
 
-        verts.extend_from_slice(&[
-            UIVertex { position: [x0, y_bottom], color: base_color }, UIVertex { position: [x1, y_bottom], color: base_color }, UIVertex { position: [x1, y_top], color: base_color },
-            UIVertex { position: [x0, y_bottom], color: base_color }, UIVertex { position: [x1, y_top], color: base_color }, UIVertex { position: [x0, y_top], color: base_color },
-        ]);
+        let font_pw = 0.0055;
+        let font_ph = 0.009;
+
+        // Bouton RESUME
+        let rx0 = -0.25; let rx1 = 0.25;
+        let ry0 = -0.08; let ry1 = 0.02;
+        add_quad(&mut verts, rx0 - 0.005, ry0 - 0.005, rx1 + 0.005, ry1 + 0.005, [0.35, 0.6, 0.4, 1.0]);
+        add_quad(&mut verts, rx0, ry0, rx1, ry1, [0.2, 0.55, 0.3, 1.0]);
+        // Centrage texte "RESUME" (6 lettres)
+        let resume_x = -((6.0 * 4.0 - 1.0) * font_pw) / 2.0;
+        let resume_y = (ry0 + ry1) / 2.0 - (5.0 * font_ph) / 2.0;
+        draw_text(&mut verts, "RESUME", resume_x, resume_y, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        // Bouton QUIT
+        let qx0 = -0.25; let qx1 = 0.25;
+        let qy0 = -0.24; let qy1 = -0.14;
+        add_quad(&mut verts, qx0 - 0.005, qy0 - 0.005, qx1 + 0.005, qy1 + 0.005, [0.6, 0.3, 0.3, 1.0]);
+        add_quad(&mut verts, qx0, qy0, qx1, qy1, [0.5, 0.2, 0.2, 1.0]);
+        // Centrage texte "QUIT" (4 lettres)
+        let quit_x = -((4.0 * 4.0 - 1.0) * font_pw) / 2.0;
+        let quit_y = (qy0 + qy1) / 2.0 - (5.0 * font_ph) / 2.0;
+        draw_text(&mut verts, "QUIT", quit_x, quit_y, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
     }
+
     verts
 }
 
@@ -370,6 +486,8 @@ struct State {
     play_mode: PlayMode,
     velocity: Vec3,
     selected_material: u16,
+    menu_open: bool,
+    cursor_pos: [f32; 2],
 }
 
 impl State {
@@ -415,7 +533,7 @@ impl State {
             multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
 
-        // UI Pipeline
+        // Pipeline UI
         let ui_shader = device.create_shader_module(wgpu::include_wgsl!("ui.wgsl"));
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[], immediate_size: 0 });
         let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -426,11 +544,15 @@ impl State {
             depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
         
-        let initial_ui = build_ui_vertices(1);
+        let initial_ui = build_ui_vertices(1, false);
         let ui_vertices_count = initial_ui.len() as u32;
-        let ui_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("UI Buffer"), contents: bytemuck::cast_slice(&initial_ui), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("UI Buffer"),
+            size: (8192 * std::mem::size_of::<UIVertex>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        queue.write_buffer(&ui_vertex_buffer, 0, bytemuck::cast_slice(&initial_ui));
 
         let mut chunk_manager = ChunkManager::new();
         let octree = generate_octree((0, 0, 0));
@@ -444,11 +566,34 @@ impl State {
             camera_buffer, camera_bind_group, depth_texture_view, camera,
             input: InputState::default(), chunk_manager,
             play_mode: PlayMode::Flying, velocity: Vec3::ZERO, selected_material: 1,
+            menu_open: false, cursor_pos: [0.0, 0.0],
         }
     }
 
+    fn toggle_menu(&mut self) {
+        self.menu_open = !self.menu_open;
+        if self.menu_open {
+            let _ = self.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+            self.window.set_cursor_visible(true);
+            self.input = InputState::default();
+        } else {
+            let _ = self.window.set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                .or_else(|_| self.window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+            self.window.set_cursor_visible(false);
+        }
+        self.update_ui();
+    }
+
+    fn cycle_material(&mut self, step: i32) {
+        let current_idx = PALETTE.iter().position(|(m, _)| *m == self.selected_material).unwrap_or(0) as i32;
+        let len = PALETTE.len() as i32;
+        let new_idx = (current_idx + step).rem_euclid(len) as usize;
+        self.selected_material = PALETTE[new_idx].0;
+        self.update_ui();
+    }
+
     fn update_ui(&mut self) {
-        let verts = build_ui_vertices(self.selected_material);
+        let verts = build_ui_vertices(self.selected_material, self.menu_open);
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
     }
@@ -464,6 +609,10 @@ impl State {
     }
 
     fn update(&mut self, dt: f32) {
+        if self.menu_open {
+            return;
+        }
+
         let speed = 25.0;
         let (sin_y, cos_y) = self.camera.yaw.sin_cos();
         let forward = Vec3::new(cos_y, 0.0, sin_y).normalize();
@@ -607,32 +756,91 @@ impl ApplicationHandler for App {
         if let Some(state) = self.state.as_mut() {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::CursorMoved { position, .. } => {
+                    let ndc_x = (position.x as f32 / state.size.width as f32) * 2.0 - 1.0;
+                    let ndc_y = 1.0 - (position.y as f32 / state.size.height as f32) * 2.0;
+                    state.cursor_pos = [ndc_x, ndc_y];
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let step = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => if y > 0.0 { -1 } else if y < 0.0 { 1 } else { 0 },
+                        MouseScrollDelta::PixelDelta(pos) => if pos.y > 0.0 { -1 } else if pos.y < 0.0 { 1 } else { 0 },
+                    };
+                    if step != 0 {
+                        state.cycle_material(step);
+                    }
+                }
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
                     let is_pressed = key_event.state == ElementState::Pressed;
                     
                     if key_event.physical_key == PhysicalKey::Code(KeyCode::Escape) && is_pressed {
-                        event_loop.exit();
+                        state.toggle_menu();
+                        return;
                     }
 
-                    match key_event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyW) => state.input.forward = is_pressed,
-                        PhysicalKey::Code(KeyCode::KeyS) => state.input.backward = is_pressed,
-                        PhysicalKey::Code(KeyCode::KeyA) => state.input.left = is_pressed,
-                        PhysicalKey::Code(KeyCode::KeyD) => state.input.right = is_pressed,
-                        PhysicalKey::Code(KeyCode::Space) => state.input.up = is_pressed,
-                        PhysicalKey::Code(KeyCode::ShiftLeft) => state.input.down = is_pressed,
-                        PhysicalKey::Code(KeyCode::Digit1) => if is_pressed { state.selected_material = 1; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit2) => if is_pressed { state.selected_material = 2; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit3) => if is_pressed { state.selected_material = 3; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::KeyM) => if is_pressed {
-                            state.play_mode = if state.play_mode == PlayMode::Real { PlayMode::Flying } else { PlayMode::Real };
-                        },
-                        _ => {}
+                    if !state.menu_open {
+                        match key_event.physical_key {
+                            PhysicalKey::Code(KeyCode::KeyW) => state.input.forward = is_pressed,
+                            PhysicalKey::Code(KeyCode::KeyS) => state.input.backward = is_pressed,
+                            PhysicalKey::Code(KeyCode::KeyA) => state.input.left = is_pressed,
+                            PhysicalKey::Code(KeyCode::KeyD) => state.input.right = is_pressed,
+                            PhysicalKey::Code(KeyCode::Space) => state.input.up = is_pressed,
+                            PhysicalKey::Code(KeyCode::ShiftLeft) => state.input.down = is_pressed,
+                            PhysicalKey::Code(KeyCode::Digit1) => if is_pressed { state.selected_material = 1; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit2) => if is_pressed { state.selected_material = 2; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit3) => if is_pressed { state.selected_material = 3; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit4) => if is_pressed { state.selected_material = 4; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit5) => if is_pressed { state.selected_material = 5; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::KeyM) => if is_pressed {
+                                state.play_mode = if state.play_mode == PlayMode::Real { PlayMode::Flying } else { PlayMode::Real };
+                            },
+                            _ => {}
+                        }
                     }
                 }
                 WindowEvent::MouseInput { state: element_state, button, .. } => {
                     if element_state == ElementState::Pressed {
-                        match button { MouseButton::Left => state.input.action_remove = true, MouseButton::Right => state.input.action_add = true, _ => {} }
+                        if state.menu_open {
+                            if button == MouseButton::Left {
+                                let [mx, my] = state.cursor_pos;
+                                let num_slots = PALETTE.len();
+                                let swatch_w = 0.1;
+                                let swatch_gap = 0.03;
+                                let swatches_total = num_slots as f32 * swatch_w + (num_slots - 1) as f32 * swatch_gap;
+                                let s_start_x = -swatches_total / 2.0;
+                                let sy0 = 0.1;
+                                let sy1 = 0.24;
+
+                                // Clic sur un carré de couleur
+                                for (i, &(id, _)) in PALETTE.iter().enumerate() {
+                                    let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
+                                    let sx1 = sx0 + swatch_w;
+                                    if mx >= sx0 && mx <= sx1 && my >= sy0 && my <= sy1 {
+                                        state.selected_material = id;
+                                        state.update_ui();
+                                        return;
+                                    }
+                                }
+
+                                // Clic sur "Reprendre"
+                                if mx >= -0.25 && mx <= 0.25 && my >= -0.08 && my <= 0.02 {
+                                    state.toggle_menu();
+                                    return;
+                                }
+
+                                // Clic sur "Quitter"
+                                if mx >= -0.25 && mx <= 0.25 && my >= -0.24 && my <= -0.14 {
+                                    event_loop.exit();
+                                    return;
+                                }
+                            }
+                        } else {
+                            match button {
+                                MouseButton::Left => state.input.action_remove = true,
+                                MouseButton::Right => state.input.action_add = true,
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 WindowEvent::Resized(size) => { state.resize(size); state.window.request_redraw(); }
@@ -647,9 +855,10 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
         if let Some(state) = self.state.as_mut() {
-            if state.play_mode == PlayMode::Flying || state.play_mode == PlayMode::Real {
+            if !state.menu_open && (state.play_mode == PlayMode::Flying || state.play_mode == PlayMode::Real) {
                 if let DeviceEvent::MouseMotion { delta } = event {
-                    state.camera.yaw += (delta.0 as f32) * 0.002; state.camera.pitch -= (delta.1 as f32) * 0.002;
+                    state.camera.yaw += (delta.0 as f32) * 0.002;
+                    state.camera.pitch -= (delta.1 as f32) * 0.002;
                     state.camera.pitch = state.camera.pitch.clamp(-1.5, 1.5);
                 }
             }
