@@ -68,11 +68,17 @@ impl WorldType {
     }
 }
 
+fn default_ortho_size() -> f32 { 36.0 }
+
 #[derive(Serialize, Deserialize)]
 pub struct SaveData {
     pub player_pos: [f32; 3],
     pub camera_yaw: f32,
     pub camera_pitch: f32,
+    #[serde(default)]
+    pub is_ortho: bool,
+    #[serde(default = "default_ortho_size")]
+    pub ortho_size: f32,
     pub play_mode: PlayMode,
     pub world_type: WorldType,
     pub seed: u32,
@@ -300,11 +306,12 @@ fn generate_octree(
     octree
 }
 
+// Fixed: matches block_mesh vertex corner ordering [min, min+u, min+v, min+u+v]
 const QUAD_UVS: [[f32; 2]; 4] = [
     [0.0, 0.0],
     [1.0, 0.0],
-    [1.0, 1.0],
     [0.0, 1.0],
+    [1.0, 1.0],
 ];
 
 fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos, palette: &[[f32; 3]]) -> MeshPayload {
@@ -601,7 +608,7 @@ impl Vertex {
     const ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
         0 => Float32x3, 
         1 => Float32x3, 
-        2 => Float32x3,
+        2 => Float32x3, 
         3 => Float32x2
     ];
     fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -636,14 +643,27 @@ struct CameraUniform {
     _pad: [f32; 3],
 }
 
-struct Camera { position: Vec3, yaw: f32, pitch: f32 }
+struct Camera { 
+    position: Vec3, 
+    yaw: f32, 
+    pitch: f32,
+    is_ortho: bool,
+    ortho_size: f32,
+}
+
 impl Camera {
     fn view_proj(&self, aspect: f32) -> Mat4 {
         let (sin_p, cos_p) = self.pitch.sin_cos();
         let (sin_y, cos_y) = self.yaw.sin_cos();
         let dir = Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p).normalize();
-        let view = glam::camera::rh::view::look_at_mat4(self.position, self.position + dir, Vec3::Y);
-        let proj = glam::camera::rh::proj::directx::perspective((60.0_f32).to_radians(), aspect, 0.05, 5000.0);
+        let view = Mat4::look_at_rh(self.position, self.position + dir, Vec3::Y);
+        let proj = if self.is_ortho {
+            let half_h = self.ortho_size * 0.5;
+            let half_w = half_h * aspect;
+            Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -2500.0, 5000.0)
+        } else {
+            Mat4::perspective_rh((60.0_f32).to_radians(), aspect, 0.05, 5000.0)
+        };
         proj * view
     }
     fn forward(&self) -> Vec3 {
@@ -681,6 +701,25 @@ fn add_quad(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, color
         UIVertex { position: [x0, y0], color },
         UIVertex { position: [x1, y1], color },
         UIVertex { position: [x0, y1], color },
+    ]);
+}
+
+fn add_line(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, aspect: f32, color: [f32; 4]) {
+    let dx = (x1 - x0) * aspect;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-5 { return; }
+    let half_t = thickness * 0.5;
+    let nx = (-dy / len) * half_t / aspect;
+    let ny = (dx / len) * half_t;
+
+    verts.extend_from_slice(&[
+        UIVertex { position: [x0 - nx, y0 - ny], color },
+        UIVertex { position: [x1 - nx, y1 - ny], color },
+        UIVertex { position: [x1 + nx, y1 + ny], color },
+        UIVertex { position: [x0 - nx, y0 - ny], color },
+        UIVertex { position: [x1 + nx, y1 + ny], color },
+        UIVertex { position: [x0 + nx, y0 + ny], color },
     ]);
 }
 
@@ -729,6 +768,7 @@ fn get_glyph(c: char) -> [u8; 5] {
         '.' => [0b000, 0b000, 0b000, 0b010, 0b010],
         '[' => [0b110, 0b100, 0b100, 0b100, 0b110],
         ']' => [0b011, 0b001, 0b001, 0b001, 0b011],
+        '|' => [0b010, 0b010, 0b010, 0b010, 0b010],
         _ => [0; 5],
     }
 }
@@ -814,6 +854,7 @@ fn build_ui_vertices(
     active_menu: ActiveMenu,
     hotbar_colors: &[[f32; 3]; 10],
     play_mode: PlayMode,
+    is_ortho: bool,
     world_type: WorldType,
     edit_size: u32,
     target_pos: Option<[i32; 3]>,
@@ -852,22 +893,21 @@ fn build_ui_vertices(
         (ax, sx, sy, depth)
     }).collect();
 
-    axes_projected.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
+    axes_projected.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (ax, sx, sy, _) in axes_projected {
+    for (ax, sx, sy, _) in &axes_projected {
         let tip_x = g_cx + (sx * g_rad) / aspect;
         let tip_y = g_cy + (sy * g_rad);
 
         if ax.is_positive {
-            let line_w = 0.002 / aspect;
-            add_quad(&mut verts, g_cx - line_w, g_cy - 0.002, tip_x + line_w, tip_y + 0.002, [ax.color[0], ax.color[1], ax.color[2], 0.75]);
-
+            add_line(&mut verts, g_cx, g_cy, tip_x, tip_y, 0.0045, aspect, [ax.color[0], ax.color[1], ax.color[2], 0.85]);
             let node_r = 0.021;
             let n_rx = node_r / aspect;
             let n_ry = node_r;
             add_quad(&mut verts, tip_x - n_rx, tip_y - n_ry, tip_x + n_rx, tip_y + n_ry, ax.color);
             draw_text_centered(&mut verts, ax.name, tip_x, tip_y, font_pw * 0.85, font_ph * 0.85, [1.0, 1.0, 1.0, 1.0]);
         } else {
+            add_line(&mut verts, g_cx, g_cy, tip_x, tip_y, 0.0025, aspect, [ax.color[0], ax.color[1], ax.color[2], 0.35]);
             let node_r = 0.010;
             let n_rx = node_r / aspect;
             let n_ry = node_r;
@@ -907,11 +947,12 @@ fn build_ui_vertices(
             add_quad(&mut verts, -0.002, -0.020, 0.002, 0.020, [1.0, 1.0, 1.0, 0.95]);
 
             let mode_hud = if play_mode == PlayMode::Flying { "FLY" } else { "REAL" };
-            let hud_title = format!("MODE: {}  |  WORLD: {}  |  OCTREE {}", mode_hud, world_type.name(), size_str);
+            let proj_hud = if is_ortho { "ORTHO" } else { "PERSP" };
+            let hud_title = format!("MODE: {} | PROJ: {} | WORLD: {} | {}", mode_hud, proj_hud, world_type.name(), size_str);
             draw_text(&mut verts, &hud_title, -0.96, 0.92, font_pw, font_ph, [1.0, 1.0, 1.0, 0.95]);
 
             if cursor_free {
-                draw_text(&mut verts, "GIZMO / ORBIT ACTIVE (VOXEL BORDERS ON)", -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.2, 0.95, 0.4, 0.95]);
+                draw_text(&mut verts, "CURSOR FREE / BORDERS ON  |  [+/-] ORTHO ZOOM", -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.2, 0.95, 0.4, 0.95]);
             } else if let Some(tpos) = target_pos {
                 let target_str = format!("AIM: [{}, {}, {}] (SNAP)", tpos[0], tpos[1], tpos[2]);
                 draw_text(&mut verts, &target_str, -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.3, 0.9, 0.9, 0.9]);
@@ -919,7 +960,7 @@ fn build_ui_vertices(
                 draw_text(&mut verts, "AIM: [UNBOUNDED VOID - PLACES IN FRONT]", -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.6, 0.7, 0.8, 0.8]);
             }
 
-            draw_text(&mut verts, "[E] EDIT PALETTE  [TAB] FREE CURSOR  [.] FOCUS SCENE  [Q/R] SIZE", -0.96, 0.80, font_pw * 0.8, font_ph * 0.8, [0.9, 0.85, 0.4, 0.85]);
+            draw_text(&mut verts, "[E] PALETTE  [TAB] FREE/BORDERS  [P] PROJECTION  [.] FOCUS  [Q/R] SIZE", -0.96, 0.80, font_pw * 0.8, font_ph * 0.8, [0.9, 0.85, 0.4, 0.85]);
         }
 
         ActiveMenu::Edit => {
@@ -1007,34 +1048,38 @@ fn build_ui_vertices(
             add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.80]);
 
             let px0 = -0.38; let px1 = 0.38;
-            let py0 = -0.62; let py1 = 0.62;
+            let py0 = -0.66; let py1 = 0.66;
             add_quad(&mut verts, px0 - 0.006, py0 - 0.006, px1 + 0.006, py1 + 0.006, [0.45, 0.45, 0.50, 1.0]);
             add_quad(&mut verts, px0, py0, px1, py1, [0.12, 0.13, 0.17, 0.98]);
 
-            draw_text_centered(&mut verts, "PAUSE / SYSTEM MENU", 0.0, 0.52, font_pw * 1.1, font_ph * 1.1, [0.95, 0.95, 0.95, 1.0]);
+            draw_text_centered(&mut verts, "PAUSE / SYSTEM MENU", 0.0, 0.54, font_pw * 1.1, font_ph * 1.1, [0.95, 0.95, 0.95, 1.0]);
 
             let mode_text = if play_mode == PlayMode::Flying { "PLAY MODE: FLYING" } else { "PLAY MODE: REAL" };
-            add_quad(&mut verts, -0.30, 0.36, 0.30, 0.45, [0.25, 0.35, 0.55, 1.0]);
-            draw_text_centered(&mut verts, mode_text, 0.0, 0.405, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, 0.40, 0.30, 0.48, [0.25, 0.35, 0.55, 1.0]);
+            draw_text_centered(&mut verts, mode_text, 0.0, 0.44, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+            let proj_text = if is_ortho { "VIEW: ORTHOGRAPHIC" } else { "VIEW: PERSPECTIVE" };
+            add_quad(&mut verts, -0.30, 0.29, 0.30, 0.37, [0.22, 0.40, 0.55, 1.0]);
+            draw_text_centered(&mut verts, proj_text, 0.0, 0.33, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
 
             let world_label = format!("WORLD: {}", world_type.name());
-            add_quad(&mut verts, -0.30, 0.24, 0.30, 0.33, [0.35, 0.25, 0.50, 1.0]);
-            draw_text_centered(&mut verts, &world_label, 0.0, 0.285, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, 0.18, 0.30, 0.26, [0.35, 0.25, 0.50, 1.0]);
+            draw_text_centered(&mut verts, &world_label, 0.0, 0.22, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
 
-            add_quad(&mut verts, -0.30, 0.12, 0.30, 0.21, [0.60, 0.30, 0.20, 1.0]);
-            draw_text_centered(&mut verts, "CLEAR SCENE", 0.0, 0.165, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, 0.07, 0.30, 0.15, [0.60, 0.30, 0.20, 1.0]);
+            draw_text_centered(&mut verts, "CLEAR SCENE", 0.0, 0.11, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
 
-            add_quad(&mut verts, -0.30, 0.00, -0.02, 0.09, [0.25, 0.45, 0.35, 1.0]);
-            draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.045, font_pw * 0.9, font_ph * 0.9, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, -0.04, -0.02, 0.04, [0.25, 0.45, 0.35, 1.0]);
+            draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.0, font_pw * 0.9, font_ph * 0.9, [1.0, 1.0, 1.0, 1.0]);
 
-            add_quad(&mut verts, 0.02, 0.00, 0.30, 0.09, [0.35, 0.45, 0.25, 1.0]);
-            draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.045, font_pw * 0.9, font_ph * 0.9, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, 0.02, -0.04, 0.30, 0.04, [0.35, 0.45, 0.25, 1.0]);
+            draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.0, font_pw * 0.9, font_ph * 0.9, [1.0, 1.0, 1.0, 1.0]);
 
-            add_quad(&mut verts, -0.30, -0.16, 0.30, -0.07, [0.20, 0.55, 0.30, 1.0]);
-            draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.115, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, -0.16, 0.30, -0.08, [0.20, 0.55, 0.30, 1.0]);
+            draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.12, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
 
-            add_quad(&mut verts, -0.30, -0.28, 0.30, -0.19, [0.55, 0.20, 0.20, 1.0]);
-            draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.235, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, -0.28, 0.30, -0.20, [0.55, 0.20, 0.20, 1.0]);
+            draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.24, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
         }
     }
 
@@ -1092,7 +1137,14 @@ impl State {
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
 
-        let camera = Camera { position: Vec3::new(16.0, 12.0, 26.0), yaw: -std::f32::consts::FRAC_PI_2, pitch: -0.3 };
+        let camera = Camera { 
+            position: Vec3::new(16.0, 12.0, 26.0), 
+            yaw: -std::f32::consts::FRAC_PI_2, 
+            pitch: -0.3,
+            is_ortho: false,
+            ortho_size: 36.0,
+        };
+
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytemuck::cast_slice(&[CameraUniform { 
                 view_proj: camera.view_proj(1.0).to_cols_array_2d(),
@@ -1148,7 +1200,7 @@ impl State {
         let chunk_manager = ChunkManager::new(Arc::clone(&palette));
 
         let initial_ui = build_ui_vertices(
-            0, ActiveMenu::None, &hotbar_colors, PlayMode::Flying, chunk_manager.world_type, 4, None, 1.0,
+            0, ActiveMenu::None, &hotbar_colors, PlayMode::Flying, camera.is_ortho, chunk_manager.world_type, 4, None, 1.0,
             camera.forward(), camera.right(), camera.up(), false,
         );
         let ui_vertices_count = initial_ui.len() as u32;
@@ -1210,7 +1262,14 @@ impl State {
         let dist = (radius * 2.2).clamp(10.0, 2000.0);
         let fwd = self.camera.forward();
         self.camera.position = center - fwd * dist;
+        self.camera.ortho_size = (radius * 2.5).clamp(8.0, 2000.0);
         self.velocity = Vec3::ZERO;
+        self.update_camera_buffer();
+        self.update_ui();
+    }
+
+    pub fn toggle_projection(&mut self) {
+        self.camera.is_ortho = !self.camera.is_ortho;
         self.update_camera_buffer();
         self.update_ui();
     }
@@ -1262,6 +1321,8 @@ impl State {
             player_pos: self.camera.position.to_array(),
             camera_yaw: self.camera.yaw,
             camera_pitch: self.camera.pitch,
+            is_ortho: self.camera.is_ortho,
+            ortho_size: self.camera.ortho_size,
             play_mode: self.play_mode,
             world_type: self.chunk_manager.world_type,
             seed: self.chunk_manager.seed,
@@ -1284,6 +1345,8 @@ impl State {
         self.camera.position = Vec3::from_array(data.player_pos);
         self.camera.yaw = data.camera_yaw;
         self.camera.pitch = data.camera_pitch;
+        self.camera.is_ortho = data.is_ortho;
+        self.camera.ortho_size = if data.ortho_size > 0.1 { data.ortho_size } else { 36.0 };
         self.play_mode = data.play_mode;
         self.velocity = Vec3::ZERO;
         self.hotbar_colors = data.hotbar_colors;
@@ -1305,6 +1368,7 @@ impl State {
 
         self.chunk_manager.loaded_chunks.clear();
         self.chunk_manager.loading_chunks.clear();
+        self.update_camera_buffer();
         self.update_ui();
         println!("Game loaded from {}", filename);
         Ok(())
@@ -1358,6 +1422,7 @@ impl State {
             self.active_menu,
             &self.hotbar_colors,
             self.play_mode,
+            self.camera.is_ortho,
             self.chunk_manager.world_type,
             self.edit_size,
             self.last_target,
@@ -1482,7 +1547,7 @@ impl State {
         let dir = self.camera.forward();
         let mut current_pos = self.camera.position;
         let step = 0.25;
-        let max_steps = 10000;
+        let max_steps = 1200; // Optimized from 10000
         let mut hit = false;
         let mut hit_pos = Vec3::ZERO;
         let mut prev_pos = current_pos;
@@ -1629,7 +1694,7 @@ impl ApplicationHandler for App {
                     let ndc_y = 1.0 - (position.y as f32 / state.size.height as f32) * 2.0;
                     state.cursor_pos = [ndc_x, ndc_y];
 
-                    // Rotation orbitale par glisser-déposer sur le Gimbal
+                    // Orbital drag on gimbal
                     if state.gimbal_dragging {
                         let dx = ndc_x - state.prev_cursor_pos[0];
                         let dy = ndc_y - state.prev_cursor_pos[1];
@@ -1657,8 +1722,15 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::PixelDelta(pos) => if pos.y > 0.0 { -1 } else if pos.y < 0.0 { 1 } else { 0 },
                     };
                     if step != 0 {
-                        state.selected_slot = (state.selected_slot as i32 + step).rem_euclid(10) as usize;
-                        state.update_ui();
+                        if state.camera.is_ortho && state.cursor_free {
+                            let zoom = if step < 0 { 0.88 } else { 1.14 };
+                            state.camera.ortho_size = (state.camera.ortho_size * zoom).clamp(2.0, 1200.0);
+                            state.update_camera_buffer();
+                            state.update_ui();
+                        } else {
+                            state.selected_slot = (state.selected_slot as i32 + step).rem_euclid(10) as usize;
+                            state.update_ui();
+                        }
                     }
                 }
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
@@ -1676,6 +1748,32 @@ impl ApplicationHandler for App {
                     {
                         state.focus_on_scene();
                         return;
+                    }
+
+                    if (key_event.physical_key == PhysicalKey::Code(KeyCode::KeyP) 
+                        || key_event.physical_key == PhysicalKey::Code(KeyCode::Numpad5))
+                        && is_pressed 
+                    {
+                        state.toggle_projection();
+                        return;
+                    }
+
+                    if is_pressed && state.camera.is_ortho {
+                        match key_event.physical_key {
+                            PhysicalKey::Code(KeyCode::NumpadAdd) | PhysicalKey::Code(KeyCode::Equal) => {
+                                state.camera.ortho_size = (state.camera.ortho_size * 0.85).clamp(2.0, 1200.0);
+                                state.update_camera_buffer();
+                                state.update_ui();
+                                return;
+                            },
+                            PhysicalKey::Code(KeyCode::NumpadSubtract) | PhysicalKey::Code(KeyCode::Minus) => {
+                                state.camera.ortho_size = (state.camera.ortho_size * 1.15).clamp(2.0, 1200.0);
+                                state.update_camera_buffer();
+                                state.update_ui();
+                                return;
+                            },
+                            _ => {}
+                        }
                     }
 
                     if key_event.physical_key == PhysicalKey::Code(KeyCode::KeyE) && is_pressed {
@@ -1736,7 +1834,6 @@ impl ApplicationHandler for App {
 
                     if button == MouseButton::Left {
                         if element_state == ElementState::Pressed {
-                            // Clic sur le bouton Focus
                             if state.cursor_free || state.active_menu != ActiveMenu::None {
                                 let (bx0, by0, bx1, by1) = get_focus_button_bounds(aspect);
                                 if mx >= bx0 && mx <= bx1 && my >= by0 && my <= by1 {
@@ -1745,7 +1842,6 @@ impl ApplicationHandler for App {
                                 }
                             }
 
-                            // Prise en charge du Gimbal
                             if state.cursor_free || state.active_menu != ActiveMenu::None {
                                 let g_cx = GIZMO_CENTER_X;
                                 let g_cy = GIZMO_CENTER_Y;
@@ -1760,14 +1856,20 @@ impl ApplicationHandler for App {
                         } else if element_state == ElementState::Released {
                             if state.gimbal_dragging {
                                 state.gimbal_dragging = false;
-                                // Si pas de glissement, alignement sur l'axe le plus proche
                                 if !state.gimbal_drag_moved {
                                     let g_cx = GIZMO_CENTER_X;
                                     let g_cy = GIZMO_CENTER_Y;
                                     let right = state.camera.right();
                                     let up = state.camera.up();
 
-                                    for ax in get_gizmo_axes() {
+                                    let mut sorted_axes = get_gizmo_axes();
+                                    sorted_axes.sort_by(|a, b| {
+                                        let da = a.dir.dot(state.camera.forward());
+                                        let db = b.dir.dot(state.camera.forward());
+                                        db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+
+                                    for ax in sorted_axes {
                                         let sx = ax.dir.dot(right);
                                         let sy = ax.dir.dot(up);
                                         let tip_x = g_cx + (sx * GIZMO_RADIUS) / aspect;
@@ -1777,6 +1879,7 @@ impl ApplicationHandler for App {
                                         if dist_sq <= 0.035 * 0.035 {
                                             state.camera.yaw = ax.yaw;
                                             state.camera.pitch = ax.pitch;
+                                            state.camera.is_ortho = true; // Snap to orthographic view like Blender
                                             state.update_camera_buffer();
                                             state.update_ui();
                                             return;
@@ -1863,31 +1966,35 @@ impl ApplicationHandler for App {
 
                         ActiveMenu::Pause => {
                             if button == MouseButton::Left && element_state == ElementState::Pressed {
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.36 && my <= 0.45 {
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.40 && my <= 0.48 {
                                     state.toggle_play_mode();
                                     return;
                                 }
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.24 && my <= 0.33 {
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.29 && my <= 0.37 {
+                                    state.toggle_projection();
+                                    return;
+                                }
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.18 && my <= 0.26 {
                                     state.cycle_world_generator();
                                     return;
                                 }
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.12 && my <= 0.21 {
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.07 && my <= 0.15 {
                                     state.clear_all_blocks();
                                     return;
                                 }
-                                if mx >= -0.30 && mx <= -0.02 && my >= 0.00 && my <= 0.09 {
+                                if mx >= -0.30 && mx <= -0.02 && my >= -0.04 && my <= 0.04 {
                                     let _ = state.save_game("world_save.json");
                                     return;
                                 }
-                                if mx >= 0.02 && mx <= 0.30 && my >= 0.00 && my <= 0.09 {
+                                if mx >= 0.02 && mx <= 0.30 && my >= -0.04 && my <= 0.04 {
                                     let _ = state.load_game("world_save.json");
                                     return;
                                 }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.16 && my <= -0.07 {
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.16 && my <= -0.08 {
                                     state.set_menu(ActiveMenu::None);
                                     return;
                                 }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.28 && my <= -0.19 {
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.28 && my <= -0.20 {
                                     event_loop.exit();
                                     return;
                                 }
