@@ -430,6 +430,18 @@ impl ChunkManager {
     fn is_solid(&self, pos: Vec3) -> bool {
         self.get_material(pos) != 0
     }
+
+    pub fn get_surface_y(&self, x: f32, z: f32) -> Option<f32> {
+        let px = x.floor() as i32;
+        let pz = z.floor() as i32;
+        for y in (-32..96).rev() {
+            let test_pos = Vec3::new(px as f32 + 0.5, y as f32 + 0.5, pz as f32 + 0.5);
+            if self.is_solid(test_pos) {
+                return Some(y as f32 + 1.0);
+            }
+        }
+        None
+    }
 }
 
 // --- STRUCTURES RENDU ---
@@ -838,6 +850,7 @@ impl State {
         self.camera.yaw = data.camera_yaw;
         self.camera.pitch = data.camera_pitch;
         self.play_mode = data.play_mode;
+        self.velocity = Vec3::ZERO;
         self.hotbar_colors = data.hotbar_colors;
         *self.palette.write().unwrap() = data.palette;
 
@@ -858,6 +871,7 @@ impl State {
 
     pub fn cycle_world_generator(&mut self) {
         self.chunk_manager.world_type = self.chunk_manager.world_type.next();
+        self.velocity = Vec3::ZERO;
         self.chunk_manager.modified_blocks.clear();
         self.chunk_manager.loaded_chunks.clear();
         self.chunk_manager.loading_chunks.clear();
@@ -955,6 +969,33 @@ impl State {
                 self.camera.position += movement * speed * dt;
             },
             PlayMode::Real => {
+                let surface_y = self.chunk_manager.get_surface_y(self.camera.position.x, self.camera.position.z);
+
+                // Void recovery
+                let void_threshold = surface_y.map(|sy| sy - 15.0).unwrap_or(-10.0);
+                if self.camera.position.y < void_threshold {
+                    self.camera.position.y = surface_y.unwrap_or(36.0) + 1.8;
+                    self.velocity = Vec3::ZERO;
+                }
+
+                // Anti-suffocation / Unstuck
+                if self.player_collides_at(self.camera.position) {
+                    let mut freed = false;
+                    for _ in 0..80 {
+                        self.camera.position.y += 0.25;
+                        if !self.player_collides_at(self.camera.position) {
+                            freed = true;
+                            break;
+                        }
+                    }
+                    if !freed {
+                        if let Some(top_y) = surface_y {
+                            self.camera.position.y = top_y + 1.8;
+                        }
+                    }
+                    self.velocity.y = 0.0;
+                }
+
                 let walk_speed = 6.5;
                 if movement.length_squared() > 0.0 { movement = movement.normalize(); }
                 
