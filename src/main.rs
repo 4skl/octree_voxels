@@ -158,12 +158,23 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
 
         for quad in group.into_iter() {
             let start_index = vertices.len() as u32;
-            let mat_id = voxels[ChunkShape::linearize(quad.minimum) as usize].0;
+
+            // 1. On cherche le voxel adjacent du côté positif de la frontière (+1)
+            let pos1 = quad.minimum;
+            let mut pos2 = quad.minimum;
+            if n.x != 0 { pos2[0] += 1; }
+            if n.y != 0 { pos2[1] += 1; }
+            if n.z != 0 { pos2[2] += 1; }
+
+            let id1 = voxels[ChunkShape::linearize(pos1) as usize].0;
+            let id2 = voxels[ChunkShape::linearize(pos2) as usize].0;
+
+            // Sélection du voxel solide
+            let mat_id = if id1 != 0 { id1 } else { id2 };
             let color = match mat_id { 2 => [0.2, 0.7, 0.3], _ => [0.5, 0.5, 0.5] };
 
             for corner in face.quad_mesh_positions(quad, 1.0) {
                 vertices.push(Vertex {
-                    // On compense le décalage de [1, 1, 1] introduit lors du flatten_into
                     position: [
                         corner[0] - 1.0 + offset_x, 
                         corner[1] - 1.0 + offset_y, 
@@ -173,9 +184,10 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
                     color,
                 });
             }
-            // block-mesh calcule le bon winding (CCW vu de l'extérieur) pour chaque face
-            // en fonction du signe de la normale ET de la permutation des axes.
-            indices.extend_from_slice(&face.quad_mesh_indices(start_index));
+            
+            // 2. On conserve l'ordre natif CCW sans condition .swap()
+            let quad_indices = face.quad_mesh_indices(start_index);
+            indices.extend_from_slice(&quad_indices);
         }
     }
     MeshPayload { vertices, indices }
@@ -367,7 +379,7 @@ impl State {
                 targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
             }),
             primitive: wgpu::PrimitiveState { 
-                topology: wgpu::PrimitiveTopology::TriangleList, 
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 cull_mode: Some(wgpu::Face::Back), // Backface Culling correctement activé
                 ..Default::default() 
             },
