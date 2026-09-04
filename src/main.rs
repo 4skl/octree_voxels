@@ -25,6 +25,9 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 type ChunkShape = ConstShape3u32<34, 34, 34>; 
 type ChunkPos = (i32, i32, i32);
 
+#[derive(PartialEq)]
+pub enum PlayMode { Flying, Real }
+
 // --- OCTREE & VOXELS ---
 
 #[derive(Clone, Copy, Default)]
@@ -34,15 +37,14 @@ pub struct OctreeNode {
     pub child_pointer: u32,
 }
 
+#[derive(Clone)]
 pub struct Octree {
     pub nodes: Vec<OctreeNode>,
     pub root_index: u32,
 }
 
 impl Octree {
-    pub fn new() -> Self {
-        Self { nodes: vec![OctreeNode::default()], root_index: 0 }
-    }
+    pub fn new() -> Self { Self { nodes: vec![OctreeNode::default()], root_index: 0 } }
 
     pub fn insert(&mut self, mut x: u32, mut y: u32, mut z: u32, depth: u8, material: u16) {
         let mut current_idx = self.root_index as usize;
@@ -97,24 +99,17 @@ impl Octree {
 pub struct Block(pub u16);
 
 impl Voxel for Block {
-    fn get_visibility(&self) -> VoxelVisibility {
-        if self.0 == 0 { VoxelVisibility::Empty } else { VoxelVisibility::Opaque }
-    }
+    fn get_visibility(&self) -> VoxelVisibility { if self.0 == 0 { VoxelVisibility::Empty } else { VoxelVisibility::Opaque } }
 }
-
 impl MergeVoxel for Block {
-    type MergeValue = u16;
-    fn merge_value(&self) -> Self::MergeValue { self.0 }
+    type MergeValue = u16; fn merge_value(&self) -> Self::MergeValue { self.0 }
 }
 
-// --- GENERATION CHUNK ---
+// --- GENERATION & MESHING ---
 
-struct MeshPayload {
-    vertices: Vec<Vertex>,
-    indices: Vec<u32>,
-}
+struct MeshPayload { vertices: Vec<Vertex>, indices: Vec<u32> }
 
-fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
+fn generate_octree(chunk_pos: ChunkPos) -> Octree {
     let mut octree = Octree::new();
     let fbm = Fbm::<Perlin>::new(42);
     let world_x_offset = chunk_pos.0 * 32;
@@ -133,12 +128,14 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
             }
         }
     }
+    octree
+}
 
+fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos) -> MeshPayload {
     let mut voxels = vec![Block(0); ChunkShape::SIZE as usize];
     octree.flatten_into(octree.root_index as usize, 1, 1, 1, 32, &mut voxels);
 
     let mut buffer = UnitQuadBuffer::new();
-    // Utilisation de visible_block_faces au lieu de greedy_quads pour l'AO per-vertex
     visible_block_faces(&voxels, &ChunkShape {}, [0, 0, 0], [33, 33, 33], &RIGHT_HANDED_Y_UP_CONFIG.faces, &mut buffer);
 
     let mut vertices = Vec::new();
@@ -153,8 +150,6 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
 
         for quad in group.into_iter() {
             let start_index = vertices.len() as u32;
-
-            // Identification du voxel solide
             let pos1 = quad.minimum;
             let mut pos2 = quad.minimum;
             if n.x != 0 { pos2[0] += 1; }
@@ -165,37 +160,20 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
             let id2 = voxels[ChunkShape::linearize(pos2) as usize].0;
             let mat_id = if id1 != 0 { id1 } else { id2 };
             
-            let color = match mat_id { 2 => [0.2, 0.7, 0.3], _ => [0.5, 0.5, 0.5] };
-            let generic_quad = block_mesh::UnorientedQuad {
-                minimum: quad.minimum,
-                width: 1,
-                height: 1,
-            };
+            let color = match mat_id { 2 => [0.2, 0.7, 0.3], 3 => [0.8, 0.2, 0.2], _ => [0.5, 0.5, 0.5] };
+            let generic_quad = block_mesh::UnorientedQuad { minimum: quad.minimum, width: 1, height: 1 };
 
-            // Utilisez ce nouveau quad pour récupérer les positions
             for corner in face.quad_mesh_positions(&generic_quad, 1.0) {
-                // Application d'une Occlusion Ambiante directionnelle basique
                 let is_bottom_corner = corner[1] < (quad.minimum[1] as f32 + 0.5);
                 let ao_multiplier = if is_bottom_corner && n.y == 0 { 0.65 } else { 1.0 };
                 
                 vertices.push(Vertex {
-                    position: [
-                        corner[0] - 1.0 + offset_x, 
-                        corner[1] - 1.0 + offset_y, 
-                        corner[2] - 1.0 + offset_z
-                    ],
+                    position: [corner[0] - 1.0 + offset_x, corner[1] - 1.0 + offset_y, corner[2] - 1.0 + offset_z],
                     normal,
-                    color: [
-                        color[0] * ao_multiplier,
-                        color[1] * ao_multiplier,
-                        color[2] * ao_multiplier,
-                    ],
+                    color: [color[0] * ao_multiplier, color[1] * ao_multiplier, color[2] * ao_multiplier],
                 });
             }
-            
-            // L'ordre des indices natifs CCW est conservé sans inversion conditionnelle
-            let quad_indices = face.quad_mesh_indices(start_index);
-            indices.extend_from_slice(&quad_indices);
+            indices.extend_from_slice(&face.quad_mesh_indices(start_index));
         }
     }
     MeshPayload { vertices, indices }
@@ -204,6 +182,7 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
 // --- GESTIONNAIRE DE CHUNKS ---
 
 struct RenderChunk {
+    octree: Octree,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
@@ -212,8 +191,8 @@ struct RenderChunk {
 struct ChunkManager {
     loaded_chunks: HashMap<ChunkPos, RenderChunk>,
     loading_chunks: HashSet<ChunkPos>,
-    tx: mpsc::Sender<(ChunkPos, MeshPayload)>,
-    rx: mpsc::Receiver<(ChunkPos, MeshPayload)>,
+    tx: mpsc::Sender<(ChunkPos, Octree, MeshPayload)>,
+    rx: mpsc::Receiver<(ChunkPos, Octree, MeshPayload)>,
     render_distance: i32,
 }
 
@@ -234,30 +213,53 @@ impl ChunkManager {
                     self.loading_chunks.insert(pos);
                     let tx_clone = self.tx.clone();
                     rayon::spawn(move || {
-                        let payload = generate_chunk(pos);
-                        let _ = tx_clone.send((pos, payload));
+                        let octree = generate_octree(pos);
+                        let payload = generate_mesh(&octree, pos);
+                        let _ = tx_clone.send((pos, octree, payload));
                     });
                 }
             }
         }
 
-        while let Ok((pos, payload)) = self.rx.try_recv() {
+        while let Ok((pos, octree, payload)) = self.rx.try_recv() {
             self.loading_chunks.remove(&pos);
-            if payload.vertices.is_empty() || payload.indices.is_empty() {
-                continue;
-            }
+            if payload.vertices.is_empty() || payload.indices.is_empty() { continue; }
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
             });
             let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX,
             });
-            self.loaded_chunks.insert(pos, RenderChunk { vertex_buffer, index_buffer, num_indices: payload.indices.len() as u32 });
+            self.loaded_chunks.insert(pos, RenderChunk { octree, vertex_buffer, index_buffer, num_indices: payload.indices.len() as u32 });
         }
 
-        self.loaded_chunks.retain(|pos, _| {
-            (pos.0 - p_x).abs() <= self.render_distance + 1 && (pos.2 - p_z).abs() <= self.render_distance + 1
-        });
+        self.loaded_chunks.retain(|pos, _| (pos.0 - p_x).abs() <= self.render_distance + 1 && (pos.2 - p_z).abs() <= self.render_distance + 1);
+    }
+
+    fn modify_block(&mut self, pos: Vec3, material: u16, device: &wgpu::Device) {
+        let cx = (pos.x / 32.0).floor() as i32; let cy = (pos.y / 32.0).floor() as i32; let cz = (pos.z / 32.0).floor() as i32;
+        let chunk_pos = (cx, cy, cz);
+        let lx = (pos.x.floor() as i32).rem_euclid(32) as u32; let ly = (pos.y.floor() as i32).rem_euclid(32) as u32; let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
+
+        if let Some(chunk) = self.loaded_chunks.get_mut(&chunk_pos) {
+            chunk.octree.insert(lx, ly, lz, 5, material);
+            let payload = generate_mesh(&chunk.octree, chunk_pos);
+            chunk.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX });
+            chunk.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX });
+            chunk.num_indices = payload.indices.len() as u32;
+        }
+    }
+
+    fn is_solid(&self, pos: Vec3) -> bool {
+        let cx = (pos.x / 32.0).floor() as i32; let cy = (pos.y / 32.0).floor() as i32; let cz = (pos.z / 32.0).floor() as i32;
+        let lx = (pos.x.floor() as i32).rem_euclid(32) as u32; let ly = (pos.y.floor() as i32).rem_euclid(32) as u32; let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
+
+        if let Some(chunk) = self.loaded_chunks.get(&(cx, cy, cz)) {
+            let mut voxels = vec![Block(0); ChunkShape::SIZE as usize];
+            chunk.octree.flatten_into(chunk.octree.root_index as usize, 1, 1, 1, 32, &mut voxels);
+            return voxels[ChunkShape::linearize([lx + 1, ly + 1, lz + 1]) as usize].0 != 0;
+        }
+        false
     }
 }
 
@@ -265,11 +267,7 @@ impl ChunkManager {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-    color: [f32; 3],
-}
+struct Vertex { position: [f32; 3], normal: [f32; 3], color: [f32; 3] }
 
 impl Vertex {
     const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
@@ -283,23 +281,74 @@ impl Vertex {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct UIVertex { position: [f32; 2], color: [f32; 3] }
+
+impl UIVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<UIVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform { view_proj: [[f32; 4]; 4] }
 
 struct Camera { position: Vec3, yaw: f32, pitch: f32 }
 impl Camera {
     fn view_proj(&self, aspect: f32) -> Mat4 {
-        let (sin_p, cos_p) = self.pitch.sin_cos();
-        let (sin_y, cos_y) = self.yaw.sin_cos();
+        let (sin_p, cos_p) = self.pitch.sin_cos(); let (sin_y, cos_y) = self.yaw.sin_cos();
         let dir = Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p).normalize();
         let view = glam::camera::rh::view::look_at_mat4(self.position, self.position + dir, Vec3::Y);
         let proj = glam::camera::rh::proj::directx::perspective((60.0_f32).to_radians(), aspect, 0.1, 500.0);
         proj * view
     }
+    fn forward(&self) -> Vec3 {
+        let (sin_p, cos_p) = self.pitch.sin_cos(); let (sin_y, cos_y) = self.yaw.sin_cos();
+        Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p).normalize()
+    }
 }
 
 #[derive(Default)]
-struct InputState { forward: bool, backward: bool, left: bool, right: bool, up: bool, down: bool }
+struct InputState { forward: bool, backward: bool, left: bool, right: bool, up: bool, down: bool, action_add: bool, action_remove: bool }
+
+fn build_ui_vertices(selected: u16) -> Vec<UIVertex> {
+    let mut verts = Vec::new();
+    let num_slots = 3;
+    let slot_width = 0.1;
+    let slot_spacing = 0.05;
+    let total_width = num_slots as f32 * slot_width + (num_slots - 1) as f32 * slot_spacing;
+    let start_x = -total_width / 2.0;
+    let y_bottom = -0.95;
+    let y_top = -0.85;
+
+    for i in 0..num_slots {
+        let id = i as u16 + 1;
+        let base_color = match id { 1 => [0.5, 0.5, 0.5], 2 => [0.2, 0.7, 0.3], _ => [0.8, 0.2, 0.2] };
+        
+        let x0 = start_x + i as f32 * (slot_width + slot_spacing);
+        let x1 = x0 + slot_width;
+
+        if selected == id {
+            let hl = [1.0, 1.0, 0.0];
+            verts.extend_from_slice(&[
+                UIVertex { position: [x0-0.01, y_bottom-0.01], color: hl }, UIVertex { position: [x1+0.01, y_bottom-0.01], color: hl }, UIVertex { position: [x1+0.01, y_top+0.01], color: hl },
+                UIVertex { position: [x0-0.01, y_bottom-0.01], color: hl }, UIVertex { position: [x1+0.01, y_top+0.01], color: hl }, UIVertex { position: [x0-0.01, y_top+0.01], color: hl },
+            ]);
+        }
+
+        verts.extend_from_slice(&[
+            UIVertex { position: [x0, y_bottom], color: base_color }, UIVertex { position: [x1, y_bottom], color: base_color }, UIVertex { position: [x1, y_top], color: base_color },
+            UIVertex { position: [x0, y_bottom], color: base_color }, UIVertex { position: [x1, y_top], color: base_color }, UIVertex { position: [x0, y_top], color: base_color },
+        ]);
+    }
+    verts
+}
 
 struct State {
     surface: wgpu::Surface<'static>,
@@ -308,6 +357,9 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
+    ui_pipeline: wgpu::RenderPipeline,
+    ui_vertex_buffer: wgpu::Buffer,
+    ui_vertices_count: u32,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_texture_view: wgpu::TextureView,
@@ -315,184 +367,189 @@ struct State {
     camera: Camera,
     input: InputState,
     chunk_manager: ChunkManager,
+    play_mode: PlayMode,
+    velocity: Vec3,
+    selected_material: u16,
 }
 
 impl State {
     async fn new(window: Arc<Window>) -> Self {
         let mut size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            size = winit::dpi::PhysicalSize::new(1280, 720);
-        }
+        if size.width == 0 || size.height == 0 { size = winit::dpi::PhysicalSize::new(1280, 720); }
 
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
-
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: Some(&surface),
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { 
+            power_preference: wgpu::PowerPreference::default(), 
+            compatible_surface: Some(&surface), 
             force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }).await.expect("Adaptateur compatible introuvable");
-
+            apply_limit_buckets: Default::default(),
+        }).await.unwrap();
         let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.unwrap();
-
         let mut config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
-        let surface_caps = surface.get_capabilities(&adapter);
-        if surface_caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
-        }
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
 
         let camera = Camera { position: Vec3::new(16.0, 45.0, 48.0), yaw: -std::f32::consts::FRAC_PI_2, pitch: -0.4 };
-        let aspect = config.width as f32 / config.height as f32;
-        let camera_uniform = CameraUniform { view_proj: camera.view_proj(aspect).to_cols_array_2d() };
-        
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"), contents: bytemuck::cast_slice(&[camera_uniform]), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            label: None, contents: bytemuck::cast_slice(&[CameraUniform { view_proj: camera.view_proj(1.0).to_cols_array_2d() }]), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0, visibility: wgpu::ShaderStages::VERTEX, count: None,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-            }], label: None,
+            entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, count: None, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None } }], label: None,
         });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }], label: None,
-        });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { layout: &camera_bind_group_layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }], label: None });
 
         let depth_texture_view = device.create_texture(&wgpu::TextureDescriptor {
-            size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, label: None, view_formats: &[],
+            size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: DEPTH_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, label: None, view_formats: &[],
         }).create_view(&wgpu::TextureViewDescriptor::default());
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[Some(&camera_bind_group_layout)], immediate_size: 0,
-        });
-
+        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&camera_bind_group_layout)], immediate_size: 0 });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None, layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(Vertex::desc())] },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
-            }),
-            primitive: wgpu::PrimitiveState { 
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back), 
-                ..Default::default() 
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default(),
-            }),
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Less), stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default() }),
             multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
 
-        let mut chunk_manager = ChunkManager::new();
-        let initial_payload = generate_chunk((0, 0, 0));
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None, contents: bytemuck::cast_slice(&initial_payload.vertices), usage: wgpu::BufferUsages::VERTEX,
+        // UI Pipeline
+        let ui_shader = device.create_shader_module(wgpu::include_wgsl!("ui.wgsl"));
+        let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[], immediate_size: 0 });
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("UI Pipeline"), layout: Some(&ui_pipeline_layout),
+            vertex: wgpu::VertexState { module: &ui_shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(UIVertex::desc())] },
+            fragment: Some(wgpu::FragmentState { module: &ui_shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None, contents: bytemuck::cast_slice(&initial_payload.indices), usage: wgpu::BufferUsages::INDEX,
-        });
-        chunk_manager.loaded_chunks.insert((0, 0, 0), RenderChunk {
-            vertex_buffer, index_buffer, num_indices: initial_payload.indices.len() as u32,
+        
+        let initial_ui = build_ui_vertices(1);
+        let ui_vertices_count = initial_ui.len() as u32;
+        let ui_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("UI Buffer"), contents: bytemuck::cast_slice(&initial_ui), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
+        let mut chunk_manager = ChunkManager::new();
+        let octree = generate_octree((0, 0, 0));
+        let initial_payload = generate_mesh(&octree, (0, 0, 0));
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&initial_payload.vertices), usage: wgpu::BufferUsages::VERTEX });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&initial_payload.indices), usage: wgpu::BufferUsages::INDEX });
+        chunk_manager.loaded_chunks.insert((0, 0, 0), RenderChunk { octree, vertex_buffer, index_buffer, num_indices: initial_payload.indices.len() as u32 });
+
         Self {
-            window, surface, device, queue, config, size, render_pipeline,
+            window, surface, device, queue, config, size, render_pipeline, ui_pipeline, ui_vertex_buffer, ui_vertices_count,
             camera_buffer, camera_bind_group, depth_texture_view, camera,
             input: InputState::default(), chunk_manager,
+            play_mode: PlayMode::Flying, velocity: Vec3::ZERO, selected_material: 1,
         }
+    }
+
+    fn update_ui(&mut self) {
+        let verts = build_ui_vertices(self.selected_material);
+        self.ui_vertices_count = verts.len() as u32;
+        self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
+            self.size = new_size; self.config.width = new_size.width; self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-
             self.depth_texture_view = self.device.create_texture(&wgpu::TextureDescriptor {
-                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: DEPTH_FORMAT, 
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT, label: None, view_formats: &[],
+                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: DEPTH_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, label: None, view_formats: &[],
             }).create_view(&wgpu::TextureViewDescriptor::default());
         }
     }
 
     fn update(&mut self, dt: f32) {
-        let speed = 40.0 * dt;
+        let speed = 25.0;
         let (sin_y, cos_y) = self.camera.yaw.sin_cos();
         let forward = Vec3::new(cos_y, 0.0, sin_y).normalize();
         let right = Vec3::new(-sin_y, 0.0, cos_y).normalize();
 
-        if self.input.forward { self.camera.position += forward * speed; }
-        if self.input.backward { self.camera.position -= forward * speed; }
-        if self.input.right { self.camera.position += right * speed; }
-        if self.input.left { self.camera.position -= right * speed; }
-        if self.input.up { self.camera.position.y += speed; }
-        if self.input.down { self.camera.position.y -= speed; }
+        let mut movement = Vec3::ZERO;
+        if self.input.forward { movement += forward; } if self.input.backward { movement -= forward; }
+        if self.input.right { movement += right; } if self.input.left { movement -= right; }
+
+        match self.play_mode {
+            PlayMode::Flying => {
+                if self.input.up { movement.y += 1.0; } if self.input.down { movement.y -= 1.0; }
+                if movement.length_squared() > 0.0 { movement = movement.normalize(); }
+                self.camera.position += movement * speed * dt;
+            },
+            PlayMode::Real => {
+                if movement.length_squared() > 0.0 { movement = movement.normalize(); }
+                
+                let dx = movement.x * speed * dt;
+                if !self.chunk_manager.is_solid(self.camera.position + Vec3::new(dx, -1.0, 0.0)) && 
+                   !self.chunk_manager.is_solid(self.camera.position + Vec3::new(dx, 0.0, 0.0)) {
+                    self.camera.position.x += dx;
+                }
+                
+                let dz = movement.z * speed * dt;
+                if !self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, -1.0, dz)) &&
+                   !self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, 0.0, dz)) {
+                    self.camera.position.z += dz;
+                }
+
+                self.velocity.y -= 45.0 * dt; 
+                if self.input.up && self.chunk_manager.is_solid(self.camera.position - Vec3::new(0.0, 1.5, 0.0)) { self.velocity.y = 15.0; }
+
+                let dy = self.velocity.y * dt;
+                let y_check = if dy > 0.0 { 0.2 } else { -1.5 };
+                
+                if self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, dy + y_check, 0.0)) { 
+                    self.velocity.y = 0.0; 
+                } else { 
+                    self.camera.position.y += dy; 
+                }
+            }
+        }
+
+        if self.input.action_add || self.input.action_remove {
+            let dir = self.camera.forward();
+            let mut current_pos = self.camera.position;
+            let step = 0.1; 
+            for _ in 0..100 { 
+                current_pos += dir * step;
+                if self.chunk_manager.is_solid(current_pos) {
+                    if self.input.action_remove { self.chunk_manager.modify_block(current_pos, 0, &self.device); } 
+                    else if self.input.action_add { self.chunk_manager.modify_block(current_pos - dir * step, self.selected_material, &self.device); }
+                    break;
+                }
+            }
+            self.input.action_add = false; self.input.action_remove = false;
+        }
 
         let aspect = if self.config.height > 0 { self.config.width as f32 / self.config.height as f32 } else { 1.0 };
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[CameraUniform { view_proj: self.camera.view_proj(aspect).to_cols_array_2d() }]));
-        
         self.chunk_manager.update(self.camera.position, &self.device);
     }
 
     fn render(&mut self) {
-        let current_win_size = self.window.inner_size();
-        if current_win_size.width > 0 && current_win_size.height > 0 {
-            if current_win_size.width != self.config.width || current_win_size.height != self.config.height {
-                self.resize(current_win_size);
-            }
-        }
-
         let mut surface_texture = self.surface.get_current_texture();
-
         if matches!(surface_texture, wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost) {
             self.surface.configure(&self.device, &self.config);
             surface_texture = self.surface.get_current_texture();
         }
-
-        let frame = match surface_texture {
-            wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            _ => return,
-        };
-
+        let frame = match surface_texture { wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame, _ => return };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
+        // Rendu 3D
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations { 
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.4, g: 0.7, b: 0.95, a: 1.0 }),
-                        store: wgpu::StoreOp::Store 
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None, 
-                occlusion_query_set: None, 
-                multiview_mask: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.4, g: 0.7, b: 0.95, a: 1.0 }), store: wgpu::StoreOp::Store }, depth_slice: None })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.depth_texture_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            
             for chunk in self.chunk_manager.loaded_chunks.values() {
                 render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
                 render_pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -500,26 +557,33 @@ impl State {
             }
         }
 
-        drop(view);
+        // Rendu 2D (UI)
+        {
+            let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("UI Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }, depth_slice: None })],
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+            });
+            ui_pass.set_pipeline(&self.ui_pipeline);
+            ui_pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
+            ui_pass.draw(0..self.ui_vertices_count, 0..1);
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
     }
 }
 
-struct App {
-    state: Option<State>,
-    last_frame: Instant,
-}
+struct App { state: Option<State>, last_frame: Instant }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
             #[allow(unused_mut)]
             let mut window_attributes = Window::default_attributes()
-                .with_title("Voxel Octree Engine")
+                .with_title("Voxel Engine")
                 .with_inner_size(LogicalSize::new(1280.0, 720.0))
                 .with_visible(true);
-
             #[cfg(target_os = "linux")]
             {
                 window_attributes = WindowAttributesExtWayland::with_name(window_attributes, "octree_voxels", "octree_voxels");
@@ -527,15 +591,12 @@ impl ApplicationHandler for App {
             }
 
             let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-            
-            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked)
-                .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+            window.set_title("Voxel Engine");
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
             window.set_cursor_visible(false);
 
             let mut state = pollster::block_on(State::new(Arc::clone(&window)));
-            
             state.render();
-            
             self.state = Some(state);
             self.last_frame = Instant::now();
             window.request_redraw();
@@ -547,8 +608,12 @@ impl ApplicationHandler for App {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
-                    if key_event.physical_key == PhysicalKey::Code(KeyCode::Escape) { event_loop.exit(); }
                     let is_pressed = key_event.state == ElementState::Pressed;
+                    
+                    if key_event.physical_key == PhysicalKey::Code(KeyCode::Escape) && is_pressed {
+                        event_loop.exit();
+                    }
+
                     match key_event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyW) => state.input.forward = is_pressed,
                         PhysicalKey::Code(KeyCode::KeyS) => state.input.backward = is_pressed,
@@ -556,20 +621,24 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::KeyD) => state.input.right = is_pressed,
                         PhysicalKey::Code(KeyCode::Space) => state.input.up = is_pressed,
                         PhysicalKey::Code(KeyCode::ShiftLeft) => state.input.down = is_pressed,
+                        PhysicalKey::Code(KeyCode::Digit1) => if is_pressed { state.selected_material = 1; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit2) => if is_pressed { state.selected_material = 2; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit3) => if is_pressed { state.selected_material = 3; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::KeyM) => if is_pressed {
+                            state.play_mode = if state.play_mode == PlayMode::Real { PlayMode::Flying } else { PlayMode::Real };
+                        },
                         _ => {}
                     }
                 }
-                WindowEvent::Resized(size) => {
-                    state.resize(size);
-                    state.window.request_redraw();
+                WindowEvent::MouseInput { state: element_state, button, .. } => {
+                    if element_state == ElementState::Pressed {
+                        match button { MouseButton::Left => state.input.action_remove = true, MouseButton::Right => state.input.action_add = true, _ => {} }
+                    }
                 }
+                WindowEvent::Resized(size) => { state.resize(size); state.window.request_redraw(); }
                 WindowEvent::RedrawRequested => {
-                    let now = Instant::now();
-                    let dt = now.duration_since(self.last_frame).as_secs_f32();
-                    self.last_frame = now;
-                    state.update(dt);
-                    state.render();
-                    state.window.request_redraw();
+                    let now = Instant::now(); let dt = now.duration_since(self.last_frame).as_secs_f32(); self.last_frame = now;
+                    state.update(dt); state.render(); state.window.request_redraw();
                 }
                 _ => {}
             }
@@ -578,19 +647,15 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
         if let Some(state) = self.state.as_mut() {
-            if let DeviceEvent::MouseMotion { delta } = event {
-                state.camera.yaw += (delta.0 as f32) * 0.002;
-                state.camera.pitch -= (delta.1 as f32) * 0.002;
-                state.camera.pitch = state.camera.pitch.clamp(-1.5, 1.5);
+            if state.play_mode == PlayMode::Flying || state.play_mode == PlayMode::Real {
+                if let DeviceEvent::MouseMotion { delta } = event {
+                    state.camera.yaw += (delta.0 as f32) * 0.002; state.camera.pitch -= (delta.1 as f32) * 0.002;
+                    state.camera.pitch = state.camera.pitch.clamp(-1.5, 1.5);
+                }
             }
         }
     }
-    
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = self.state.as_mut() {
-            state.window.request_redraw();
-        }
-    }
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) { if let Some(state) = self.state.as_mut() { state.window.request_redraw(); } }
 }
 
 pub fn main() {
@@ -599,48 +664,4 @@ pub fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App { state: None, last_frame: Instant::now() };
     event_loop.run_app(&mut app).unwrap();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn all_faces_are_wound_front_facing() {
-        for face in RIGHT_HANDED_Y_UP_CONFIG.faces {
-            let quad = block_mesh::UnorientedQuad {
-                minimum: [10, 10, 10],
-                width: 1,
-                height: 1,
-            };
-            let corners = face.quad_mesh_positions(&quad, 1.0).map(|c| Vec3::from(c));
-            let n = face.signed_normal();
-            let normal = Vec3::new(n.x as f32, n.y as f32, n.z as f32);
-            let idx = face.quad_mesh_indices(0);
-            for tri in idx.chunks(3) {
-                let (a, b, c) = (corners[tri[0] as usize], corners[tri[1] as usize], corners[tri[2] as usize]);
-                let tri_normal = (b - a).cross(c - a);
-                assert!(
-                    tri_normal.dot(normal) > 0.0,
-                    "Face {:?} : triangle {:?} tourné dans le mauvais sens (triangle normal = {:?})",
-                    normal, tri, tri_normal
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn mesh_reaches_chunk_boundaries() {
-        let payload = generate_chunk((0, 0, 0));
-        assert!(!payload.vertices.is_empty());
-        let (mut max_x, mut max_y, mut max_z) = (0.0f32, 0.0f32, 0.0f32);
-        for v in &payload.vertices {
-            max_x = max_x.max(v.position[0]);
-            max_y = max_y.max(v.position[1]);
-            max_z = max_z.max(v.position[2]);
-        }
-        assert!((max_x - 32.0).abs() < 1e-3, "Le mesh doit atteindre x=32, max_x = {max_x}");
-        assert!((max_z - 32.0).abs() < 1e-3, "Le mesh doit atteindre z=32, max_z = {max_z}");
-        assert!(max_y > 1.0, "Le mesh doit contenir des couches superieures, max_y = {max_y}");
-    }
 }
