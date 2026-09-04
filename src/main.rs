@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
-use glam::{Vec3, Mat4};
+use glam::{Vec3, Mat4, IVec3};
 use block_mesh::{visible_block_faces, UnitQuadBuffer, Voxel, VoxelVisibility, MergeVoxel, RIGHT_HANDED_Y_UP_CONFIG};
 use ndshape::{ConstShape, ConstShape3u32};
 use noise::{NoiseFn, Fbm, Perlin};
@@ -136,10 +136,6 @@ impl Octree {
             if y >= half_size { octant |= 2; y -= half_size; }
             if z >= half_size { octant |= 4; z -= half_size; }
 
-            if material != 0 {
-                self.nodes[current_idx].child_mask |= 1 << octant;
-            }
-
             current_idx = (self.nodes[current_idx].child_pointer + octant) as usize;
             half_size >>= 1;
         }
@@ -147,6 +143,43 @@ impl Octree {
         self.nodes[current_idx].material_id = material;
         self.nodes[current_idx].child_pointer = 0;
         self.nodes[current_idx].child_mask = 0;
+
+        self.collapse(self.root_index as usize);
+    }
+
+    pub fn collapse(&mut self, node_idx: usize) -> bool {
+        let child_ptr = self.nodes[node_idx].child_pointer;
+        if child_ptr == 0 {
+            return true;
+        }
+
+        let first_mat = self.nodes[child_ptr as usize].material_id;
+        let mut all_same = true;
+
+        for i in 0..8 {
+            let c_idx = (child_ptr + i) as usize;
+            let is_leaf = self.collapse(c_idx);
+            if !is_leaf || self.nodes[c_idx].material_id != first_mat {
+                all_same = false;
+            }
+        }
+
+        if all_same {
+            self.nodes[node_idx].material_id = first_mat;
+            self.nodes[node_idx].child_pointer = 0;
+            self.nodes[node_idx].child_mask = if first_mat != 0 { 0xFF } else { 0 };
+            return true;
+        }
+
+        let mut mask = 0;
+        for i in 0..8 {
+            let c_idx = (child_ptr + i) as usize;
+            if self.nodes[c_idx].material_id != 0 || self.nodes[c_idx].child_pointer != 0 {
+                mask |= 1 << i;
+            }
+        }
+        self.nodes[node_idx].child_mask = mask;
+        false
     }
 
     pub fn query(&self, mut x: u32, mut y: u32, mut z: u32) -> u16 {
@@ -212,7 +245,7 @@ impl MergeVoxel for Block {
     fn merge_value(&self) -> Self::MergeValue { self.0 }
 }
 
-// --- RENDU ET MAILLAGE ---
+// --- RENDERING & MESHING ---
 
 struct MeshPayload { vertices: Vec<Vertex>, indices: Vec<u32> }
 
@@ -306,7 +339,6 @@ fn generate_octree(
     octree
 }
 
-// Fixed: matches block_mesh vertex corner ordering [min, min+u, min+v, min+u+v]
 const QUAD_UVS: [[f32; 2]; 4] = [
     [0.0, 0.0],
     [1.0, 0.0],
@@ -370,6 +402,53 @@ struct RenderChunk {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    vertex_capacity: usize,
+    index_capacity: usize,
+}
+
+fn update_chunk_buffers(
+    chunk: &mut RenderChunk,
+    payload: &MeshPayload,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    if payload.vertices.is_empty() || payload.indices.is_empty() {
+        chunk.num_indices = 0;
+        return;
+    }
+
+    let v_bytes = bytemuck::cast_slice(&payload.vertices);
+    let i_bytes = bytemuck::cast_slice(&payload.indices);
+
+    if v_bytes.len() > chunk.vertex_capacity {
+        chunk.vertex_capacity = (v_bytes.len() * 2).max(1024);
+        chunk.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: chunk.vertex_capacity as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+
+    if i_bytes.len() > chunk.index_capacity {
+        chunk.index_capacity = (i_bytes.len() * 2).max(1024);
+        chunk.index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: chunk.index_capacity as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+
+    queue.write_buffer(&chunk.vertex_buffer, 0, v_bytes);
+    queue.write_buffer(&chunk.index_buffer, 0, i_bytes);
+    chunk.num_indices = payload.indices.len() as u32;
+}
+
+pub struct RaycastHit {
+    pub voxel_pos: IVec3,
+    pub normal: IVec3,
+    pub material: u16,
 }
 
 struct ChunkManager {
@@ -402,6 +481,89 @@ impl ChunkManager {
         }
     }
 
+    pub fn get_material_at_voxel(&self, v: IVec3) -> u16 {
+        let cx = v.x.div_euclid(32);
+        let cy = v.y.div_euclid(32);
+        let cz = v.z.div_euclid(32);
+
+        if let Some(&mat) = self.full_chunk_overrides.get(&(cx, cy, cz)) {
+            return mat;
+        }
+
+        let lx = v.x.rem_euclid(32) as u32;
+        let ly = v.y.rem_euclid(32) as u32;
+        let lz = v.z.rem_euclid(32) as u32;
+
+        if let Some(chunk) = self.loaded_chunks.get(&(cx, cy, cz)) {
+            chunk.octree.query(lx, ly, lz)
+        } else {
+            0
+        }
+    }
+
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RaycastHit> {
+        let mut voxel = glam::ivec3(
+            origin.x.floor() as i32,
+            origin.y.floor() as i32,
+            origin.z.floor() as i32,
+        );
+
+        let step = glam::ivec3(
+            if dir.x > 0.0 { 1 } else { -1 },
+            if dir.y > 0.0 { 1 } else { -1 },
+            if dir.z > 0.0 { 1 } else { -1 },
+        );
+
+        let delta_t = Vec3::new(
+            if dir.x.abs() > 1e-6 { (1.0 / dir.x).abs() } else { f32::MAX },
+            if dir.y.abs() > 1e-6 { (1.0 / dir.y).abs() } else { f32::MAX },
+            if dir.z.abs() > 1e-6 { (1.0 / dir.z).abs() } else { f32::MAX },
+        );
+
+        let mut t_max = Vec3::new(
+            if dir.x > 0.0 { (voxel.x as f32 + 1.0 - origin.x) * delta_t.x } else { (origin.x - voxel.x as f32) * delta_t.x },
+            if dir.y > 0.0 { (voxel.y as f32 + 1.0 - origin.y) * delta_t.y } else { (origin.y - voxel.y as f32) * delta_t.y },
+            if dir.z > 0.0 { (voxel.z as f32 + 1.0 - origin.z) * delta_t.z } else { (origin.z - voxel.z as f32) * delta_t.z },
+        );
+
+        let mut normal = glam::IVec3::ZERO;
+        let mut dist = 0.0;
+
+        while dist < max_dist {
+            let mat = self.get_material_at_voxel(voxel);
+            if mat != 0 {
+                return Some(RaycastHit { voxel_pos: voxel, normal, material: mat });
+            }
+
+            if t_max.x < t_max.y {
+                if t_max.x < t_max.z {
+                    voxel.x += step.x;
+                    dist = t_max.x;
+                    t_max.x += delta_t.x;
+                    normal = glam::ivec3(-step.x, 0, 0);
+                } else {
+                    voxel.z += step.z;
+                    dist = t_max.z;
+                    t_max.z += delta_t.z;
+                    normal = glam::ivec3(0, 0, -step.z);
+                }
+            } else {
+                if t_max.y < t_max.z {
+                    voxel.y += step.y;
+                    dist = t_max.y;
+                    t_max.y += delta_t.y;
+                    normal = glam::ivec3(0, -step.y, 0);
+                } else {
+                    voxel.z += step.z;
+                    dist = t_max.z;
+                    t_max.z += delta_t.z;
+                    normal = glam::ivec3(0, 0, -step.z);
+                }
+            }
+        }
+        None
+    }
+
     fn update(&mut self, player_pos: Vec3, device: &wgpu::Device) {
         let p_x = (player_pos.x / 32.0).floor() as i32;
         let p_z = (player_pos.z / 32.0).floor() as i32;
@@ -431,13 +593,22 @@ impl ChunkManager {
         while let Ok((pos, octree, payload)) = self.rx.try_recv() {
             self.loading_chunks.remove(&pos);
             if payload.vertices.is_empty() || payload.indices.is_empty() { continue; }
+            let v_bytes = bytemuck::cast_slice(&payload.vertices);
+            let i_bytes = bytemuck::cast_slice(&payload.indices);
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
+                label: None, contents: v_bytes, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX,
+                label: None, contents: i_bytes, usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             });
-            self.loaded_chunks.insert(pos, RenderChunk { octree, vertex_buffer, index_buffer, num_indices: payload.indices.len() as u32 });
+            self.loaded_chunks.insert(pos, RenderChunk {
+                octree,
+                vertex_buffer,
+                index_buffer,
+                num_indices: payload.indices.len() as u32,
+                vertex_capacity: v_bytes.len(),
+                index_capacity: i_bytes.len(),
+            });
         }
 
         self.loaded_chunks.retain(|pos, _| {
@@ -445,7 +616,7 @@ impl ChunkManager {
         });
     }
 
-    fn set_whole_chunk(&mut self, chunk_pos: ChunkPos, material: u16, device: &wgpu::Device) {
+    fn set_whole_chunk(&mut self, chunk_pos: ChunkPos, material: u16, device: &wgpu::Device, queue: &wgpu::Queue) {
         if material == 0 {
             self.full_chunk_overrides.insert(chunk_pos, 0);
         } else {
@@ -460,21 +631,11 @@ impl ChunkManager {
             }
             let pal = self.palette.read().unwrap().clone();
             let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
-            if payload.vertices.is_empty() || payload.indices.is_empty() {
-                chunk.num_indices = 0;
-            } else {
-                chunk.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
-                });
-                chunk.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX,
-                });
-                chunk.num_indices = payload.indices.len() as u32;
-            }
+            update_chunk_buffers(chunk, &payload, device, queue);
         }
     }
 
-    fn modify_cube(&mut self, pos: Vec3, material: u16, size: u32, device: &wgpu::Device) {
+    fn modify_cube(&mut self, pos: Vec3, material: u16, size: u32, device: &wgpu::Device, queue: &wgpu::Queue) {
         let s = size as i32;
         let bx = (pos.x.floor() as i32).div_euclid(s) * s;
         let by = (pos.y.floor() as i32).div_euclid(s) * s;
@@ -490,7 +651,7 @@ impl ChunkManager {
                 for dy in 0..chunks_count {
                     for dz in 0..chunks_count {
                         let cpos = (start_cx + dx, start_cy + dy, start_cz + dz);
-                        self.set_whole_chunk(cpos, material, device);
+                        self.set_whole_chunk(cpos, material, device, queue);
                     }
                 }
             }
@@ -531,49 +692,23 @@ impl ChunkManager {
         let chunk = self.loaded_chunks.entry(chunk_pos).or_insert_with(|| {
             let octree = generate_octree(chunk_pos, self.world_type, self.seed, self.modified_blocks.get(&chunk_pos), self.full_chunk_overrides.get(&chunk_pos).copied());
             let vb = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None, size: 64, usage: wgpu::BufferUsages::VERTEX, mapped_at_creation: false,
+                label: None, size: 1024, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             });
             let ib = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None, size: 64, usage: wgpu::BufferUsages::INDEX, mapped_at_creation: false,
+                label: None, size: 1024, usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
             });
-            RenderChunk { octree, vertex_buffer: vb, index_buffer: ib, num_indices: 0 }
+            RenderChunk { octree, vertex_buffer: vb, index_buffer: ib, num_indices: 0, vertex_capacity: 1024, index_capacity: 1024 }
         });
 
         chunk.octree.insert(lx, ly, lz, depth, material);
 
         let pal = self.palette.read().unwrap().clone();
         let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
-        if payload.vertices.is_empty() || payload.indices.is_empty() {
-            chunk.num_indices = 0;
-        } else {
-            chunk.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
-            });
-            chunk.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX,
-            });
-            chunk.num_indices = payload.indices.len() as u32;
-        }
+        update_chunk_buffers(chunk, &payload, device, queue);
     }
 
     fn get_material(&self, pos: Vec3) -> u16 {
-        let cx = (pos.x / 32.0).floor() as i32;
-        let cy = (pos.y / 32.0).floor() as i32;
-        let cz = (pos.z / 32.0).floor() as i32;
-
-        if let Some(&mat) = self.full_chunk_overrides.get(&(cx, cy, cz)) {
-            return mat;
-        }
-
-        let lx = (pos.x.floor() as i32).rem_euclid(32) as u32;
-        let ly = (pos.y.floor() as i32).rem_euclid(32) as u32;
-        let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
-
-        if let Some(chunk) = self.loaded_chunks.get(&(cx, cy, cz)) {
-            chunk.octree.query(lx, ly, lz)
-        } else {
-            0
-        }
+        self.get_material_at_voxel(glam::ivec3(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32))
     }
 
     fn is_solid(&self, pos: Vec3) -> bool {
@@ -593,7 +728,7 @@ impl ChunkManager {
     }
 }
 
-// --- STRUCTURES VERTEX & CAMERA ---
+// --- VERTEX & CAMERA DATA ---
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -723,80 +858,140 @@ fn add_line(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, thick
     ]);
 }
 
-fn get_glyph(c: char) -> [u8; 5] {
+// 5x7 Font Bitmap: 7 rows of 5-bit masks
+fn get_glyph_5x7(c: char) -> [u8; 7] {
     match c {
-        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
-        'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
-        'C' => [0b111, 0b100, 0b100, 0b100, 0b111],
-        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
-        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
-        'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
-        'G' => [0b111, 0b100, 0b101, 0b101, 0b111],
-        'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
-        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
-        'J' => [0b001, 0b001, 0b001, 0b101, 0b111],
-        'K' => [0b101, 0b110, 0b100, 0b110, 0b101],
-        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
-        'M' => [0b101, 0b111, 0b101, 0b101, 0b101],
-        'N' => [0b101, 0b111, 0b111, 0b101, 0b101],
-        'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
-        'P' => [0b111, 0b101, 0b111, 0b100, 0b100],
-        'Q' => [0b010, 0b101, 0b101, 0b110, 0b011],
-        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
-        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
-        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
-        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
-        'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
-        'W' => [0b101, 0b101, 0b101, 0b111, 0b101],
-        'X' => [0b101, 0b101, 0b010, 0b101, 0b101],
-        'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
-        'Z' => [0b111, 0b001, 0b010, 0b100, 0b111],
-        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
-        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
-        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
-        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
-        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
-        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
-        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
-        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
-        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
-        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
-        ':' => [0b000, 0b010, 0b000, 0b010, 0b000],
-        '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
-        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
-        '+' => [0b000, 0b010, 0b111, 0b010, 0b000],
-        '.' => [0b000, 0b000, 0b000, 0b010, 0b010],
-        '[' => [0b110, 0b100, 0b100, 0b100, 0b110],
-        ']' => [0b011, 0b001, 0b001, 0b001, 0b011],
-        '|' => [0b010, 0b010, 0b010, 0b010, 0b010],
-        _ => [0; 5],
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
+        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'G' => [0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
+        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'J' => [0b00001, 0b00001, 0b00001, 0b00001, 0b10001, 0b10001, 0b01110],
+        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
+        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        'a' => [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
+        'b' => [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110],
+        'c' => [0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10001, 0b01110],
+        'd' => [0b00001, 0b00001, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111],
+        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110],
+        'f' => [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
+        'g' => [0b00000, 0b00000, 0b01111, 0b10001, 0b01111, 0b00001, 0b01110],
+        'h' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'l' => [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'm' => [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10001, 0b10001],
+        'n' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'o' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
+        'p' => [0b00000, 0b00000, 0b11110, 0b10001, 0b11110, 0b10000, 0b10000],
+        'r' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
+        's' => [0b00000, 0b00000, 0b01110, 0b10000, 0b01110, 0b00001, 0b11110],
+        't' => [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
+        'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
+        '0' => [0b01110, 0b10011, 0b10101, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
+        '3' => [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
+        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+        ':' => [0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000],
+        '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000, 0b00000],
+        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
+        '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000],
+        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
+        '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
+        ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
+        '|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        '*' => [0b00000, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0b00000],
+        '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
+        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
+        _ => [0; 7],
     }
 }
 
-fn draw_text(verts: &mut Vec<UIVertex>, text: &str, start_x: f32, start_y: f32, pixel_w: f32, pixel_h: f32, color: [f32; 4]) {
-    let mut cursor_x = start_x;
-    for c in text.chars() {
-        let glyph = get_glyph(c);
-        for row in 0..5 {
-            let line = glyph[row];
-            let y1 = start_y + (4 - row) as f32 * pixel_h;
-            let y0 = y1 - pixel_h;
-            for col in 0..3 {
-                if (line & (1 << (2 - col))) != 0 {
-                    let x0 = cursor_x + col as f32 * pixel_w;
-                    let x1 = x0 + pixel_w;
-                    add_quad(verts, x0, y0, x1, y1, color);
-                }
+fn draw_glyph_raw(
+    verts: &mut Vec<UIVertex>,
+    glyph: &[u8; 7],
+    x: f32,
+    y: f32,
+    pw: f32,
+    ph: f32,
+    color: [f32; 4],
+) {
+    for row in 0..7 {
+        let line = glyph[row];
+        if line == 0 { continue; }
+        let y1 = y + (6 - row) as f32 * ph;
+        let y0 = y1 - ph;
+        for col in 0..5 {
+            if (line & (1 << (4 - col))) != 0 {
+                let x0 = x + col as f32 * pw;
+                let x1 = x0 + pw;
+                add_quad(verts, x0, y0, x1, y1, color);
             }
         }
-        cursor_x += 4.0 * pixel_w;
     }
 }
 
-fn draw_text_centered(verts: &mut Vec<UIVertex>, text: &str, cx: f32, cy: f32, pw: f32, ph: f32, color: [f32; 4]) {
-    let total_w = (text.len() as f32 * 4.0 - 1.0) * pw;
-    let total_h = 5.0 * ph;
-    draw_text(verts, text, cx - total_w / 2.0, cy - total_h / 2.0, pw, ph, color);
+pub fn draw_text(
+    verts: &mut Vec<UIVertex>,
+    text: &str,
+    start_x: f32,
+    start_y: f32,
+    scale: f32,
+    aspect: f32,
+    color: [f32; 4],
+) {
+    let ph = 0.0032 * scale;
+    let pw = ph / aspect;
+    let shadow_color = [0.02, 0.02, 0.04, color[3] * 0.9];
+    let shadow_offset_x = pw * 0.75;
+    let shadow_offset_y = -ph * 0.75;
+
+    let mut cursor_x = start_x;
+    for c in text.chars() {
+        let glyph = get_glyph_5x7(c);
+        draw_glyph_raw(verts, &glyph, cursor_x + shadow_offset_x, start_y + shadow_offset_y, pw, ph, shadow_color);
+        draw_glyph_raw(verts, &glyph, cursor_x, start_y, pw, ph, color);
+        cursor_x += 6.0 * pw;
+    }
+}
+
+pub fn draw_text_centered(
+    verts: &mut Vec<UIVertex>,
+    text: &str,
+    cx: f32,
+    cy: f32,
+    scale: f32,
+    aspect: f32,
+    color: [f32; 4],
+) {
+    let ph = 0.0032 * scale;
+    let pw = ph / aspect;
+    let total_w = (text.len() as f32 * 6.0 - 1.0) * pw;
+    let total_h = 7.0 * ph;
+    draw_text(verts, text, cx - total_w / 2.0, cy - total_h / 2.0, scale, aspect, color);
 }
 
 const PRESET_SWATCHES: [[f32; 3]; 10] = [
@@ -865,27 +1060,21 @@ fn build_ui_vertices(
     cursor_free: bool,
 ) -> Vec<UIVertex> {
     let mut verts = Vec::new();
-    let font_pw = 0.0050;
-    let font_ph = 0.0085;
 
-    // --- GIMBAL BLENDER ---
     let g_cx = GIZMO_CENTER_X;
     let g_cy = GIZMO_CENTER_Y;
     let g_rad = GIZMO_RADIUS;
 
-    // Anneau de fond
     let disc_rx = (g_rad + 0.018) / aspect;
     let disc_ry = g_rad + 0.018;
     add_quad(&mut verts, g_cx - disc_rx - 0.003, g_cy - disc_ry - 0.003, g_cx + disc_rx + 0.003, g_cy + disc_ry + 0.003, [0.25, 0.30, 0.38, 0.6]);
     add_quad(&mut verts, g_cx - disc_rx, g_cy - disc_ry, g_cx + disc_rx, g_cy + disc_ry, [0.08, 0.10, 0.14, 0.70]);
 
-    // Bouton Focus à gauche du Gimbal
     let (bx0, by0, bx1, by1) = get_focus_button_bounds(aspect);
     add_quad(&mut verts, bx0 - 0.003, by0 - 0.003, bx1 + 0.003, by1 + 0.003, [0.35, 0.40, 0.50, 0.8]);
     add_quad(&mut verts, bx0, by0, bx1, by1, [0.12, 0.15, 0.22, 0.90]);
-    draw_text_centered(&mut verts, "[.]", (bx0 + bx1) / 2.0, (by0 + by1) / 2.0, font_pw * 0.9, font_ph * 0.9, [0.3, 0.9, 1.0, 1.0]);
+    draw_text_centered(&mut verts, "[.]", (bx0 + bx1) / 2.0, (by0 + by1) / 2.0, 1.1, aspect, [0.3, 0.9, 1.0, 1.0]);
 
-    // Projection des axes du Gimbal
     let mut axes_projected: Vec<(GizmoAxis, f32, f32, f32)> = get_gizmo_axes().into_iter().map(|ax| {
         let sx = ax.dir.dot(camera_right);
         let sy = ax.dir.dot(camera_up);
@@ -905,7 +1094,7 @@ fn build_ui_vertices(
             let n_rx = node_r / aspect;
             let n_ry = node_r;
             add_quad(&mut verts, tip_x - n_rx, tip_y - n_ry, tip_x + n_rx, tip_y + n_ry, ax.color);
-            draw_text_centered(&mut verts, ax.name, tip_x, tip_y, font_pw * 0.85, font_ph * 0.85, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, ax.name, tip_x, tip_y, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         } else {
             add_line(&mut verts, g_cx, g_cy, tip_x, tip_y, 0.0025, aspect, [ax.color[0], ax.color[1], ax.color[2], 0.35]);
             let node_r = 0.010;
@@ -915,7 +1104,6 @@ fn build_ui_vertices(
         }
     }
 
-    // --- BARRE DE SLOTS ---
     let num_slots = 10;
     let slot_w = 0.054;
     let slot_gap = 0.009;
@@ -936,7 +1124,7 @@ fn build_ui_vertices(
         add_quad(&mut verts, x0, y_bottom, x1, y_top, [rgb[0], rgb[1], rgb[2], 1.0]);
 
         let num_str = match i { 9 => "0", _ => &format!("{}", i + 1) };
-        draw_text_centered(&mut verts, num_str, (x0 + x1) / 2.0, y_top + 0.02, font_pw * 0.8, font_ph * 0.8, [0.9, 0.9, 0.9, 0.9]);
+        draw_text_centered(&mut verts, num_str, (x0 + x1) / 2.0, y_top + 0.02, 1.0, aspect, [0.9, 0.9, 0.9, 0.9]);
     }
 
     let size_str = format!("SIZE: {}X{}", edit_size, edit_size);
@@ -949,18 +1137,18 @@ fn build_ui_vertices(
             let mode_hud = if play_mode == PlayMode::Flying { "FLY" } else { "REAL" };
             let proj_hud = if is_ortho { "ORTHO" } else { "PERSP" };
             let hud_title = format!("MODE: {} | PROJ: {} | WORLD: {} | {}", mode_hud, proj_hud, world_type.name(), size_str);
-            draw_text(&mut verts, &hud_title, -0.96, 0.92, font_pw, font_ph, [1.0, 1.0, 1.0, 0.95]);
+            draw_text(&mut verts, &hud_title, -0.96, 0.92, 1.25, aspect, [1.0, 1.0, 1.0, 0.95]);
 
             if cursor_free {
-                draw_text(&mut verts, "CURSOR FREE / BORDERS ON  |  [+/-] ORTHO ZOOM", -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.2, 0.95, 0.4, 0.95]);
+                draw_text(&mut verts, "CURSOR FREE / BORDERS ON  |  [+/-] ORTHO ZOOM", -0.96, 0.86, 1.0, aspect, [0.2, 0.95, 0.4, 0.95]);
             } else if let Some(tpos) = target_pos {
                 let target_str = format!("AIM: [{}, {}, {}] (SNAP)", tpos[0], tpos[1], tpos[2]);
-                draw_text(&mut verts, &target_str, -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.3, 0.9, 0.9, 0.9]);
+                draw_text(&mut verts, &target_str, -0.96, 0.86, 1.0, aspect, [0.3, 0.9, 0.9, 0.9]);
             } else {
-                draw_text(&mut verts, "AIM: [UNBOUNDED VOID - PLACES IN FRONT]", -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.6, 0.7, 0.8, 0.8]);
+                draw_text(&mut verts, "AIM: [UNBOUNDED VOID - PLACES IN FRONT]", -0.96, 0.86, 1.0, aspect, [0.6, 0.7, 0.8, 0.8]);
             }
 
-            draw_text(&mut verts, "[E] PALETTE  [TAB] FREE/BORDERS  [P] PROJECTION  [.] FOCUS  [Q/R] SIZE", -0.96, 0.80, font_pw * 0.8, font_ph * 0.8, [0.9, 0.85, 0.4, 0.85]);
+            draw_text(&mut verts, "[E] PALETTE  [TAB] FREE/BORDERS  [P] PROJECTION  [.] FOCUS  [F/R] SIZE", -0.96, 0.80, 0.95, aspect, [0.9, 0.85, 0.4, 0.85]);
         }
 
         ActiveMenu::Edit => {
@@ -971,7 +1159,7 @@ fn build_ui_vertices(
             add_quad(&mut verts, px0 - 0.006, py0 - 0.006, px1 + 0.006, py1 + 0.006, [0.25, 0.35, 0.50, 1.0]);
             add_quad(&mut verts, px0, py0, px1, py1, [0.10, 0.12, 0.16, 0.98]);
 
-            draw_text_centered(&mut verts, "EDIT STUDIO - PALETTE & OCTREE (E)", 0.0, 0.58, font_pw * 1.1, font_ph * 1.1, [1.0, 0.9, 0.2, 1.0]);
+            draw_text_centered(&mut verts, "EDIT STUDIO - PALETTE & OCTREE (E)", 0.0, 0.58, 1.3, aspect, [1.0, 0.9, 0.2, 1.0]);
 
             let sw_w = 0.082;
             let sw_gap = 0.015;
@@ -992,13 +1180,13 @@ fn build_ui_vertices(
                 add_quad(&mut verts, sx0, sy0, sx1, sy1, [rgb[0], rgb[1], rgb[2], 1.0]);
 
                 let num_str = match i { 9 => "0", _ => &format!("{}", i + 1) };
-                draw_text_centered(&mut verts, num_str, (sx0 + sx1) / 2.0, sy1 + 0.022, font_pw * 0.8, font_ph * 0.8, [0.8, 0.8, 0.8, 0.9]);
+                draw_text_centered(&mut verts, num_str, (sx0 + sx1) / 2.0, sy1 + 0.022, 1.0, aspect, [0.8, 0.8, 0.8, 0.9]);
             }
 
             let [cur_r, cur_g, cur_b] = hotbar_colors[selected_slot];
             add_quad(&mut verts, 0.24, 0.18, 0.46, 0.37, [0.25, 0.28, 0.35, 1.0]);
             add_quad(&mut verts, 0.248, 0.188, 0.452, 0.362, [cur_r, cur_g, cur_b, 1.0]);
-            draw_text_centered(&mut verts, "ACTIVE COLOR", 0.35, 0.39, font_pw * 0.8, font_ph * 0.8, [0.85, 0.85, 0.85, 0.9]);
+            draw_text_centered(&mut verts, "ACTIVE COLOR", 0.35, 0.39, 1.0, aspect, [0.85, 0.85, 0.85, 0.9]);
 
             let sl_x0 = -0.32;
             let sl_x1 = 0.18;
@@ -1009,7 +1197,7 @@ fn build_ui_vertices(
             ];
 
             for (lbl, val, y0, y1, bar_col) in channels {
-                draw_text_centered(&mut verts, lbl, -0.37, (y0 + y1) / 2.0, font_pw, font_ph, bar_col);
+                draw_text_centered(&mut verts, lbl, -0.37, (y0 + y1) / 2.0, 1.1, aspect, bar_col);
                 add_quad(&mut verts, sl_x0, y0, sl_x1, y1, [0.18, 0.20, 0.25, 1.0]);
                 let filled_x = sl_x0 + val * (sl_x1 - sl_x0);
                 add_quad(&mut verts, sl_x0, y0, filled_x, y1, bar_col);
@@ -1023,7 +1211,7 @@ fn build_ui_vertices(
             let pwy0 = 0.05;
             let pwy1 = 0.11;
 
-            draw_text_centered(&mut verts, "QUICK PALETTE CHIPS", 0.0, 0.135, font_pw * 0.8, font_ph * 0.8, [0.75, 0.75, 0.8, 0.9]);
+            draw_text_centered(&mut verts, "QUICK PALETTE CHIPS", 0.0, 0.135, 1.0, aspect, [0.75, 0.75, 0.8, 0.9]);
             for (i, &rgb) in PRESET_SWATCHES.iter().enumerate() {
                 let px0 = pw_start_x + i as f32 * (pw_w + pw_gap);
                 let px1 = px0 + pw_w;
@@ -1032,16 +1220,16 @@ fn build_ui_vertices(
             }
 
             add_quad(&mut verts, -0.40, -0.10, -0.22, -0.02, [0.35, 0.40, 0.55, 1.0]);
-            draw_text_centered(&mut verts, "/ 2 (Q)", -0.31, -0.06, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "/ 2 (F)", -0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             let active_sz_txt = format!("CURRENT: {}X{}", edit_size, edit_size);
-            draw_text_centered(&mut verts, &active_sz_txt, 0.0, -0.06, font_pw * 1.1, font_ph * 1.1, [1.0, 0.85, 0.2, 1.0]);
+            draw_text_centered(&mut verts, &active_sz_txt, 0.0, -0.06, 1.25, aspect, [1.0, 0.85, 0.2, 1.0]);
 
             add_quad(&mut verts, 0.22, -0.10, 0.40, -0.02, [0.35, 0.40, 0.55, 1.0]);
-            draw_text_centered(&mut verts, "* 2 (R)", 0.31, -0.06, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "* 2 (R)", 0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             add_quad(&mut verts, -0.22, -0.25, 0.22, -0.17, [0.20, 0.50, 0.30, 1.0]);
-            draw_text_centered(&mut verts, "DONE (PRESS E)", 0.0, -0.21, font_pw * 0.9, font_ph * 0.9, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "DONE (PRESS E)", 0.0, -0.21, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
 
         ActiveMenu::Pause => {
@@ -1052,34 +1240,34 @@ fn build_ui_vertices(
             add_quad(&mut verts, px0 - 0.006, py0 - 0.006, px1 + 0.006, py1 + 0.006, [0.45, 0.45, 0.50, 1.0]);
             add_quad(&mut verts, px0, py0, px1, py1, [0.12, 0.13, 0.17, 0.98]);
 
-            draw_text_centered(&mut verts, "PAUSE / SYSTEM MENU", 0.0, 0.54, font_pw * 1.1, font_ph * 1.1, [0.95, 0.95, 0.95, 1.0]);
+            draw_text_centered(&mut verts, "PAUSE / SYSTEM MENU", 0.0, 0.54, 1.3, aspect, [0.95, 0.95, 0.95, 1.0]);
 
             let mode_text = if play_mode == PlayMode::Flying { "PLAY MODE: FLYING" } else { "PLAY MODE: REAL" };
             add_quad(&mut verts, -0.30, 0.40, 0.30, 0.48, [0.25, 0.35, 0.55, 1.0]);
-            draw_text_centered(&mut verts, mode_text, 0.0, 0.44, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, mode_text, 0.0, 0.44, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             let proj_text = if is_ortho { "VIEW: ORTHOGRAPHIC" } else { "VIEW: PERSPECTIVE" };
             add_quad(&mut verts, -0.30, 0.29, 0.30, 0.37, [0.22, 0.40, 0.55, 1.0]);
-            draw_text_centered(&mut verts, proj_text, 0.0, 0.33, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, proj_text, 0.0, 0.33, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             let world_label = format!("WORLD: {}", world_type.name());
             add_quad(&mut verts, -0.30, 0.18, 0.30, 0.26, [0.35, 0.25, 0.50, 1.0]);
-            draw_text_centered(&mut verts, &world_label, 0.0, 0.22, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, &world_label, 0.0, 0.22, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             add_quad(&mut verts, -0.30, 0.07, 0.30, 0.15, [0.60, 0.30, 0.20, 1.0]);
-            draw_text_centered(&mut verts, "CLEAR SCENE", 0.0, 0.11, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "CLEAR SCENE", 0.0, 0.11, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             add_quad(&mut verts, -0.30, -0.04, -0.02, 0.04, [0.25, 0.45, 0.35, 1.0]);
-            draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.0, font_pw * 0.9, font_ph * 0.9, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.0, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             add_quad(&mut verts, 0.02, -0.04, 0.30, 0.04, [0.35, 0.45, 0.25, 1.0]);
-            draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.0, font_pw * 0.9, font_ph * 0.9, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.0, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             add_quad(&mut verts, -0.30, -0.16, 0.30, -0.08, [0.20, 0.55, 0.30, 1.0]);
-            draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.12, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.12, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             add_quad(&mut verts, -0.30, -0.28, 0.30, -0.20, [0.55, 0.20, 0.20, 1.0]);
-            draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.24, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.24, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
     }
 
@@ -1545,39 +1733,24 @@ impl State {
         }
 
         let dir = self.camera.forward();
-        let mut current_pos = self.camera.position;
-        let step = 0.25;
-        let max_steps = 1200; // Optimized from 10000
-        let mut hit = false;
-        let mut hit_pos = Vec3::ZERO;
-        let mut prev_pos = current_pos;
-
-        for _ in 0..max_steps { 
-            current_pos += dir * step;
-            let mat = self.chunk_manager.get_material(current_pos);
-            if mat != 0 {
-                hit = true;
-                hit_pos = current_pos;
-                break;
-            }
-            prev_pos = current_pos;
-        }
+        let hit = self.chunk_manager.raycast(self.camera.position, dir, 300.0);
 
         let s = self.edit_size as i32;
-        if hit {
+        if let Some(ref h) = hit {
             self.last_target = Some([
-                (hit_pos.x.floor() as i32).div_euclid(s) * s,
-                (hit_pos.y.floor() as i32).div_euclid(s) * s,
-                (hit_pos.z.floor() as i32).div_euclid(s) * s,
+                h.voxel_pos.x.div_euclid(s) * s,
+                h.voxel_pos.y.div_euclid(s) * s,
+                h.voxel_pos.z.div_euclid(s) * s,
             ]);
         } else {
             self.last_target = None;
         }
 
         if self.input.action_add || self.input.action_remove || self.input.action_pick {
-            if hit {
+            if let Some(h) = hit {
+                let hit_center = Vec3::new(h.voxel_pos.x as f32 + 0.5, h.voxel_pos.y as f32 + 0.5, h.voxel_pos.z as f32 + 0.5);
                 if self.input.action_pick {
-                    let mat = self.chunk_manager.get_material(hit_pos);
+                    let mat = h.material;
                     let pal = self.palette.read().unwrap();
                     if let Some(&color) = pal.get((mat - 1) as usize) {
                         self.hotbar_colors[self.selected_slot] = color;
@@ -1585,19 +1758,19 @@ impl State {
                         self.update_ui();
                     }
                 } else if self.input.action_remove { 
-                    self.chunk_manager.modify_cube(hit_pos, 0, self.edit_size, &self.device); 
+                    self.chunk_manager.modify_cube(hit_center, 0, self.edit_size, &self.device, &self.queue); 
                 } else if self.input.action_add { 
-                    let place_pos = prev_pos;
+                    let place_pos = hit_center + h.normal.as_vec3() * (self.edit_size as f32);
                     if self.play_mode == PlayMode::Flying || !self.player_collides_at(self.camera.position) {
                         let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
-                        self.chunk_manager.modify_cube(place_pos, mat_id, self.edit_size, &self.device); 
+                        self.chunk_manager.modify_cube(place_pos, mat_id, self.edit_size, &self.device, &self.queue); 
                     }
                 }
             } else if self.input.action_add {
                 let spawn_dist = (self.edit_size as f32 * 1.5).clamp(8.0, 64.0);
                 let place_pos = self.camera.position + dir * spawn_dist;
                 let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
-                self.chunk_manager.modify_cube(place_pos, mat_id, self.edit_size, &self.device);
+                self.chunk_manager.modify_cube(place_pos, mat_id, self.edit_size, &self.device, &self.queue);
             }
 
             self.input.action_add = false; 
@@ -1694,7 +1867,6 @@ impl ApplicationHandler for App {
                     let ndc_y = 1.0 - (position.y as f32 / state.size.height as f32) * 2.0;
                     state.cursor_pos = [ndc_x, ndc_y];
 
-                    // Orbital drag on gimbal
                     if state.gimbal_dragging {
                         let dx = ndc_x - state.prev_cursor_pos[0];
                         let dy = ndc_y - state.prev_cursor_pos[1];
@@ -1800,7 +1972,7 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::F5) => { let _ = state.save_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::F9) => { let _ = state.load_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::KeyM) => state.toggle_play_mode(),
-                            PhysicalKey::Code(KeyCode::KeyQ) => state.scale_voxel_size(false),
+                            PhysicalKey::Code(KeyCode::KeyF) => state.scale_voxel_size(false),
                             PhysicalKey::Code(KeyCode::KeyR) => state.scale_voxel_size(true),
                             PhysicalKey::Code(KeyCode::Digit1) => { state.selected_slot = 0; state.update_ui(); },
                             PhysicalKey::Code(KeyCode::Digit2) => { state.selected_slot = 1; state.update_ui(); },
@@ -1879,7 +2051,7 @@ impl ApplicationHandler for App {
                                         if dist_sq <= 0.035 * 0.035 {
                                             state.camera.yaw = ax.yaw;
                                             state.camera.pitch = ax.pitch;
-                                            state.camera.is_ortho = true; // Snap to orthographic view like Blender
+                                            state.camera.is_ortho = true;
                                             state.update_camera_buffer();
                                             state.update_ui();
                                             return;

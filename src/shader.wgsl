@@ -15,13 +15,15 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
-    @location(1) uv: vec2<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
 };
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.color = model.color;
+    out.normal = model.normal;
     out.uv = model.uv;
     out.clip_position = camera.view_proj * vec4<f32>(model.position, 1.0);
     return out;
@@ -29,7 +31,11 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    var col = in.color;
+    let light_dir = normalize(vec3<f32>(0.5, 0.9, 0.3));
+    let ndotl = max(dot(in.normal, light_dir), 0.0);
+    let lighting = ndotl * 0.65 + 0.35;
+
+    var col = in.color * lighting;
     if (camera.show_borders > 0.5) {
         let edge = min(min(in.uv.x, 1.0 - in.uv.x), min(in.uv.y, 1.0 - in.uv.y));
         if (edge < 0.045) {
