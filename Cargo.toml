@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+block-mesh = "0.2.0"
+bytemuck = {version = "1.25.2", features = ["derive"] }
+env_logger = "0.11.11"
+glam = "0.33.6"
+log = "0.4.34"
+ndshape = "0.3.0"
+noise = "0.9.0"
+pollster = "1.0.1"
+rayon = "1.12.0"
+wgpu = "30.0.1"
+winit = "0.30.13"
