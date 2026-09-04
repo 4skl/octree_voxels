@@ -340,7 +340,7 @@ impl Camera {
         let (sin_p, cos_p) = self.pitch.sin_cos(); let (sin_y, cos_y) = self.yaw.sin_cos();
         let dir = Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p).normalize();
         let view = glam::camera::rh::view::look_at_mat4(self.position, self.position + dir, Vec3::Y);
-        let proj = glam::camera::rh::proj::directx::perspective((60.0_f32).to_radians(), aspect, 0.1, 500.0);
+        let proj = glam::camera::rh::proj::directx::perspective((60.0_f32).to_radians(), aspect, 0.05, 500.0);
         proj * view
     }
     fn forward(&self) -> Vec3 {
@@ -429,7 +429,6 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
     let font_pw = 0.0055;
     let font_ph = 0.009;
 
-    // Hotbar en bas
     let slot_width = 0.08;
     let slot_spacing = 0.02;
     let total_width = num_slots as f32 * slot_width + (num_slots - 1) as f32 * slot_spacing;
@@ -450,17 +449,14 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
     }
 
     if !menu_open {
-        // Réticule central
         add_quad(&mut verts, -0.016, -0.0035, 0.016, 0.0035, [0.0, 0.0, 0.0, 0.6]);
         add_quad(&mut verts, -0.0035, -0.026, 0.0035, 0.026, [0.0, 0.0, 0.0, 0.6]);
         add_quad(&mut verts, -0.014, -0.002, 0.014, 0.002, [1.0, 1.0, 1.0, 0.9]);
         add_quad(&mut verts, -0.002, -0.024, 0.002, 0.024, [1.0, 1.0, 1.0, 0.9]);
 
-        // Indicateur du mode de jeu actif
         let mode_hud = if play_mode == PlayMode::Flying { "FLY" } else { "REAL" };
         draw_text(&mut verts, mode_hud, -0.95, 0.90, 0.006, 0.011, [1.0, 1.0, 1.0, 0.85]);
     } else {
-        // Menu Pause
         add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.0, 0.0, 0.0, 0.65]);
 
         let px0 = -0.48; let px1 = 0.48;
@@ -468,7 +464,6 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
         add_quad(&mut verts, px0 - 0.008, py0 - 0.008, px1 + 0.008, py1 + 0.008, [0.4, 0.4, 0.45, 1.0]);
         add_quad(&mut verts, px0, py0, px1, py1, [0.12, 0.12, 0.15, 0.95]);
 
-        // 1. Sélection de slot à éditer
         let swatch_w = 0.11;
         let swatch_gap = 0.025;
         let swatches_total = num_slots as f32 * swatch_w + (num_slots - 1) as f32 * swatch_gap;
@@ -488,14 +483,11 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
             add_quad(&mut verts, sx0, sy0, sx1, sy1, [rgb[0], rgb[1], rgb[2], 1.0]);
         }
 
-        // 2. Sélecteur de couleur RVB
         let [cur_r, cur_g, cur_b] = hotbar_colors[selected_slot];
 
-        // Boîte d'aperçu de la couleur
         add_quad(&mut verts, 0.215, 0.155, 0.385, 0.355, [0.4, 0.4, 0.45, 1.0]);
         add_quad(&mut verts, 0.22, 0.16, 0.38, 0.35, [cur_r, cur_g, cur_b, 1.0]);
 
-        // Sliders Rouge, Vert, Bleu
         let sl_x0 = -0.30;
         let sl_x1 = 0.15;
         let channels = [
@@ -512,18 +504,15 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
             add_quad(&mut verts, filled_x - 0.012, y0 - 0.008, filled_x + 0.012, y1 + 0.008, [1.0, 1.0, 1.0, 1.0]);
         }
 
-        // 3. Bouton Mode (Vol / Réel)
         let mode_text = if play_mode == PlayMode::Flying { "MODE: FLYING" } else { "MODE: REAL" };
         add_quad(&mut verts, -0.305, -0.015, 0.305, 0.085, [0.35, 0.5, 0.75, 1.0]);
         add_quad(&mut verts, -0.30, -0.01, 0.30, 0.08, [0.2, 0.32, 0.55, 1.0]);
         draw_text_centered(&mut verts, mode_text, 0.0, 0.035, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
 
-        // 4. Bouton RESUME
         add_quad(&mut verts, -0.305, -0.155, 0.305, -0.055, [0.35, 0.6, 0.4, 1.0]);
         add_quad(&mut verts, -0.30, -0.15, 0.30, -0.06, [0.2, 0.55, 0.3, 1.0]);
         draw_text_centered(&mut verts, "RESUME", 0.0, -0.105, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
 
-        // 5. Bouton QUIT
         add_quad(&mut verts, -0.305, -0.295, 0.305, -0.195, [0.6, 0.3, 0.3, 1.0]);
         add_quad(&mut verts, -0.30, -0.29, 0.30, -0.20, [0.5, 0.2, 0.2, 1.0]);
         draw_text_centered(&mut verts, "QUIT", 0.0, -0.245, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
@@ -602,7 +591,6 @@ impl State {
             multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
 
-        // Pipeline UI
         let ui_shader = device.create_shader_module(wgpu::include_wgsl!("ui.wgsl"));
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[], immediate_size: 0 });
         let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -614,11 +602,11 @@ impl State {
         });
 
         let hotbar_colors = [
-            [0.50, 0.50, 0.50], // 1: Gris
-            [0.20, 0.70, 0.30], // 2: Vert
-            [0.80, 0.20, 0.20], // 3: Rouge
-            [0.20, 0.45, 0.85], // 4: Bleu
-            [0.95, 0.75, 0.20], // 5: Jaune
+            [0.50, 0.50, 0.50],
+            [0.20, 0.70, 0.30],
+            [0.80, 0.20, 0.20],
+            [0.20, 0.45, 0.85],
+            [0.95, 0.75, 0.20],
         ];
 
         let palette = Arc::new(RwLock::new(hotbar_colors.to_vec()));
@@ -689,6 +677,21 @@ impl State {
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
     }
 
+    fn player_collides_at(&self, pos: Vec3) -> bool {
+        let r = 0.35;
+        let heights = [-1.55, -0.75, 0.15];
+        for &dy in &heights {
+            for &dx in &[-r, r] {
+                for &dz in &[-r, r] {
+                    if self.chunk_manager.is_solid(pos + Vec3::new(dx, dy, dz)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size; self.config.width = new_size.width; self.config.height = new_size.height;
@@ -702,7 +705,6 @@ impl State {
     fn update(&mut self, dt: f32) {
         if self.menu_open { return; }
 
-        let speed = 25.0;
         let (sin_y, cos_y) = self.camera.yaw.sin_cos();
         let forward = Vec3::new(cos_y, 0.0, sin_y).normalize();
         let right = Vec3::new(-sin_y, 0.0, cos_y).normalize();
@@ -713,73 +715,75 @@ impl State {
 
         match self.play_mode {
             PlayMode::Flying => {
+                let speed = 24.0;
                 if self.input.up { movement.y += 1.0; } if self.input.down { movement.y -= 1.0; }
                 if movement.length_squared() > 0.0 { movement = movement.normalize(); }
                 self.camera.position += movement * speed * dt;
             },
             PlayMode::Real => {
+                let walk_speed = 6.5;
                 if movement.length_squared() > 0.0 { movement = movement.normalize(); }
                 
-                let dx = movement.x * speed * dt;
-                if !self.chunk_manager.is_solid(self.camera.position + Vec3::new(dx, -1.0, 0.0)) && 
-                   !self.chunk_manager.is_solid(self.camera.position + Vec3::new(dx, 0.0, 0.0)) {
+                let dx = movement.x * walk_speed * dt;
+                if !self.player_collides_at(self.camera.position + Vec3::new(dx, 0.0, 0.0)) {
                     self.camera.position.x += dx;
                 }
                 
-                let dz = movement.z * speed * dt;
-                if !self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, -1.0, dz)) &&
-                   !self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, 0.0, dz)) {
+                let dz = movement.z * walk_speed * dt;
+                if !self.player_collides_at(self.camera.position + Vec3::new(0.0, 0.0, dz)) {
                     self.camera.position.z += dz;
                 }
 
-                // Gravité
-                self.velocity.y -= 45.0 * dt; 
+                // Gravity
+                self.velocity.y -= 38.0 * dt;
 
-                // Détection d'appui au sol et Saut sur ESPACE
-                let on_ground = self.chunk_manager.is_solid(self.camera.position - Vec3::new(0.0, 1.6, 0.0));
+                // Jump when on the ground
+                let on_ground = self.player_collides_at(self.camera.position - Vec3::new(0.0, 0.08, 0.0));
                 if self.input.up && on_ground { 
-                    self.velocity.y = 13.0; 
+                    self.velocity.y = 11.5; 
                 }
 
-                let dy = self.velocity.y * dt;
-                if dy < 0.0 {
-                    if self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, dy - 1.5, 0.0)) { 
+                // Vertical sub-stepping for collision & clipping prevention
+                let total_dy = self.velocity.y * dt;
+                let step_count = ((total_dy.abs() / 0.08).ceil() as i32).max(1);
+                let step_dy = total_dy / step_count as f32;
+
+                for _ in 0..step_count {
+                    if self.player_collides_at(self.camera.position + Vec3::new(0.0, step_dy, 0.0)) {
                         self.velocity.y = 0.0;
-                        self.camera.position.y = (self.camera.position.y + dy - 1.5).floor() + 2.5;
-                    } else { 
-                        self.camera.position.y += dy; 
-                    }
-                } else if dy > 0.0 {
-                    if self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, dy + 0.3, 0.0)) {
-                        self.velocity.y = 0.0;
+                        break;
                     } else {
-                        self.camera.position.y += dy;
+                        self.camera.position.y += step_dy;
                     }
                 }
             }
         }
 
-        // Actions souris (Poser / Supprimer / Pipette)
+        // Handle Cube interactions: Add / Remove / Pick
         if self.input.action_add || self.input.action_remove || self.input.action_pick {
             let dir = self.camera.forward();
             let mut current_pos = self.camera.position;
-            let step = 0.1; 
-            for _ in 0..100 { 
+            let step = 0.05; 
+            for _ in 0..200 { 
                 current_pos += dir * step;
                 let mat = self.chunk_manager.get_material(current_pos);
                 if mat != 0 {
                     if self.input.action_pick {
-                        let color = self.palette.read().unwrap().get((mat - 1) as usize).copied();
-                        if let Some(color) = color {
+                        let pal = self.palette.read().unwrap();
+                        if let Some(&color) = pal.get((mat - 1) as usize) {
                             self.hotbar_colors[self.selected_slot] = color;
+                            drop(pal);
                             self.update_ui();
                         }
                     } else if self.input.action_remove { 
                         self.chunk_manager.modify_block(current_pos, 0, &self.device); 
                     } else if self.input.action_add { 
                         let place_pos = current_pos - dir * step;
-                        let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
-                        self.chunk_manager.modify_block(place_pos, mat_id, &self.device); 
+                        // Avoid spawning cube directly inside player's body
+                        if self.play_mode == PlayMode::Flying || !self.player_collides_at(self.camera.position) {
+                            let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
+                            self.chunk_manager.modify_block(place_pos, mat_id, &self.device); 
+                        }
                     }
                     break;
                 }
@@ -805,7 +809,7 @@ impl State {
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        // Rendu 3D
+        // 3D Pass
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
@@ -823,7 +827,7 @@ impl State {
             }
         }
 
-        // Rendu 2D (UI)
+        // 2D Pass (UI)
         {
             let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("UI Render Pass"),
@@ -935,7 +939,6 @@ impl ApplicationHandler for App {
                             if element_state == ElementState::Pressed {
                                 let [mx, my] = state.cursor_pos;
 
-                                // 1. Sélection d'un slot
                                 let swatch_w = 0.11;
                                 let swatch_gap = 0.025;
                                 let s_start_x = -(5.0 * swatch_w + 4.0 * swatch_gap) / 2.0;
@@ -949,7 +952,6 @@ impl ApplicationHandler for App {
                                     }
                                 }
 
-                                // 2. Clic sur les curseurs RVB
                                 let sl_x0 = -0.30;
                                 let sl_x1 = 0.15;
                                 if mx >= sl_x0 - 0.02 && mx <= sl_x1 + 0.02 {
@@ -972,19 +974,16 @@ impl ApplicationHandler for App {
                                     }
                                 }
 
-                                // 3. Bouton Mode
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.01 && my <= 0.08 {
                                     state.toggle_play_mode();
                                     return;
                                 }
 
-                                // 4. Bouton RESUME
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.15 && my <= -0.06 {
                                     state.toggle_menu();
                                     return;
                                 }
 
-                                // 5. Bouton QUIT
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.29 && my <= -0.20 {
                                     event_loop.exit();
                                     return;
