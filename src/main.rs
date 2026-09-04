@@ -24,7 +24,7 @@ use noise::{NoiseFn, Fbm, Perlin};
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 type ChunkShape = ConstShape3u32<34, 34, 34>; 
 type ChunkPos = (i32, i32, i32);
-pub type Palette = [[f32; 3]; 5];
+pub type Palette = Vec<[f32; 3]>;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum PlayMode { Flying, Real }
@@ -66,6 +66,28 @@ impl Octree {
             current_idx = (self.nodes[current_idx].child_pointer + octant) as usize;
         }
         self.nodes[current_idx].material_id = material;
+    }
+
+    pub fn query(&self, mut x: u32, mut y: u32, mut z: u32, depth: u8) -> u16 {
+        let mut current_idx = self.root_index as usize;
+        let mut half_size = 1 << depth;
+        for _ in 0..depth {
+            half_size >>= 1;
+            let mut octant = 0;
+            if x >= half_size { octant |= 1; x -= half_size; }
+            if y >= half_size { octant |= 2; y -= half_size; }
+            if z >= half_size { octant |= 4; z -= half_size; }
+
+            let node = &self.nodes[current_idx];
+            if node.child_pointer == 0 {
+                return node.material_id;
+            }
+            if (node.child_mask & (1 << octant)) == 0 {
+                return 0;
+            }
+            current_idx = (node.child_pointer + octant) as usize;
+        }
+        self.nodes[current_idx].material_id
     }
 
     pub fn flatten_into(&self, node_idx: usize, x: u32, y: u32, z: u32, size: u32, voxels: &mut [Block]) {
@@ -132,7 +154,7 @@ fn generate_octree(chunk_pos: ChunkPos) -> Octree {
     octree
 }
 
-fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos, palette: &Palette) -> MeshPayload {
+fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos, palette: &[[f32; 3]]) -> MeshPayload {
     let mut voxels = vec![Block(0); ChunkShape::SIZE as usize];
     octree.flatten_into(octree.root_index as usize, 1, 1, 1, 32, &mut voxels);
 
@@ -222,7 +244,7 @@ impl ChunkManager {
                     let pal_arc = Arc::clone(&self.palette);
                     rayon::spawn(move || {
                         let octree = generate_octree(pos);
-                        let pal = *pal_arc.read().unwrap();
+                        let pal = pal_arc.read().unwrap().clone();
                         let payload = generate_mesh(&octree, pos, &pal);
                         let _ = tx_clone.send((pos, octree, payload));
                     });
@@ -252,7 +274,7 @@ impl ChunkManager {
 
         if let Some(chunk) = self.loaded_chunks.get_mut(&chunk_pos) {
             chunk.octree.insert(lx, ly, lz, 5, material);
-            let pal = *self.palette.read().unwrap();
+            let pal = self.palette.read().unwrap().clone();
             let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
             chunk.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX });
             chunk.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX });
@@ -260,16 +282,19 @@ impl ChunkManager {
         }
     }
 
-    fn is_solid(&self, pos: Vec3) -> bool {
+    fn get_material(&self, pos: Vec3) -> u16 {
         let cx = (pos.x / 32.0).floor() as i32; let cy = (pos.y / 32.0).floor() as i32; let cz = (pos.z / 32.0).floor() as i32;
         let lx = (pos.x.floor() as i32).rem_euclid(32) as u32; let ly = (pos.y.floor() as i32).rem_euclid(32) as u32; let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
 
         if let Some(chunk) = self.loaded_chunks.get(&(cx, cy, cz)) {
-            let mut voxels = vec![Block(0); ChunkShape::SIZE as usize];
-            chunk.octree.flatten_into(chunk.octree.root_index as usize, 1, 1, 1, 32, &mut voxels);
-            return voxels[ChunkShape::linearize([lx + 1, ly + 1, lz + 1]) as usize].0 != 0;
+            chunk.octree.query(lx, ly, lz, 5)
+        } else {
+            0
         }
-        false
+    }
+
+    fn is_solid(&self, pos: Vec3) -> bool {
+        self.get_material(pos) != 0
     }
 }
 
@@ -325,7 +350,17 @@ impl Camera {
 }
 
 #[derive(Default)]
-struct InputState { forward: bool, backward: bool, left: bool, right: bool, up: bool, down: bool, action_add: bool, action_remove: bool }
+struct InputState { 
+    forward: bool, 
+    backward: bool, 
+    left: bool, 
+    right: bool, 
+    up: bool, 
+    down: bool, 
+    action_add: bool, 
+    action_remove: bool,
+    action_pick: bool,
+}
 
 fn add_quad(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 4]) {
     verts.extend_from_slice(&[
@@ -388,9 +423,9 @@ fn draw_text_centered(verts: &mut Vec<UIVertex>, text: &str, cx: f32, cy: f32, p
     draw_text(verts, text, cx - total_w / 2.0, cy - total_h / 2.0, pw, ph, color);
 }
 
-fn build_ui_vertices(selected: u16, menu_open: bool, palette: &Palette, play_mode: PlayMode) -> Vec<UIVertex> {
+fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f32; 3]; 5], play_mode: PlayMode) -> Vec<UIVertex> {
     let mut verts = Vec::new();
-    let num_slots = palette.len();
+    let num_slots = hotbar_colors.len();
     let font_pw = 0.0055;
     let font_ph = 0.009;
 
@@ -402,12 +437,11 @@ fn build_ui_vertices(selected: u16, menu_open: bool, palette: &Palette, play_mod
     let y_bottom = -0.95;
     let y_top = -0.85;
 
-    for (i, &rgb) in palette.iter().enumerate() {
-        let id = (i + 1) as u16;
+    for (i, &rgb) in hotbar_colors.iter().enumerate() {
         let x0 = start_x + i as f32 * (slot_width + slot_spacing);
         let x1 = x0 + slot_width;
 
-        if selected == id {
+        if selected_slot == i {
             add_quad(&mut verts, x0 - 0.01, y_bottom - 0.01, x1 + 0.01, y_top + 0.01, [1.0, 1.0, 0.0, 1.0]);
         } else {
             add_quad(&mut verts, x0 - 0.005, y_bottom - 0.005, x1 + 0.005, y_top + 0.005, [0.2, 0.2, 0.2, 0.8]);
@@ -442,12 +476,11 @@ fn build_ui_vertices(selected: u16, menu_open: bool, palette: &Palette, play_mod
         let sy0 = 0.42;
         let sy1 = 0.52;
 
-        for (i, &rgb) in palette.iter().enumerate() {
-            let id = (i + 1) as u16;
+        for (i, &rgb) in hotbar_colors.iter().enumerate() {
             let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
             let sx1 = sx0 + swatch_w;
 
-            if selected == id {
+            if selected_slot == i {
                 add_quad(&mut verts, sx0 - 0.012, sy0 - 0.012, sx1 + 0.012, sy1 + 0.012, [1.0, 1.0, 0.2, 1.0]);
             } else {
                 add_quad(&mut verts, sx0 - 0.006, sy0 - 0.006, sx1 + 0.006, sy1 + 0.006, [0.25, 0.25, 0.3, 1.0]);
@@ -456,8 +489,7 @@ fn build_ui_vertices(selected: u16, menu_open: bool, palette: &Palette, play_mod
         }
 
         // 2. Sélecteur de couleur RVB
-        let sel_idx = (selected.saturating_sub(1) as usize).min(palette.len() - 1);
-        let [cur_r, cur_g, cur_b] = palette[sel_idx];
+        let [cur_r, cur_g, cur_b] = hotbar_colors[selected_slot];
 
         // Boîte d'aperçu de la couleur
         add_quad(&mut verts, 0.215, 0.155, 0.385, 0.355, [0.4, 0.4, 0.45, 1.0]);
@@ -519,7 +551,8 @@ struct State {
     chunk_manager: ChunkManager,
     play_mode: PlayMode,
     velocity: Vec3,
-    selected_material: u16,
+    selected_slot: usize,
+    hotbar_colors: [[f32; 3]; 5],
     palette: Arc<RwLock<Palette>>,
     menu_open: bool,
     cursor_pos: [f32; 2],
@@ -580,15 +613,17 @@ impl State {
             depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
 
-        let palette = Arc::new(RwLock::new([
+        let hotbar_colors = [
             [0.50, 0.50, 0.50], // 1: Gris
             [0.20, 0.70, 0.30], // 2: Vert
             [0.80, 0.20, 0.20], // 3: Rouge
             [0.20, 0.45, 0.85], // 4: Bleu
             [0.95, 0.75, 0.20], // 5: Jaune
-        ]));
+        ];
 
-        let initial_ui = build_ui_vertices(1, false, &palette.read().unwrap(), PlayMode::Flying);
+        let palette = Arc::new(RwLock::new(hotbar_colors.to_vec()));
+
+        let initial_ui = build_ui_vertices(0, false, &hotbar_colors, PlayMode::Flying);
         let ui_vertices_count = initial_ui.len() as u32;
         let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("UI Buffer"),
@@ -609,7 +644,7 @@ impl State {
             window, surface, device, queue, config, size, render_pipeline, ui_pipeline, ui_vertex_buffer, ui_vertices_count,
             camera_buffer, camera_bind_group, depth_texture_view, camera,
             input: InputState::default(), chunk_manager,
-            play_mode: PlayMode::Flying, velocity: Vec3::ZERO, selected_material: 1,
+            play_mode: PlayMode::Flying, velocity: Vec3::ZERO, selected_slot: 0, hotbar_colors,
             palette, menu_open: false, cursor_pos: [0.0, 0.0], active_slider: None,
         }
     }
@@ -635,25 +670,21 @@ impl State {
         self.update_ui();
     }
 
-    fn remesh_all(&mut self) {
-        let pal = *self.palette.read().unwrap();
-        for (&chunk_pos, chunk) in self.chunk_manager.loaded_chunks.iter_mut() {
-            let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
-            if !payload.vertices.is_empty() && !payload.indices.is_empty() {
-                chunk.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
-                });
-                chunk.index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX,
-                });
-                chunk.num_indices = payload.indices.len() as u32;
+    fn get_or_create_material(&self, color: [f32; 3]) -> u16 {
+        let mut pal = self.palette.write().unwrap();
+        for (i, &c) in pal.iter().enumerate() {
+            if (c[0] - color[0]).abs() < 0.005 
+               && (c[1] - color[1]).abs() < 0.005 
+               && (c[2] - color[2]).abs() < 0.005 {
+                return (i + 1) as u16;
             }
         }
+        pal.push(color);
+        pal.len() as u16
     }
 
     fn update_ui(&mut self) {
-        let pal = *self.palette.read().unwrap();
-        let verts = build_ui_vertices(self.selected_material, self.menu_open, &pal, self.play_mode);
+        let verts = build_ui_vertices(self.selected_slot, self.menu_open, &self.hotbar_colors, self.play_mode);
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
     }
@@ -701,33 +732,61 @@ impl State {
                     self.camera.position.z += dz;
                 }
 
+                // Gravité
                 self.velocity.y -= 45.0 * dt; 
-                if self.input.up && self.chunk_manager.is_solid(self.camera.position - Vec3::new(0.0, 1.5, 0.0)) { self.velocity.y = 15.0; }
+
+                // Détection d'appui au sol et Saut sur ESPACE
+                let on_ground = self.chunk_manager.is_solid(self.camera.position - Vec3::new(0.0, 1.6, 0.0));
+                if self.input.up && on_ground { 
+                    self.velocity.y = 13.0; 
+                }
 
                 let dy = self.velocity.y * dt;
-                let y_check = if dy > 0.0 { 0.2 } else { -1.5 };
-                
-                if self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, dy + y_check, 0.0)) { 
-                    self.velocity.y = 0.0; 
-                } else { 
-                    self.camera.position.y += dy; 
+                if dy < 0.0 {
+                    if self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, dy - 1.5, 0.0)) { 
+                        self.velocity.y = 0.0;
+                        self.camera.position.y = (self.camera.position.y + dy - 1.5).floor() + 2.5;
+                    } else { 
+                        self.camera.position.y += dy; 
+                    }
+                } else if dy > 0.0 {
+                    if self.chunk_manager.is_solid(self.camera.position + Vec3::new(0.0, dy + 0.3, 0.0)) {
+                        self.velocity.y = 0.0;
+                    } else {
+                        self.camera.position.y += dy;
+                    }
                 }
             }
         }
 
-        if self.input.action_add || self.input.action_remove {
+        // Actions souris (Poser / Supprimer / Pipette)
+        if self.input.action_add || self.input.action_remove || self.input.action_pick {
             let dir = self.camera.forward();
             let mut current_pos = self.camera.position;
             let step = 0.1; 
             for _ in 0..100 { 
                 current_pos += dir * step;
-                if self.chunk_manager.is_solid(current_pos) {
-                    if self.input.action_remove { self.chunk_manager.modify_block(current_pos, 0, &self.device); } 
-                    else if self.input.action_add { self.chunk_manager.modify_block(current_pos - dir * step, self.selected_material, &self.device); }
+                let mat = self.chunk_manager.get_material(current_pos);
+                if mat != 0 {
+                    if self.input.action_pick {
+                        let color = self.palette.read().unwrap().get((mat - 1) as usize).copied();
+                        if let Some(color) = color {
+                            self.hotbar_colors[self.selected_slot] = color;
+                            self.update_ui();
+                        }
+                    } else if self.input.action_remove { 
+                        self.chunk_manager.modify_block(current_pos, 0, &self.device); 
+                    } else if self.input.action_add { 
+                        let place_pos = current_pos - dir * step;
+                        let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
+                        self.chunk_manager.modify_block(place_pos, mat_id, &self.device); 
+                    }
                     break;
                 }
             }
-            self.input.action_add = false; self.input.action_remove = false;
+            self.input.action_add = false; 
+            self.input.action_remove = false;
+            self.input.action_pick = false;
         }
 
         let aspect = if self.config.height > 0 { self.config.width as f32 / self.config.height as f32 } else { 1.0 };
@@ -824,12 +883,7 @@ impl ApplicationHandler for App {
                             let sl_x0 = -0.30;
                             let sl_x1 = 0.15;
                             let val = ((ndc_x - sl_x0) / (sl_x1 - sl_x0)).clamp(0.0, 1.0);
-                            let sel_idx = (state.selected_material.saturating_sub(1) as usize).min(4);
-                            {
-                                let mut pal = state.palette.write().unwrap();
-                                pal[sel_idx][channel] = val;
-                            }
-                            // Only update the UI while dragging
+                            state.hotbar_colors[state.selected_slot][channel] = val;
                             state.update_ui();
                         }
                     }
@@ -840,9 +894,7 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::PixelDelta(pos) => if pos.y > 0.0 { -1 } else if pos.y < 0.0 { 1 } else { 0 },
                     };
                     if step != 0 {
-                        let cur_idx = (state.selected_material.saturating_sub(1)) as i32;
-                        let new_idx = (cur_idx + step).rem_euclid(5) as u16 + 1;
-                        state.selected_material = new_idx;
+                        state.selected_slot = (state.selected_slot as i32 + step).rem_euclid(5) as usize;
                         state.update_ui();
                     }
                 }
@@ -856,11 +908,12 @@ impl ApplicationHandler for App {
 
                     match key_event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyM) => if is_pressed { state.toggle_play_mode(); },
-                        PhysicalKey::Code(KeyCode::Digit1) => if is_pressed { state.selected_material = 1; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit2) => if is_pressed { state.selected_material = 2; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit3) => if is_pressed { state.selected_material = 3; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit4) => if is_pressed { state.selected_material = 4; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit5) => if is_pressed { state.selected_material = 5; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit1) => if is_pressed { state.selected_slot = 0; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit2) => if is_pressed { state.selected_slot = 1; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit3) => if is_pressed { state.selected_slot = 2; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit4) => if is_pressed { state.selected_slot = 3; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit5) => if is_pressed { state.selected_slot = 4; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::KeyC) => if is_pressed && !state.menu_open { state.input.action_pick = true; },
                         _ => {}
                     }
 
@@ -890,7 +943,7 @@ impl ApplicationHandler for App {
                                     let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
                                     let sx1 = sx0 + swatch_w;
                                     if mx >= sx0 && mx <= sx1 && my >= 0.42 && my <= 0.52 {
-                                        state.selected_material = (i + 1) as u16;
+                                        state.selected_slot = i;
                                         state.update_ui();
                                         return;
                                     }
@@ -901,11 +954,11 @@ impl ApplicationHandler for App {
                                 let sl_x1 = 0.15;
                                 if mx >= sl_x0 - 0.02 && mx <= sl_x1 + 0.02 {
                                     let slider_clicked = if my >= 0.28 && my <= 0.36 {
-                                        Some(0) // R
+                                        Some(0)
                                     } else if my >= 0.21 && my <= 0.29 {
-                                        Some(1) // G
+                                        Some(1)
                                     } else if my >= 0.14 && my <= 0.22 {
-                                        Some(2) // B
+                                        Some(2)
                                     } else {
                                         None
                                     };
@@ -913,46 +966,38 @@ impl ApplicationHandler for App {
                                     if let Some(channel) = slider_clicked {
                                         state.active_slider = Some(channel);
                                         let val = ((mx - sl_x0) / (sl_x1 - sl_x0)).clamp(0.0, 1.0);
-                                        let sel_idx = (state.selected_material.saturating_sub(1) as usize).min(4);
-                                        {
-                                            let mut pal = state.palette.write().unwrap();
-                                            pal[sel_idx][channel] = val;
-                                        }
-                                        state.remesh_all();
+                                        state.hotbar_colors[state.selected_slot][channel] = val;
                                         state.update_ui();
                                         return;
                                     }
                                 }
 
-                                // 3. Clic sur le bouton de mode (Vol / Réel)
+                                // 3. Bouton Mode
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.01 && my <= 0.08 {
                                     state.toggle_play_mode();
                                     return;
                                 }
 
-                                // 4. Clic sur RESUME
+                                // 4. Bouton RESUME
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.15 && my <= -0.06 {
                                     state.toggle_menu();
                                     return;
                                 }
 
-                                // 5. Clic sur QUIT
+                                // 5. Bouton QUIT
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.29 && my <= -0.20 {
                                     event_loop.exit();
                                     return;
                                 }
                             } else {
-                                // Mouse released: remesh chunks once
-                                if state.active_slider.is_some() {
-                                    state.active_slider = None;
-                                    state.remesh_all();
-                                }
+                                state.active_slider = None;
                             }
                         }
                     } else if element_state == ElementState::Pressed {
                         match button {
                             MouseButton::Left => state.input.action_remove = true,
                             MouseButton::Right => state.input.action_add = true,
+                            MouseButton::Middle => state.input.action_pick = true,
                             _ => {}
                         }
                     }
