@@ -22,7 +22,8 @@ use ndshape::{ConstShape, ConstShape3u32};
 use noise::{NoiseFn, Fbm, Perlin};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-type ChunkShape = ConstShape3u32<32, 32, 32>;
+// Ajout du padding pour le chunk (32 + 2 = 34) afin d'éviter le "wrapping" des index aux bordures
+type ChunkShape = ConstShape3u32<34, 34, 34>; 
 type ChunkPos = (i32, i32, i32);
 
 // --- OCTREE & VOXELS ---
@@ -135,10 +136,15 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
     }
 
     let mut voxels = vec![Block(0); ChunkShape::SIZE as usize];
-    octree.flatten_into(octree.root_index as usize, 0, 0, 0, 32, &mut voxels);
+    // Décalage de [1, 1, 1] pour éviter l'out-of-bounds et générer un culling valide via le padding vide
+    octree.flatten_into(octree.root_index as usize, 1, 1, 1, 32, &mut voxels);
 
     let mut buffer = GreedyQuadsBuffer::new(voxels.len());
-    greedy_quads(&voxels, &ChunkShape {}, [0, 0, 0], [31, 31, 31], &RIGHT_HANDED_Y_UP_CONFIG.faces, &mut buffer);
+    // greedy_quads(min, max) attend un max INCLUSIF et applique lui-même un padding(-1)
+    // interne. Le contenu réel occupe [1..33) dans le chunk 34^3, donc il faut donner
+    // [0..34) pour que toute la zone de contenu soit mouchée (les faces bordures contre
+    // le padding vide sont conservées, ce qui évite d'avoir besoin des chunks voisins).
+    greedy_quads(&voxels, &ChunkShape {}, [0, 0, 0], [33, 33, 33], &RIGHT_HANDED_Y_UP_CONFIG.faces, &mut buffer);
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -157,15 +163,19 @@ fn generate_chunk(chunk_pos: ChunkPos) -> MeshPayload {
 
             for corner in face.quad_mesh_positions(quad, 1.0) {
                 vertices.push(Vertex {
-                    position: [corner[0] + offset_x, corner[1] + offset_y, corner[2] + offset_z],
+                    // On compense le décalage de [1, 1, 1] introduit lors du flatten_into
+                    position: [
+                        corner[0] - 1.0 + offset_x, 
+                        corner[1] - 1.0 + offset_y, 
+                        corner[2] - 1.0 + offset_z
+                    ],
                     normal,
                     color,
                 });
             }
-            indices.extend_from_slice(&[
-                start_index, start_index + 1, start_index + 2,
-                start_index + 2, start_index + 3, start_index,
-            ]);
+            // block-mesh calcule le bon winding (CCW vu de l'extérieur) pour chaque face
+            // en fonction du signe de la normale ET de la permutation des axes.
+            indices.extend_from_slice(&face.quad_mesh_indices(start_index));
         }
     }
     MeshPayload { vertices, indices }
@@ -212,6 +222,11 @@ impl ChunkManager {
         }
 
         while let Ok((pos, payload)) = self.rx.try_recv() {
+            self.loading_chunks.remove(&pos);
+            // wgpu panics on zero-size buffers — skip chunks with no visible geometry
+            if payload.vertices.is_empty() || payload.indices.is_empty() {
+                continue;
+            }
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
             });
@@ -219,7 +234,6 @@ impl ChunkManager {
                 label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX,
             });
             self.loaded_chunks.insert(pos, RenderChunk { vertex_buffer, index_buffer, num_indices: payload.indices.len() as u32 });
-            self.loading_chunks.remove(&pos);
         }
 
         self.loaded_chunks.retain(|pos, _| {
@@ -352,7 +366,11 @@ impl State {
                 module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
             }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            primitive: wgpu::PrimitiveState { 
+                topology: wgpu::PrimitiveTopology::TriangleList, 
+                cull_mode: Some(wgpu::Face::Back), // Backface Culling correctement activé
+                ..Default::default() 
+            },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(), bias: wgpu::DepthBiasState::default(),
@@ -562,4 +580,54 @@ pub fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App { state: None, last_frame: Instant::now() };
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Vérifie que pour chaque face, le winding produit par `quad_mesh_indices`
+    /// est CCW vu de l'extérieur (la normale calculée du triangle pointe dans le
+    /// sens de la normale de la face), sinon la face serait éliminée par le culling.
+    #[test]
+    fn all_faces_are_wound_front_facing() {
+        for face in RIGHT_HANDED_Y_UP_CONFIG.faces {
+            let quad = block_mesh::UnorientedQuad {
+                minimum: [10, 10, 10],
+                width: 1,
+                height: 1,
+            };
+            let corners = face.quad_mesh_positions(&quad, 1.0).map(|c| Vec3::from(c));
+            let n = face.signed_normal();
+            let normal = Vec3::new(n.x as f32, n.y as f32, n.z as f32);
+            let idx = face.quad_mesh_indices(0);
+            for tri in idx.chunks(3) {
+                let (a, b, c) = (corners[tri[0] as usize], corners[tri[1] as usize], corners[tri[2] as usize]);
+                let tri_normal = (b - a).cross(c - a);
+                assert!(
+                    tri_normal.dot(normal) > 0.0,
+                    "Face {:?} : triangle {:?} tourné dans le mauvais sens (triangle normal = {:?})",
+                    normal, tri, tri_normal
+                );
+            }
+        }
+    }
+
+    /// Vérifie que le mesh couvre TOUT le chunk jusqu'aux bords (position 32) :
+    /// avec l'ancien appel greedy_quads([1,1,1],[32,32,32]), la colonne/rangee 32
+    /// (voxel monde 31) n'etait jamais mouchée, d'ou les vides entre chunks.
+    #[test]
+    fn mesh_reaches_chunk_boundaries() {
+        let payload = generate_chunk((0, 0, 0));
+        assert!(!payload.vertices.is_empty());
+        let (mut max_x, mut max_y, mut max_z) = (0.0f32, 0.0f32, 0.0f32);
+        for v in &payload.vertices {
+            max_x = max_x.max(v.position[0]);
+            max_y = max_y.max(v.position[1]);
+            max_z = max_z.max(v.position[2]);
+        }
+        assert!((max_x - 32.0).abs() < 1e-3, "Le mesh doit atteindre x=32, max_x = {max_x}");
+        assert!((max_z - 32.0).abs() < 1e-3, "Le mesh doit atteindre z=32, max_z = {max_z}");
+        assert!(max_y > 1.0, "Le mesh doit contenir des couches superieures, max_y = {max_y}");
+    }
 }
