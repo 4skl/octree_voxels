@@ -527,6 +527,11 @@ impl ApplicationHandler for App {
             }
 
             let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
+            
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+            window.set_cursor_visible(false);
+
             let mut state = pollster::block_on(State::new(Arc::clone(&window)));
             
             state.render();
