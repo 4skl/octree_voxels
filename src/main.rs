@@ -20,14 +20,56 @@ use glam::{Vec3, Mat4};
 use block_mesh::{visible_block_faces, UnitQuadBuffer, Voxel, VoxelVisibility, MergeVoxel, RIGHT_HANDED_Y_UP_CONFIG};
 use ndshape::{ConstShape, ConstShape3u32};
 use noise::{NoiseFn, Fbm, Perlin};
+use serde::{Serialize, Deserialize};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 type ChunkShape = ConstShape3u32<34, 34, 34>; 
 type ChunkPos = (i32, i32, i32);
 pub type Palette = Vec<[f32; 3]>;
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Serialize, Deserialize)]
 pub enum PlayMode { Flying, Real }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum WorldType {
+    Hills,
+    Mountains,
+    Flat,
+    FloatingIslands,
+}
+
+impl WorldType {
+    pub fn next(&self) -> Self {
+        match self {
+            WorldType::Hills => WorldType::Mountains,
+            WorldType::Mountains => WorldType::Flat,
+            WorldType::Flat => WorldType::FloatingIslands,
+            WorldType::FloatingIslands => WorldType::Hills,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            WorldType::Hills => "HILLS",
+            WorldType::Mountains => "MOUNTAINS",
+            WorldType::Flat => "FLAT",
+            WorldType::FloatingIslands => "ISLANDS",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SaveData {
+    pub player_pos: [f32; 3],
+    pub camera_yaw: f32,
+    pub camera_pitch: f32,
+    pub play_mode: PlayMode,
+    pub world_type: WorldType,
+    pub seed: u32,
+    pub hotbar_colors: [[f32; 3]; 5],
+    pub palette: Vec<[f32; 3]>,
+    pub modified_blocks: Vec<([i32; 3], Vec<([u32; 3], u16)>)>,
+}
 
 // --- OCTREE & VOXELS ---
 
@@ -132,25 +174,84 @@ impl MergeVoxel for Block {
 
 struct MeshPayload { vertices: Vec<Vertex>, indices: Vec<u32> }
 
-fn generate_octree(chunk_pos: ChunkPos) -> Octree {
+fn generate_octree(
+    chunk_pos: ChunkPos,
+    world_type: WorldType,
+    seed: u32,
+    deltas: Option<&HashMap<[u32; 3], u16>>,
+) -> Octree {
     let mut octree = Octree::new();
-    let fbm = Fbm::<Perlin>::new(42);
+    let fbm = Fbm::<Perlin>::new(seed);
     let world_x_offset = chunk_pos.0 * 32;
     let world_z_offset = chunk_pos.2 * 32;
 
-    for x in 0..32 {
-        for z in 0..32 {
-            let world_x = (x as i32 + world_x_offset) as f64 * 0.05;
-            let world_z = (z as i32 + world_z_offset) as f64 * 0.05;
-            let noise_val = fbm.get([world_x, world_z]);
-            let height = ((noise_val + 1.0) * 12.0).clamp(0.0, 31.0) as u32;
+    match world_type {
+        WorldType::Flat => {
+            if chunk_pos.1 == 0 {
+                for x in 0..32 {
+                    for z in 0..32 {
+                        for y in 0..4 {
+                            let material = if y == 3 { 2 } else { 1 };
+                            octree.insert(x, y, z, 5, material);
+                        }
+                    }
+                }
+            }
+        }
+        WorldType::Hills => {
+            for x in 0..32 {
+                for z in 0..32 {
+                    let world_x = (x as i32 + world_x_offset) as f64 * 0.04;
+                    let world_z = (z as i32 + world_z_offset) as f64 * 0.04;
+                    let noise_val = fbm.get([world_x, world_z]);
+                    let height = ((noise_val + 1.0) * 12.0).clamp(0.0, 31.0) as u32;
 
-            for y in 0..=height {
-                let material = if y == height { 2 } else { 1 };
-                octree.insert(x, y, z, 5, material);
+                    for y in 0..=height {
+                        let material = if y == height { 2 } else { 1 };
+                        octree.insert(x, y, z, 5, material);
+                    }
+                }
+            }
+        }
+        WorldType::Mountains => {
+            for x in 0..32 {
+                for z in 0..32 {
+                    let world_x = (x as i32 + world_x_offset) as f64 * 0.025;
+                    let world_z = (z as i32 + world_z_offset) as f64 * 0.025;
+                    let n = fbm.get([world_x, world_z]).abs();
+                    let height = (n * 30.0 + 2.0).clamp(0.0, 31.0) as u32;
+
+                    for y in 0..=height {
+                        let material = if y >= 25 { 3 } else if y == height { 2 } else { 1 };
+                        octree.insert(x, y, z, 5, material);
+                    }
+                }
+            }
+        }
+        WorldType::FloatingIslands => {
+            let world_y_offset = chunk_pos.1 * 32;
+            for x in 0..32 {
+                for y in 0..32 {
+                    for z in 0..32 {
+                        let wx = (x as i32 + world_x_offset) as f64 * 0.05;
+                        let wy = (y as i32 + world_y_offset) as f64 * 0.08;
+                        let wz = (z as i32 + world_z_offset) as f64 * 0.05;
+                        let density = fbm.get([wx, wy, wz]) - ((y as f64 + world_y_offset as f64) - 16.0) * 0.04;
+                        if density > 0.12 {
+                            octree.insert(x, y, z, 5, 2);
+                        }
+                    }
+                }
             }
         }
     }
+
+    if let Some(mods) = deltas {
+        for (&[x, y, z], &material) in mods {
+            octree.insert(x, y, z, 5, material);
+        }
+    }
+
     octree
 }
 
@@ -223,12 +324,25 @@ struct ChunkManager {
     rx: mpsc::Receiver<(ChunkPos, Octree, MeshPayload)>,
     render_distance: i32,
     palette: Arc<RwLock<Palette>>,
+    pub world_type: WorldType,
+    pub seed: u32,
+    pub modified_blocks: HashMap<ChunkPos, HashMap<[u32; 3], u16>>,
 }
 
 impl ChunkManager {
     fn new(palette: Arc<RwLock<Palette>>) -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { loaded_chunks: HashMap::new(), loading_chunks: HashSet::new(), tx, rx, render_distance: 3, palette }
+        Self {
+            loaded_chunks: HashMap::new(),
+            loading_chunks: HashSet::new(),
+            tx,
+            rx,
+            render_distance: 3,
+            palette,
+            world_type: WorldType::Hills,
+            seed: 42,
+            modified_blocks: HashMap::new(),
+        }
     }
 
     fn update(&mut self, player_pos: Vec3, device: &wgpu::Device) {
@@ -242,8 +356,12 @@ impl ChunkManager {
                     self.loading_chunks.insert(pos);
                     let tx_clone = self.tx.clone();
                     let pal_arc = Arc::clone(&self.palette);
+                    let deltas = self.modified_blocks.get(&pos).cloned();
+                    let wtype = self.world_type;
+                    let seed = self.seed;
+
                     rayon::spawn(move || {
-                        let octree = generate_octree(pos);
+                        let octree = generate_octree(pos, wtype, seed, deltas.as_ref());
                         let pal = pal_arc.read().unwrap().clone();
                         let payload = generate_mesh(&octree, pos, &pal);
                         let _ = tx_clone.send((pos, octree, payload));
@@ -264,27 +382,43 @@ impl ChunkManager {
             self.loaded_chunks.insert(pos, RenderChunk { octree, vertex_buffer, index_buffer, num_indices: payload.indices.len() as u32 });
         }
 
-        self.loaded_chunks.retain(|pos, _| (pos.0 - p_x).abs() <= self.render_distance + 1 && (pos.2 - p_z).abs() <= self.render_distance + 1);
+        self.loaded_chunks.retain(|pos, _| {
+            (pos.0 - p_x).abs() <= self.render_distance + 1 && (pos.2 - p_z).abs() <= self.render_distance + 1
+        });
     }
 
     fn modify_block(&mut self, pos: Vec3, material: u16, device: &wgpu::Device) {
-        let cx = (pos.x / 32.0).floor() as i32; let cy = (pos.y / 32.0).floor() as i32; let cz = (pos.z / 32.0).floor() as i32;
+        let cx = (pos.x / 32.0).floor() as i32;
+        let cy = (pos.y / 32.0).floor() as i32;
+        let cz = (pos.z / 32.0).floor() as i32;
         let chunk_pos = (cx, cy, cz);
-        let lx = (pos.x.floor() as i32).rem_euclid(32) as u32; let ly = (pos.y.floor() as i32).rem_euclid(32) as u32; let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
+        let lx = (pos.x.floor() as i32).rem_euclid(32) as u32;
+        let ly = (pos.y.floor() as i32).rem_euclid(32) as u32;
+        let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
+
+        self.modified_blocks.entry(chunk_pos).or_default().insert([lx, ly, lz], material);
 
         if let Some(chunk) = self.loaded_chunks.get_mut(&chunk_pos) {
             chunk.octree.insert(lx, ly, lz, 5, material);
             let pal = self.palette.read().unwrap().clone();
             let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
-            chunk.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX });
-            chunk.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX });
+            chunk.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
+            });
+            chunk.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX,
+            });
             chunk.num_indices = payload.indices.len() as u32;
         }
     }
 
     fn get_material(&self, pos: Vec3) -> u16 {
-        let cx = (pos.x / 32.0).floor() as i32; let cy = (pos.y / 32.0).floor() as i32; let cz = (pos.z / 32.0).floor() as i32;
-        let lx = (pos.x.floor() as i32).rem_euclid(32) as u32; let ly = (pos.y.floor() as i32).rem_euclid(32) as u32; let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
+        let cx = (pos.x / 32.0).floor() as i32;
+        let cy = (pos.y / 32.0).floor() as i32;
+        let cz = (pos.z / 32.0).floor() as i32;
+        let lx = (pos.x.floor() as i32).rem_euclid(32) as u32;
+        let ly = (pos.y.floor() as i32).rem_euclid(32) as u32;
+        let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
 
         if let Some(chunk) = self.loaded_chunks.get(&(cx, cy, cz)) {
             chunk.octree.query(lx, ly, lz, 5)
@@ -337,14 +471,16 @@ struct CameraUniform { view_proj: [[f32; 4]; 4] }
 struct Camera { position: Vec3, yaw: f32, pitch: f32 }
 impl Camera {
     fn view_proj(&self, aspect: f32) -> Mat4 {
-        let (sin_p, cos_p) = self.pitch.sin_cos(); let (sin_y, cos_y) = self.yaw.sin_cos();
+        let (sin_p, cos_p) = self.pitch.sin_cos();
+        let (sin_y, cos_y) = self.yaw.sin_cos();
         let dir = Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p).normalize();
         let view = glam::camera::rh::view::look_at_mat4(self.position, self.position + dir, Vec3::Y);
         let proj = glam::camera::rh::proj::directx::perspective((60.0_f32).to_radians(), aspect, 0.05, 500.0);
         proj * view
     }
     fn forward(&self) -> Vec3 {
-        let (sin_p, cos_p) = self.pitch.sin_cos(); let (sin_y, cos_y) = self.yaw.sin_cos();
+        let (sin_p, cos_p) = self.pitch.sin_cos();
+        let (sin_y, cos_y) = self.yaw.sin_cos();
         Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p).normalize()
     }
 }
@@ -377,21 +513,40 @@ fn get_glyph(c: char) -> [u8; 5] {
     match c {
         'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
         'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
+        'C' => [0b111, 0b100, 0b100, 0b100, 0b111],
         'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
         'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
         'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
         'G' => [0b111, 0b100, 0b101, 0b101, 0b111],
+        'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
         'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'J' => [0b001, 0b001, 0b001, 0b101, 0b111],
+        'K' => [0b101, 0b110, 0b100, 0b110, 0b101],
         'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
         'M' => [0b101, 0b111, 0b101, 0b101, 0b101],
         'N' => [0b101, 0b111, 0b111, 0b101, 0b101],
         'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        'P' => [0b111, 0b101, 0b111, 0b100, 0b100],
         'Q' => [0b010, 0b101, 0b101, 0b110, 0b011],
         'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
         'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
         'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
         'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
+        'W' => [0b101, 0b101, 0b101, 0b111, 0b101],
+        'X' => [0b101, 0b101, 0b010, 0b101, 0b101],
         'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
+        'Z' => [0b111, 0b001, 0b010, 0b100, 0b111],
+        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
         ':' => [0b000, 0b010, 0b000, 0b010, 0b000],
         _ => [0; 5],
     }
@@ -423,7 +578,13 @@ fn draw_text_centered(verts: &mut Vec<UIVertex>, text: &str, cx: f32, cy: f32, p
     draw_text(verts, text, cx - total_w / 2.0, cy - total_h / 2.0, pw, ph, color);
 }
 
-fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f32; 3]; 5], play_mode: PlayMode) -> Vec<UIVertex> {
+fn build_ui_vertices(
+    selected_slot: usize,
+    menu_open: bool,
+    hotbar_colors: &[[f32; 3]; 5],
+    play_mode: PlayMode,
+    world_type: WorldType,
+) -> Vec<UIVertex> {
     let mut verts = Vec::new();
     let num_slots = hotbar_colors.len();
     let font_pw = 0.0055;
@@ -456,11 +617,12 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
 
         let mode_hud = if play_mode == PlayMode::Flying { "FLY" } else { "REAL" };
         draw_text(&mut verts, mode_hud, -0.95, 0.90, 0.006, 0.011, [1.0, 1.0, 1.0, 0.85]);
+        draw_text(&mut verts, world_type.name(), -0.95, 0.84, 0.006, 0.011, [0.75, 0.85, 1.0, 0.85]);
     } else {
         add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.0, 0.0, 0.0, 0.65]);
 
         let px0 = -0.48; let px1 = 0.48;
-        let py0 = -0.58; let py1 = 0.58;
+        let py0 = -0.68; let py1 = 0.62;
         add_quad(&mut verts, px0 - 0.008, py0 - 0.008, px1 + 0.008, py1 + 0.008, [0.4, 0.4, 0.45, 1.0]);
         add_quad(&mut verts, px0, py0, px1, py1, [0.12, 0.12, 0.15, 0.95]);
 
@@ -468,8 +630,8 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
         let swatch_gap = 0.025;
         let swatches_total = num_slots as f32 * swatch_w + (num_slots - 1) as f32 * swatch_gap;
         let s_start_x = -swatches_total / 2.0;
-        let sy0 = 0.42;
-        let sy1 = 0.52;
+        let sy0 = 0.46;
+        let sy1 = 0.56;
 
         for (i, &rgb) in hotbar_colors.iter().enumerate() {
             let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
@@ -485,15 +647,15 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
 
         let [cur_r, cur_g, cur_b] = hotbar_colors[selected_slot];
 
-        add_quad(&mut verts, 0.215, 0.155, 0.385, 0.355, [0.4, 0.4, 0.45, 1.0]);
-        add_quad(&mut verts, 0.22, 0.16, 0.38, 0.35, [cur_r, cur_g, cur_b, 1.0]);
+        add_quad(&mut verts, 0.215, 0.195, 0.385, 0.395, [0.4, 0.4, 0.45, 1.0]);
+        add_quad(&mut verts, 0.22, 0.20, 0.38, 0.39, [cur_r, cur_g, cur_b, 1.0]);
 
         let sl_x0 = -0.30;
         let sl_x1 = 0.15;
         let channels = [
-            ("R", cur_r, 0.30, 0.34, [0.9, 0.25, 0.25, 1.0]),
-            ("G", cur_g, 0.23, 0.27, [0.25, 0.85, 0.35, 1.0]),
-            ("B", cur_b, 0.16, 0.20, [0.25, 0.45, 0.95, 1.0]),
+            ("R", cur_r, 0.34, 0.38, [0.9, 0.25, 0.25, 1.0]),
+            ("G", cur_g, 0.27, 0.31, [0.25, 0.85, 0.35, 1.0]),
+            ("B", cur_b, 0.20, 0.24, [0.25, 0.45, 0.95, 1.0]),
         ];
 
         for (lbl, val, y0, y1, bar_col) in channels {
@@ -505,17 +667,23 @@ fn build_ui_vertices(selected_slot: usize, menu_open: bool, hotbar_colors: &[[f3
         }
 
         let mode_text = if play_mode == PlayMode::Flying { "MODE: FLYING" } else { "MODE: REAL" };
-        add_quad(&mut verts, -0.305, -0.015, 0.305, 0.085, [0.35, 0.5, 0.75, 1.0]);
-        add_quad(&mut verts, -0.30, -0.01, 0.30, 0.08, [0.2, 0.32, 0.55, 1.0]);
-        draw_text_centered(&mut verts, mode_text, 0.0, 0.035, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        add_quad(&mut verts, -0.305, 0.045, 0.305, 0.145, [0.35, 0.5, 0.75, 1.0]);
+        add_quad(&mut verts, -0.30, 0.05, 0.30, 0.14, [0.2, 0.32, 0.55, 1.0]);
+        draw_text_centered(&mut verts, mode_text, 0.0, 0.095, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
 
-        add_quad(&mut verts, -0.305, -0.155, 0.305, -0.055, [0.35, 0.6, 0.4, 1.0]);
-        add_quad(&mut verts, -0.30, -0.15, 0.30, -0.06, [0.2, 0.55, 0.3, 1.0]);
-        draw_text_centered(&mut verts, "RESUME", 0.0, -0.105, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        add_quad(&mut verts, -0.305, -0.075, 0.305, 0.025, [0.5, 0.4, 0.7, 1.0]);
+        add_quad(&mut verts, -0.30, -0.07, 0.30, 0.02, [0.35, 0.25, 0.5, 1.0]);
+        draw_text_centered(&mut verts, world_type.name(), 0.0, -0.025, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
 
-        add_quad(&mut verts, -0.305, -0.295, 0.305, -0.195, [0.6, 0.3, 0.3, 1.0]);
-        add_quad(&mut verts, -0.30, -0.29, 0.30, -0.20, [0.5, 0.2, 0.2, 1.0]);
-        draw_text_centered(&mut verts, "QUIT", 0.0, -0.245, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        add_quad(&mut verts, -0.305, -0.195, 0.305, -0.095, [0.35, 0.6, 0.4, 1.0]);
+        add_quad(&mut verts, -0.30, -0.19, 0.30, -0.10, [0.2, 0.55, 0.3, 1.0]);
+        draw_text_centered(&mut verts, "RESUME", 0.0, -0.145, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        add_quad(&mut verts, -0.305, -0.315, 0.305, -0.215, [0.6, 0.3, 0.3, 1.0]);
+        add_quad(&mut verts, -0.30, -0.31, 0.30, -0.22, [0.5, 0.2, 0.2, 1.0]);
+        draw_text_centered(&mut verts, "QUIT", 0.0, -0.265, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        draw_text_centered(&mut verts, "F2: PRESET   F5: SAVE   F9: LOAD", 0.0, -0.42, font_pw * 0.9, font_ph * 0.9, [0.8, 0.8, 0.85, 0.9]);
     }
 
     verts
@@ -610,8 +778,9 @@ impl State {
         ];
 
         let palette = Arc::new(RwLock::new(hotbar_colors.to_vec()));
+        let mut chunk_manager = ChunkManager::new(Arc::clone(&palette));
 
-        let initial_ui = build_ui_vertices(0, false, &hotbar_colors, PlayMode::Flying);
+        let initial_ui = build_ui_vertices(0, false, &hotbar_colors, PlayMode::Flying, chunk_manager.world_type);
         let ui_vertices_count = initial_ui.len() as u32;
         let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("UI Buffer"),
@@ -621,8 +790,7 @@ impl State {
         });
         queue.write_buffer(&ui_vertex_buffer, 0, bytemuck::cast_slice(&initial_ui));
 
-        let mut chunk_manager = ChunkManager::new(Arc::clone(&palette));
-        let octree = generate_octree((0, 0, 0));
+        let octree = generate_octree((0, 0, 0), chunk_manager.world_type, chunk_manager.seed, None);
         let initial_payload = generate_mesh(&octree, (0, 0, 0), &palette.read().unwrap());
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&initial_payload.vertices), usage: wgpu::BufferUsages::VERTEX });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&initial_payload.indices), usage: wgpu::BufferUsages::INDEX });
@@ -635,6 +803,66 @@ impl State {
             play_mode: PlayMode::Flying, velocity: Vec3::ZERO, selected_slot: 0, hotbar_colors,
             palette, menu_open: false, cursor_pos: [0.0, 0.0], active_slider: None,
         }
+    }
+
+    pub fn save_game(&self, filename: &str) -> std::io::Result<()> {
+        let serialized_deltas: Vec<([i32; 3], Vec<([u32; 3], u16)>)> = self.chunk_manager.modified_blocks.iter()
+            .map(|(&(cx, cy, cz), block_map)| {
+                ([cx, cy, cz], block_map.iter().map(|(&k, &v)| (k, v)).collect())
+            })
+            .collect();
+
+        let data = SaveData {
+            player_pos: self.camera.position.to_array(),
+            camera_yaw: self.camera.yaw,
+            camera_pitch: self.camera.pitch,
+            play_mode: self.play_mode,
+            world_type: self.chunk_manager.world_type,
+            seed: self.chunk_manager.seed,
+            hotbar_colors: self.hotbar_colors,
+            palette: self.palette.read().unwrap().clone(),
+            modified_blocks: serialized_deltas,
+        };
+
+        let json = serde_json::to_string_pretty(&data)?;
+        std::fs::write(filename, json)?;
+        println!("Game saved to {}", filename);
+        Ok(())
+    }
+
+    pub fn load_game(&mut self, filename: &str) -> std::io::Result<()> {
+        let content = std::fs::read_to_string(filename)?;
+        let data: SaveData = serde_json::from_str(&content)?;
+
+        self.camera.position = Vec3::from_array(data.player_pos);
+        self.camera.yaw = data.camera_yaw;
+        self.camera.pitch = data.camera_pitch;
+        self.play_mode = data.play_mode;
+        self.hotbar_colors = data.hotbar_colors;
+        *self.palette.write().unwrap() = data.palette;
+
+        self.chunk_manager.world_type = data.world_type;
+        self.chunk_manager.seed = data.seed;
+        self.chunk_manager.modified_blocks.clear();
+        for (chunk_coords, edits) in data.modified_blocks {
+            let pos = (chunk_coords[0], chunk_coords[1], chunk_coords[2]);
+            self.chunk_manager.modified_blocks.insert(pos, edits.into_iter().collect());
+        }
+
+        self.chunk_manager.loaded_chunks.clear();
+        self.chunk_manager.loading_chunks.clear();
+        self.update_ui();
+        println!("Game loaded from {}", filename);
+        Ok(())
+    }
+
+    pub fn cycle_world_generator(&mut self) {
+        self.chunk_manager.world_type = self.chunk_manager.world_type.next();
+        self.chunk_manager.modified_blocks.clear();
+        self.chunk_manager.loaded_chunks.clear();
+        self.chunk_manager.loading_chunks.clear();
+        self.update_ui();
+        println!("Switched to preset: {:?}", self.chunk_manager.world_type);
     }
 
     fn toggle_menu(&mut self) {
@@ -672,7 +900,13 @@ impl State {
     }
 
     fn update_ui(&mut self) {
-        let verts = build_ui_vertices(self.selected_slot, self.menu_open, &self.hotbar_colors, self.play_mode);
+        let verts = build_ui_vertices(
+            self.selected_slot,
+            self.menu_open,
+            &self.hotbar_colors,
+            self.play_mode,
+            self.chunk_manager.world_type,
+        );
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
     }
@@ -734,16 +968,13 @@ impl State {
                     self.camera.position.z += dz;
                 }
 
-                // Gravity
                 self.velocity.y -= 38.0 * dt;
 
-                // Jump when on the ground
                 let on_ground = self.player_collides_at(self.camera.position - Vec3::new(0.0, 0.08, 0.0));
                 if self.input.up && on_ground { 
                     self.velocity.y = 11.5; 
                 }
 
-                // Vertical sub-stepping for collision & clipping prevention
                 let total_dy = self.velocity.y * dt;
                 let step_count = ((total_dy.abs() / 0.08).ceil() as i32).max(1);
                 let step_dy = total_dy / step_count as f32;
@@ -759,7 +990,6 @@ impl State {
             }
         }
 
-        // Handle Cube interactions: Add / Remove / Pick
         if self.input.action_add || self.input.action_remove || self.input.action_pick {
             let dir = self.camera.forward();
             let mut current_pos = self.camera.position;
@@ -779,7 +1009,6 @@ impl State {
                         self.chunk_manager.modify_block(current_pos, 0, &self.device); 
                     } else if self.input.action_add { 
                         let place_pos = current_pos - dir * step;
-                        // Avoid spawning cube directly inside player's body
                         if self.play_mode == PlayMode::Flying || !self.player_collides_at(self.camera.position) {
                             let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
                             self.chunk_manager.modify_block(place_pos, mat_id, &self.device); 
@@ -809,7 +1038,6 @@ impl State {
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        // 3D Pass
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
@@ -827,7 +1055,6 @@ impl State {
             }
         }
 
-        // 2D Pass (UI)
         {
             let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("UI Render Pass"),
@@ -861,7 +1088,6 @@ impl ApplicationHandler for App {
             }
 
             let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-            window.set_title("Voxel Engine");
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
             window.set_cursor_visible(false);
 
@@ -910,15 +1136,20 @@ impl ApplicationHandler for App {
                         return;
                     }
 
-                    match key_event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyM) => if is_pressed { state.toggle_play_mode(); },
-                        PhysicalKey::Code(KeyCode::Digit1) => if is_pressed { state.selected_slot = 0; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit2) => if is_pressed { state.selected_slot = 1; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit3) => if is_pressed { state.selected_slot = 2; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit4) => if is_pressed { state.selected_slot = 3; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::Digit5) => if is_pressed { state.selected_slot = 4; state.update_ui(); },
-                        PhysicalKey::Code(KeyCode::KeyC) => if is_pressed && !state.menu_open { state.input.action_pick = true; },
-                        _ => {}
+                    if is_pressed {
+                        match key_event.physical_key {
+                            PhysicalKey::Code(KeyCode::F2) => state.cycle_world_generator(),
+                            PhysicalKey::Code(KeyCode::F5) => { let _ = state.save_game("world_save.json"); },
+                            PhysicalKey::Code(KeyCode::F9) => { let _ = state.load_game("world_save.json"); },
+                            PhysicalKey::Code(KeyCode::KeyM) => state.toggle_play_mode(),
+                            PhysicalKey::Code(KeyCode::Digit1) => { state.selected_slot = 0; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit2) => { state.selected_slot = 1; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit3) => { state.selected_slot = 2; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit4) => { state.selected_slot = 3; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit5) => { state.selected_slot = 4; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::KeyC) if !state.menu_open => state.input.action_pick = true,
+                            _ => {}
+                        }
                     }
 
                     if !state.menu_open {
@@ -939,29 +1170,27 @@ impl ApplicationHandler for App {
                             if element_state == ElementState::Pressed {
                                 let [mx, my] = state.cursor_pos;
 
-                                // 1. Sélection d'un slot
                                 let swatch_w = 0.11;
                                 let swatch_gap = 0.025;
                                 let s_start_x = -(5.0 * swatch_w + 4.0 * swatch_gap) / 2.0;
                                 for i in 0..5 {
                                     let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
                                     let sx1 = sx0 + swatch_w;
-                                    if mx >= sx0 && mx <= sx1 && my >= 0.42 && my <= 0.52 {
+                                    if mx >= sx0 && mx <= sx1 && my >= 0.46 && my <= 0.56 {
                                         state.selected_slot = i;
                                         state.update_ui();
                                         return;
                                     }
                                 }
 
-                                // 2. Clic sur les curseurs RVB
                                 let sl_x0 = -0.30;
                                 let sl_x1 = 0.15;
                                 if mx >= sl_x0 - 0.02 && mx <= sl_x1 + 0.02 {
-                                    let slider_clicked = if my >= 0.28 && my <= 0.36 {
+                                    let slider_clicked = if my >= 0.32 && my <= 0.40 {
                                         Some(0)
-                                    } else if my >= 0.21 && my <= 0.29 {
+                                    } else if my >= 0.25 && my <= 0.33 {
                                         Some(1)
-                                    } else if my >= 0.14 && my <= 0.22 {
+                                    } else if my >= 0.18 && my <= 0.26 {
                                         Some(2)
                                     } else {
                                         None
@@ -976,20 +1205,26 @@ impl ApplicationHandler for App {
                                     }
                                 }
 
-                                // 3. Bouton Mode
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.01 && my <= 0.08 {
+                                // Mode Button
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.05 && my <= 0.14 {
                                     state.toggle_play_mode();
                                     return;
                                 }
 
-                                // 4. Bouton RESUME
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.15 && my <= -0.06 {
+                                // World Preset Button
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.07 && my <= 0.02 {
+                                    state.cycle_world_generator();
+                                    return;
+                                }
+
+                                // Resume Button
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.19 && my <= -0.10 {
                                     state.toggle_menu();
                                     return;
                                 }
 
-                                // 5. Bouton QUIT
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.29 && my <= -0.20 {
+                                // Quit Button
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.31 && my <= -0.22 {
                                     event_loop.exit();
                                     return;
                                 }
