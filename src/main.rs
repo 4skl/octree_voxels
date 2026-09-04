@@ -12,7 +12,7 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::platform::x11::WindowAttributesExtX11;
 
 use wgpu::util::DeviceExt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -24,20 +24,9 @@ use noise::{NoiseFn, Fbm, Perlin};
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 type ChunkShape = ConstShape3u32<34, 34, 34>; 
 type ChunkPos = (i32, i32, i32);
+pub type Palette = [[f32; 3]; 5];
 
-pub const PALETTE: [(u16, [f32; 3]); 5] = [
-    (1, [0.5, 0.5, 0.5]),    // Pierre (Gris)
-    (2, [0.2, 0.7, 0.3]),    // Herbe (Vert)
-    (3, [0.8, 0.2, 0.2]),    // Brique (Rouge)
-    (4, [0.2, 0.45, 0.85]),  // Eau / Lapis (Bleu)
-    (5, [0.95, 0.75, 0.2]),  // Sable / Or (Jaune)
-];
-
-pub fn material_color(id: u16) -> [f32; 3] {
-    PALETTE.iter().find(|(m, _)| *m == id).map(|(_, c)| *c).unwrap_or([0.5, 0.5, 0.5])
-}
-
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 pub enum PlayMode { Flying, Real }
 
 // --- OCTREE & VOXELS ---
@@ -143,7 +132,7 @@ fn generate_octree(chunk_pos: ChunkPos) -> Octree {
     octree
 }
 
-fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos) -> MeshPayload {
+fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos, palette: &Palette) -> MeshPayload {
     let mut voxels = vec![Block(0); ChunkShape::SIZE as usize];
     octree.flatten_into(octree.root_index as usize, 1, 1, 1, 32, &mut voxels);
 
@@ -172,7 +161,12 @@ fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos) -> MeshPayload {
             let id2 = voxels[ChunkShape::linearize(pos2) as usize].0;
             let mat_id = if id1 != 0 { id1 } else { id2 };
             
-            let color = material_color(mat_id);
+            let color = if mat_id >= 1 && (mat_id as usize) <= palette.len() {
+                palette[(mat_id - 1) as usize]
+            } else {
+                [0.5, 0.5, 0.5]
+            };
+
             let generic_quad = block_mesh::UnorientedQuad { minimum: quad.minimum, width: 1, height: 1 };
 
             for corner in face.quad_mesh_positions(&generic_quad, 1.0) {
@@ -206,12 +200,13 @@ struct ChunkManager {
     tx: mpsc::Sender<(ChunkPos, Octree, MeshPayload)>,
     rx: mpsc::Receiver<(ChunkPos, Octree, MeshPayload)>,
     render_distance: i32,
+    palette: Arc<RwLock<Palette>>,
 }
 
 impl ChunkManager {
-    fn new() -> Self {
+    fn new(palette: Arc<RwLock<Palette>>) -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { loaded_chunks: HashMap::new(), loading_chunks: HashSet::new(), tx, rx, render_distance: 3 }
+        Self { loaded_chunks: HashMap::new(), loading_chunks: HashSet::new(), tx, rx, render_distance: 3, palette }
     }
 
     fn update(&mut self, player_pos: Vec3, device: &wgpu::Device) {
@@ -224,9 +219,11 @@ impl ChunkManager {
                 if !self.loaded_chunks.contains_key(&pos) && !self.loading_chunks.contains(&pos) {
                     self.loading_chunks.insert(pos);
                     let tx_clone = self.tx.clone();
+                    let pal_arc = Arc::clone(&self.palette);
                     rayon::spawn(move || {
                         let octree = generate_octree(pos);
-                        let payload = generate_mesh(&octree, pos);
+                        let pal = *pal_arc.read().unwrap();
+                        let payload = generate_mesh(&octree, pos, &pal);
                         let _ = tx_clone.send((pos, octree, payload));
                     });
                 }
@@ -255,7 +252,8 @@ impl ChunkManager {
 
         if let Some(chunk) = self.loaded_chunks.get_mut(&chunk_pos) {
             chunk.octree.insert(lx, ly, lz, 5, material);
-            let payload = generate_mesh(&chunk.octree, chunk_pos);
+            let pal = *self.palette.read().unwrap();
+            let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
             chunk.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX });
             chunk.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX });
             chunk.num_indices = payload.indices.len() as u32;
@@ -340,17 +338,26 @@ fn add_quad(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, color
     ]);
 }
 
-// Matrice 3x5 pour dessiner du texte sans texture
 fn get_glyph(c: char) -> [u8; 5] {
     match c {
-        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+        'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
+        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
         'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
-        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
-        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
-        'M' => [0b101, 0b111, 0b101, 0b101, 0b101],
-        'Q' => [0b010, 0b101, 0b101, 0b110, 0b011],
+        'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
+        'G' => [0b111, 0b100, 0b101, 0b101, 0b111],
         'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'M' => [0b101, 0b111, 0b101, 0b101, 0b101],
+        'N' => [0b101, 0b111, 0b111, 0b101, 0b101],
+        'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        'Q' => [0b010, 0b101, 0b101, 0b110, 0b011],
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
         'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
+        ':' => [0b000, 0b010, 0b000, 0b010, 0b000],
         _ => [0; 5],
     }
 }
@@ -371,13 +378,23 @@ fn draw_text(verts: &mut Vec<UIVertex>, text: &str, start_x: f32, start_y: f32, 
                 }
             }
         }
-        cursor_x += 4.0 * pixel_w; // 3 pixels + 1 espace
+        cursor_x += 4.0 * pixel_w;
     }
 }
 
-fn build_ui_vertices(selected: u16, menu_open: bool) -> Vec<UIVertex> {
+fn draw_text_centered(verts: &mut Vec<UIVertex>, text: &str, cx: f32, cy: f32, pw: f32, ph: f32, color: [f32; 4]) {
+    let total_w = (text.len() as f32 * 4.0 - 1.0) * pw;
+    let total_h = 5.0 * ph;
+    draw_text(verts, text, cx - total_w / 2.0, cy - total_h / 2.0, pw, ph, color);
+}
+
+fn build_ui_vertices(selected: u16, menu_open: bool, palette: &Palette, play_mode: PlayMode) -> Vec<UIVertex> {
     let mut verts = Vec::new();
-    let num_slots = PALETTE.len();
+    let num_slots = palette.len();
+    let font_pw = 0.0055;
+    let font_ph = 0.009;
+
+    // Hotbar en bas
     let slot_width = 0.08;
     let slot_spacing = 0.02;
     let total_width = num_slots as f32 * slot_width + (num_slots - 1) as f32 * slot_spacing;
@@ -385,8 +402,8 @@ fn build_ui_vertices(selected: u16, menu_open: bool) -> Vec<UIVertex> {
     let y_bottom = -0.95;
     let y_top = -0.85;
 
-    // Hotbar
-    for (i, &(id, rgb)) in PALETTE.iter().enumerate() {
+    for (i, &rgb) in palette.iter().enumerate() {
+        let id = (i + 1) as u16;
         let x0 = start_x + i as f32 * (slot_width + slot_spacing);
         let x1 = x0 + slot_width;
 
@@ -399,35 +416,34 @@ fn build_ui_vertices(selected: u16, menu_open: bool) -> Vec<UIVertex> {
     }
 
     if !menu_open {
-        // Viseur / Crosshair au centre de l'écran
-        let ch_color = [1.0, 1.0, 1.0, 0.85];
-        let ch_outline = [0.0, 0.0, 0.0, 0.6];
-        
-        // Bordures noires
-        add_quad(&mut verts, -0.016, -0.0035, 0.016, 0.0035, ch_outline);
-        add_quad(&mut verts, -0.0035, -0.026, 0.0035, 0.026, ch_outline);
-        
-        // Barres blanches centrales
-        add_quad(&mut verts, -0.014, -0.002, 0.014, 0.002, ch_color);
-        add_quad(&mut verts, -0.002, -0.024, 0.002, 0.024, ch_color);
+        // Réticule central
+        add_quad(&mut verts, -0.016, -0.0035, 0.016, 0.0035, [0.0, 0.0, 0.0, 0.6]);
+        add_quad(&mut verts, -0.0035, -0.026, 0.0035, 0.026, [0.0, 0.0, 0.0, 0.6]);
+        add_quad(&mut verts, -0.014, -0.002, 0.014, 0.002, [1.0, 1.0, 1.0, 0.9]);
+        add_quad(&mut verts, -0.002, -0.024, 0.002, 0.024, [1.0, 1.0, 1.0, 0.9]);
+
+        // Indicateur du mode de jeu actif
+        let mode_hud = if play_mode == PlayMode::Flying { "FLY" } else { "REAL" };
+        draw_text(&mut verts, mode_hud, -0.95, 0.90, 0.006, 0.011, [1.0, 1.0, 1.0, 0.85]);
     } else {
         // Menu Pause
         add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.0, 0.0, 0.0, 0.65]);
 
-        let px0 = -0.45; let px1 = 0.45;
-        let py0 = -0.35; let py1 = 0.35;
+        let px0 = -0.48; let px1 = 0.48;
+        let py0 = -0.58; let py1 = 0.58;
         add_quad(&mut verts, px0 - 0.008, py0 - 0.008, px1 + 0.008, py1 + 0.008, [0.4, 0.4, 0.45, 1.0]);
         add_quad(&mut verts, px0, py0, px1, py1, [0.12, 0.12, 0.15, 0.95]);
 
-        // Sélecteur de couleurs
-        let swatch_w = 0.1;
-        let swatch_gap = 0.03;
+        // 1. Sélection de slot à éditer
+        let swatch_w = 0.11;
+        let swatch_gap = 0.025;
         let swatches_total = num_slots as f32 * swatch_w + (num_slots - 1) as f32 * swatch_gap;
         let s_start_x = -swatches_total / 2.0;
-        let sy0 = 0.1;
-        let sy1 = 0.24;
+        let sy0 = 0.42;
+        let sy1 = 0.52;
 
-        for (i, &(id, rgb)) in PALETTE.iter().enumerate() {
+        for (i, &rgb) in palette.iter().enumerate() {
+            let id = (i + 1) as u16;
             let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
             let sx1 = sx0 + swatch_w;
 
@@ -439,28 +455,46 @@ fn build_ui_vertices(selected: u16, menu_open: bool) -> Vec<UIVertex> {
             add_quad(&mut verts, sx0, sy0, sx1, sy1, [rgb[0], rgb[1], rgb[2], 1.0]);
         }
 
-        let font_pw = 0.0055;
-        let font_ph = 0.009;
+        // 2. Sélecteur de couleur RVB
+        let sel_idx = (selected.saturating_sub(1) as usize).min(palette.len() - 1);
+        let [cur_r, cur_g, cur_b] = palette[sel_idx];
 
-        // Bouton RESUME
-        let rx0 = -0.25; let rx1 = 0.25;
-        let ry0 = -0.08; let ry1 = 0.02;
-        add_quad(&mut verts, rx0 - 0.005, ry0 - 0.005, rx1 + 0.005, ry1 + 0.005, [0.35, 0.6, 0.4, 1.0]);
-        add_quad(&mut verts, rx0, ry0, rx1, ry1, [0.2, 0.55, 0.3, 1.0]);
-        // Centrage texte "RESUME" (6 lettres)
-        let resume_x = -((6.0 * 4.0 - 1.0) * font_pw) / 2.0;
-        let resume_y = (ry0 + ry1) / 2.0 - (5.0 * font_ph) / 2.0;
-        draw_text(&mut verts, "RESUME", resume_x, resume_y, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        // Boîte d'aperçu de la couleur
+        add_quad(&mut verts, 0.215, 0.155, 0.385, 0.355, [0.4, 0.4, 0.45, 1.0]);
+        add_quad(&mut verts, 0.22, 0.16, 0.38, 0.35, [cur_r, cur_g, cur_b, 1.0]);
 
-        // Bouton QUIT
-        let qx0 = -0.25; let qx1 = 0.25;
-        let qy0 = -0.24; let qy1 = -0.14;
-        add_quad(&mut verts, qx0 - 0.005, qy0 - 0.005, qx1 + 0.005, qy1 + 0.005, [0.6, 0.3, 0.3, 1.0]);
-        add_quad(&mut verts, qx0, qy0, qx1, qy1, [0.5, 0.2, 0.2, 1.0]);
-        // Centrage texte "QUIT" (4 lettres)
-        let quit_x = -((4.0 * 4.0 - 1.0) * font_pw) / 2.0;
-        let quit_y = (qy0 + qy1) / 2.0 - (5.0 * font_ph) / 2.0;
-        draw_text(&mut verts, "QUIT", quit_x, quit_y, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        // Sliders Rouge, Vert, Bleu
+        let sl_x0 = -0.30;
+        let sl_x1 = 0.15;
+        let channels = [
+            ("R", cur_r, 0.30, 0.34, [0.9, 0.25, 0.25, 1.0]),
+            ("G", cur_g, 0.23, 0.27, [0.25, 0.85, 0.35, 1.0]),
+            ("B", cur_b, 0.16, 0.20, [0.25, 0.45, 0.95, 1.0]),
+        ];
+
+        for (lbl, val, y0, y1, bar_col) in channels {
+            draw_text_centered(&mut verts, lbl, -0.34, (y0 + y1) / 2.0, font_pw, font_ph, bar_col);
+            add_quad(&mut verts, sl_x0, y0, sl_x1, y1, [0.18, 0.18, 0.22, 1.0]);
+            let filled_x = sl_x0 + val * (sl_x1 - sl_x0);
+            add_quad(&mut verts, sl_x0, y0, filled_x, y1, bar_col);
+            add_quad(&mut verts, filled_x - 0.012, y0 - 0.008, filled_x + 0.012, y1 + 0.008, [1.0, 1.0, 1.0, 1.0]);
+        }
+
+        // 3. Bouton Mode (Vol / Réel)
+        let mode_text = if play_mode == PlayMode::Flying { "MODE: FLYING" } else { "MODE: REAL" };
+        add_quad(&mut verts, -0.305, -0.015, 0.305, 0.085, [0.35, 0.5, 0.75, 1.0]);
+        add_quad(&mut verts, -0.30, -0.01, 0.30, 0.08, [0.2, 0.32, 0.55, 1.0]);
+        draw_text_centered(&mut verts, mode_text, 0.0, 0.035, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        // 4. Bouton RESUME
+        add_quad(&mut verts, -0.305, -0.155, 0.305, -0.055, [0.35, 0.6, 0.4, 1.0]);
+        add_quad(&mut verts, -0.30, -0.15, 0.30, -0.06, [0.2, 0.55, 0.3, 1.0]);
+        draw_text_centered(&mut verts, "RESUME", 0.0, -0.105, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        // 5. Bouton QUIT
+        add_quad(&mut verts, -0.305, -0.295, 0.305, -0.195, [0.6, 0.3, 0.3, 1.0]);
+        add_quad(&mut verts, -0.30, -0.29, 0.30, -0.20, [0.5, 0.2, 0.2, 1.0]);
+        draw_text_centered(&mut verts, "QUIT", 0.0, -0.245, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
     }
 
     verts
@@ -486,8 +520,10 @@ struct State {
     play_mode: PlayMode,
     velocity: Vec3,
     selected_material: u16,
+    palette: Arc<RwLock<Palette>>,
     menu_open: bool,
     cursor_pos: [f32; 2],
+    active_slider: Option<usize>,
 }
 
 impl State {
@@ -543,20 +579,28 @@ impl State {
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview_mask: None, cache: None,
         });
-        
-        let initial_ui = build_ui_vertices(1, false);
+
+        let palette = Arc::new(RwLock::new([
+            [0.50, 0.50, 0.50], // 1: Gris
+            [0.20, 0.70, 0.30], // 2: Vert
+            [0.80, 0.20, 0.20], // 3: Rouge
+            [0.20, 0.45, 0.85], // 4: Bleu
+            [0.95, 0.75, 0.20], // 5: Jaune
+        ]));
+
+        let initial_ui = build_ui_vertices(1, false, &palette.read().unwrap(), PlayMode::Flying);
         let ui_vertices_count = initial_ui.len() as u32;
         let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("UI Buffer"),
-            size: (8192 * std::mem::size_of::<UIVertex>()) as wgpu::BufferAddress,
+            size: (16384 * std::mem::size_of::<UIVertex>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         queue.write_buffer(&ui_vertex_buffer, 0, bytemuck::cast_slice(&initial_ui));
 
-        let mut chunk_manager = ChunkManager::new();
+        let mut chunk_manager = ChunkManager::new(Arc::clone(&palette));
         let octree = generate_octree((0, 0, 0));
-        let initial_payload = generate_mesh(&octree, (0, 0, 0));
+        let initial_payload = generate_mesh(&octree, (0, 0, 0), &palette.read().unwrap());
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&initial_payload.vertices), usage: wgpu::BufferUsages::VERTEX });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&initial_payload.indices), usage: wgpu::BufferUsages::INDEX });
         chunk_manager.loaded_chunks.insert((0, 0, 0), RenderChunk { octree, vertex_buffer, index_buffer, num_indices: initial_payload.indices.len() as u32 });
@@ -566,12 +610,13 @@ impl State {
             camera_buffer, camera_bind_group, depth_texture_view, camera,
             input: InputState::default(), chunk_manager,
             play_mode: PlayMode::Flying, velocity: Vec3::ZERO, selected_material: 1,
-            menu_open: false, cursor_pos: [0.0, 0.0],
+            palette, menu_open: false, cursor_pos: [0.0, 0.0], active_slider: None,
         }
     }
 
     fn toggle_menu(&mut self) {
         self.menu_open = !self.menu_open;
+        self.active_slider = None;
         if self.menu_open {
             let _ = self.window.set_cursor_grab(winit::window::CursorGrabMode::None);
             self.window.set_cursor_visible(true);
@@ -584,16 +629,31 @@ impl State {
         self.update_ui();
     }
 
-    fn cycle_material(&mut self, step: i32) {
-        let current_idx = PALETTE.iter().position(|(m, _)| *m == self.selected_material).unwrap_or(0) as i32;
-        let len = PALETTE.len() as i32;
-        let new_idx = (current_idx + step).rem_euclid(len) as usize;
-        self.selected_material = PALETTE[new_idx].0;
+    fn toggle_play_mode(&mut self) {
+        self.play_mode = if self.play_mode == PlayMode::Real { PlayMode::Flying } else { PlayMode::Real };
+        self.velocity = Vec3::ZERO;
         self.update_ui();
     }
 
+    fn remesh_all(&mut self) {
+        let pal = *self.palette.read().unwrap();
+        for (&chunk_pos, chunk) in self.chunk_manager.loaded_chunks.iter_mut() {
+            let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
+            if !payload.vertices.is_empty() && !payload.indices.is_empty() {
+                chunk.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
+                });
+                chunk.index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None, contents: bytemuck::cast_slice(&payload.indices), usage: wgpu::BufferUsages::INDEX,
+                });
+                chunk.num_indices = payload.indices.len() as u32;
+            }
+        }
+    }
+
     fn update_ui(&mut self) {
-        let verts = build_ui_vertices(self.selected_material, self.menu_open);
+        let pal = *self.palette.read().unwrap();
+        let verts = build_ui_vertices(self.selected_material, self.menu_open, &pal, self.play_mode);
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
     }
@@ -609,9 +669,7 @@ impl State {
     }
 
     fn update(&mut self, dt: f32) {
-        if self.menu_open {
-            return;
-        }
+        if self.menu_open { return; }
 
         let speed = 25.0;
         let (sin_y, cos_y) = self.camera.yaw.sin_cos();
@@ -760,6 +818,21 @@ impl ApplicationHandler for App {
                     let ndc_x = (position.x as f32 / state.size.width as f32) * 2.0 - 1.0;
                     let ndc_y = 1.0 - (position.y as f32 / state.size.height as f32) * 2.0;
                     state.cursor_pos = [ndc_x, ndc_y];
+
+                    if state.menu_open {
+                        if let Some(channel) = state.active_slider {
+                            let sl_x0 = -0.30;
+                            let sl_x1 = 0.15;
+                            let val = ((ndc_x - sl_x0) / (sl_x1 - sl_x0)).clamp(0.0, 1.0);
+                            let sel_idx = (state.selected_material.saturating_sub(1) as usize).min(4);
+                            {
+                                let mut pal = state.palette.write().unwrap();
+                                pal[sel_idx][channel] = val;
+                            }
+                            // Only update the UI while dragging
+                            state.update_ui();
+                        }
+                    }
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
                     let step = match delta {
@@ -767,7 +840,10 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::PixelDelta(pos) => if pos.y > 0.0 { -1 } else if pos.y < 0.0 { 1 } else { 0 },
                     };
                     if step != 0 {
-                        state.cycle_material(step);
+                        let cur_idx = (state.selected_material.saturating_sub(1)) as i32;
+                        let new_idx = (cur_idx + step).rem_euclid(5) as u16 + 1;
+                        state.selected_material = new_idx;
+                        state.update_ui();
                     }
                 }
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
@@ -778,6 +854,16 @@ impl ApplicationHandler for App {
                         return;
                     }
 
+                    match key_event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyM) => if is_pressed { state.toggle_play_mode(); },
+                        PhysicalKey::Code(KeyCode::Digit1) => if is_pressed { state.selected_material = 1; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit2) => if is_pressed { state.selected_material = 2; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit3) => if is_pressed { state.selected_material = 3; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit4) => if is_pressed { state.selected_material = 4; state.update_ui(); },
+                        PhysicalKey::Code(KeyCode::Digit5) => if is_pressed { state.selected_material = 5; state.update_ui(); },
+                        _ => {}
+                    }
+
                     if !state.menu_open {
                         match key_event.physical_key {
                             PhysicalKey::Code(KeyCode::KeyW) => state.input.forward = is_pressed,
@@ -786,60 +872,88 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::KeyD) => state.input.right = is_pressed,
                             PhysicalKey::Code(KeyCode::Space) => state.input.up = is_pressed,
                             PhysicalKey::Code(KeyCode::ShiftLeft) => state.input.down = is_pressed,
-                            PhysicalKey::Code(KeyCode::Digit1) => if is_pressed { state.selected_material = 1; state.update_ui(); },
-                            PhysicalKey::Code(KeyCode::Digit2) => if is_pressed { state.selected_material = 2; state.update_ui(); },
-                            PhysicalKey::Code(KeyCode::Digit3) => if is_pressed { state.selected_material = 3; state.update_ui(); },
-                            PhysicalKey::Code(KeyCode::Digit4) => if is_pressed { state.selected_material = 4; state.update_ui(); },
-                            PhysicalKey::Code(KeyCode::Digit5) => if is_pressed { state.selected_material = 5; state.update_ui(); },
-                            PhysicalKey::Code(KeyCode::KeyM) => if is_pressed {
-                                state.play_mode = if state.play_mode == PlayMode::Real { PlayMode::Flying } else { PlayMode::Real };
-                            },
                             _ => {}
                         }
                     }
                 }
                 WindowEvent::MouseInput { state: element_state, button, .. } => {
-                    if element_state == ElementState::Pressed {
-                        if state.menu_open {
-                            if button == MouseButton::Left {
+                    if state.menu_open {
+                        if button == MouseButton::Left {
+                            if element_state == ElementState::Pressed {
                                 let [mx, my] = state.cursor_pos;
-                                let num_slots = PALETTE.len();
-                                let swatch_w = 0.1;
-                                let swatch_gap = 0.03;
-                                let swatches_total = num_slots as f32 * swatch_w + (num_slots - 1) as f32 * swatch_gap;
-                                let s_start_x = -swatches_total / 2.0;
-                                let sy0 = 0.1;
-                                let sy1 = 0.24;
 
-                                // Clic sur un carré de couleur
-                                for (i, &(id, _)) in PALETTE.iter().enumerate() {
+                                // 1. Sélection d'un slot
+                                let swatch_w = 0.11;
+                                let swatch_gap = 0.025;
+                                let s_start_x = -(5.0 * swatch_w + 4.0 * swatch_gap) / 2.0;
+                                for i in 0..5 {
                                     let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
                                     let sx1 = sx0 + swatch_w;
-                                    if mx >= sx0 && mx <= sx1 && my >= sy0 && my <= sy1 {
-                                        state.selected_material = id;
+                                    if mx >= sx0 && mx <= sx1 && my >= 0.42 && my <= 0.52 {
+                                        state.selected_material = (i + 1) as u16;
                                         state.update_ui();
                                         return;
                                     }
                                 }
 
-                                // Clic sur "Reprendre"
-                                if mx >= -0.25 && mx <= 0.25 && my >= -0.08 && my <= 0.02 {
+                                // 2. Clic sur les curseurs RVB
+                                let sl_x0 = -0.30;
+                                let sl_x1 = 0.15;
+                                if mx >= sl_x0 - 0.02 && mx <= sl_x1 + 0.02 {
+                                    let slider_clicked = if my >= 0.28 && my <= 0.36 {
+                                        Some(0) // R
+                                    } else if my >= 0.21 && my <= 0.29 {
+                                        Some(1) // G
+                                    } else if my >= 0.14 && my <= 0.22 {
+                                        Some(2) // B
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(channel) = slider_clicked {
+                                        state.active_slider = Some(channel);
+                                        let val = ((mx - sl_x0) / (sl_x1 - sl_x0)).clamp(0.0, 1.0);
+                                        let sel_idx = (state.selected_material.saturating_sub(1) as usize).min(4);
+                                        {
+                                            let mut pal = state.palette.write().unwrap();
+                                            pal[sel_idx][channel] = val;
+                                        }
+                                        state.remesh_all();
+                                        state.update_ui();
+                                        return;
+                                    }
+                                }
+
+                                // 3. Clic sur le bouton de mode (Vol / Réel)
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.01 && my <= 0.08 {
+                                    state.toggle_play_mode();
+                                    return;
+                                }
+
+                                // 4. Clic sur RESUME
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.15 && my <= -0.06 {
                                     state.toggle_menu();
                                     return;
                                 }
 
-                                // Clic sur "Quitter"
-                                if mx >= -0.25 && mx <= 0.25 && my >= -0.24 && my <= -0.14 {
+                                // 5. Clic sur QUIT
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.29 && my <= -0.20 {
                                     event_loop.exit();
                                     return;
                                 }
+                            } else {
+                                // Mouse released: remesh chunks once
+                                if state.active_slider.is_some() {
+                                    state.active_slider = None;
+                                    state.remesh_all();
+                                }
                             }
-                        } else {
-                            match button {
-                                MouseButton::Left => state.input.action_remove = true,
-                                MouseButton::Right => state.input.action_add = true,
-                                _ => {}
-                            }
+                        }
+                    } else if element_state == ElementState::Pressed {
+                        match button {
+                            MouseButton::Left => state.input.action_remove = true,
+                            MouseButton::Right => state.input.action_add = true,
+                            _ => {}
                         }
                     }
                 }
@@ -855,7 +969,7 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
         if let Some(state) = self.state.as_mut() {
-            if !state.menu_open && (state.play_mode == PlayMode::Flying || state.play_mode == PlayMode::Real) {
+            if !state.menu_open {
                 if let DeviceEvent::MouseMotion { delta } = event {
                     state.camera.yaw += (delta.0 as f32) * 0.002;
                     state.camera.pitch -= (delta.1 as f32) * 0.002;
