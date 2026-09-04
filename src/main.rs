@@ -32,27 +32,30 @@ pub enum PlayMode { Flying, Real }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum WorldType {
+    Empty,
+    Flat,
     Hills,
     Mountains,
-    Flat,
     FloatingIslands,
 }
 
 impl WorldType {
     pub fn next(&self) -> Self {
         match self {
+            WorldType::Empty => WorldType::Flat,
+            WorldType::Flat => WorldType::Hills,
             WorldType::Hills => WorldType::Mountains,
-            WorldType::Mountains => WorldType::Flat,
-            WorldType::Flat => WorldType::FloatingIslands,
-            WorldType::FloatingIslands => WorldType::Hills,
+            WorldType::Mountains => WorldType::FloatingIslands,
+            WorldType::FloatingIslands => WorldType::Empty,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
+            WorldType::Empty => "EMPTY CANVAS",
+            WorldType::Flat => "FLAT",
             WorldType::Hills => "HILLS",
             WorldType::Mountains => "MOUNTAINS",
-            WorldType::Flat => "FLAT",
             WorldType::FloatingIslands => "ISLANDS",
         }
     }
@@ -66,12 +69,12 @@ pub struct SaveData {
     pub play_mode: PlayMode,
     pub world_type: WorldType,
     pub seed: u32,
-    pub hotbar_colors: [[f32; 3]; 5],
+    pub hotbar_colors: [[f32; 3]; 10],
     pub palette: Vec<[f32; 3]>,
     pub modified_blocks: Vec<([i32; 3], Vec<([u32; 3], u16)>)>,
 }
 
-// --- OCTREE & VOXELS ---
+// --- OCTREE MULTI-RÉSOLUTION ---
 
 #[derive(Clone, Copy, Default)]
 pub struct OctreeNode {
@@ -87,47 +90,70 @@ pub struct Octree {
 }
 
 impl Octree {
-    pub fn new() -> Self { Self { nodes: vec![OctreeNode::default()], root_index: 0 } }
+    pub fn new() -> Self { 
+        Self { nodes: vec![OctreeNode::default()], root_index: 0 } 
+    }
 
     pub fn insert(&mut self, mut x: u32, mut y: u32, mut z: u32, depth: u8, material: u16) {
         let mut current_idx = self.root_index as usize;
-        let mut half_size = 1 << depth;
-        for _ in 0..depth {
-            half_size >>= 1;
-            let mut octant = 0;
-            if x >= half_size { octant |= 1; x -= half_size; }
-            if y >= half_size { octant |= 2; y -= half_size; }
-            if z >= half_size { octant |= 4; z -= half_size; }
+        let mut half_size = 16;
 
-            if self.nodes[current_idx].child_pointer == 0 {
+        for _ in 0..depth {
+            let old_mat = self.nodes[current_idx].material_id;
+            let child_ptr = self.nodes[current_idx].child_pointer;
+
+            // Subdivision de nœud parent si nécessaire
+            if child_ptr == 0 {
                 let new_ptr = self.nodes.len() as u32;
                 self.nodes.resize(self.nodes.len() + 8, OctreeNode::default());
+                if old_mat != 0 {
+                    for c in 0..8 {
+                        self.nodes[(new_ptr + c) as usize].material_id = old_mat;
+                    }
+                    self.nodes[current_idx].child_mask = 0xFF;
+                } else {
+                    self.nodes[current_idx].child_mask = 0;
+                }
                 self.nodes[current_idx].child_pointer = new_ptr;
+                self.nodes[current_idx].material_id = 0;
             }
-            self.nodes[current_idx].child_mask |= 1 << octant;
-            current_idx = (self.nodes[current_idx].child_pointer + octant) as usize;
-        }
-        self.nodes[current_idx].material_id = material;
-    }
 
-    pub fn query(&self, mut x: u32, mut y: u32, mut z: u32, depth: u8) -> u16 {
-        let mut current_idx = self.root_index as usize;
-        let mut half_size = 1 << depth;
-        for _ in 0..depth {
-            half_size >>= 1;
             let mut octant = 0;
             if x >= half_size { octant |= 1; x -= half_size; }
             if y >= half_size { octant |= 2; y -= half_size; }
             if z >= half_size { octant |= 4; z -= half_size; }
 
+            if material != 0 {
+                self.nodes[current_idx].child_mask |= 1 << octant;
+            }
+
+            current_idx = (self.nodes[current_idx].child_pointer + octant) as usize;
+            half_size >>= 1;
+        }
+
+        self.nodes[current_idx].material_id = material;
+        self.nodes[current_idx].child_pointer = 0;
+        self.nodes[current_idx].child_mask = 0;
+    }
+
+    pub fn query(&self, mut x: u32, mut y: u32, mut z: u32) -> u16 {
+        let mut current_idx = self.root_index as usize;
+        let mut half_size = 16;
+        for _ in 0..5 {
             let node = &self.nodes[current_idx];
             if node.child_pointer == 0 {
                 return node.material_id;
             }
+            let mut octant = 0;
+            if x >= half_size { octant |= 1; x -= half_size; }
+            if y >= half_size { octant |= 2; y -= half_size; }
+            if z >= half_size { octant |= 4; z -= half_size; }
+
             if (node.child_mask & (1 << octant)) == 0 {
                 return 0;
             }
             current_idx = (node.child_pointer + octant) as usize;
+            half_size >>= 1;
         }
         self.nodes[current_idx].material_id
     }
@@ -164,13 +190,16 @@ impl Octree {
 pub struct Block(pub u16);
 
 impl Voxel for Block {
-    fn get_visibility(&self) -> VoxelVisibility { if self.0 == 0 { VoxelVisibility::Empty } else { VoxelVisibility::Opaque } }
+    fn get_visibility(&self) -> VoxelVisibility { 
+        if self.0 == 0 { VoxelVisibility::Empty } else { VoxelVisibility::Opaque } 
+    }
 }
 impl MergeVoxel for Block {
-    type MergeValue = u16; fn merge_value(&self) -> Self::MergeValue { self.0 }
+    type MergeValue = u16; 
+    fn merge_value(&self) -> Self::MergeValue { self.0 }
 }
 
-// --- GENERATION & MESHING ---
+// --- MAILLAGE ET GÉNÉRATION SANS OMBRES ---
 
 struct MeshPayload { vertices: Vec<Vertex>, indices: Vec<u32> }
 
@@ -186,6 +215,9 @@ fn generate_octree(
     let world_z_offset = chunk_pos.2 * 32;
 
     match world_type {
+        WorldType::Empty => {
+            // Vide par défaut pour la sculpture 3D libre
+        }
         WorldType::Flat => {
             if chunk_pos.1 == 0 {
                 for x in 0..32 {
@@ -293,13 +325,11 @@ fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos, palette: &[[f32; 3]]) -> 
             let generic_quad = block_mesh::UnorientedQuad { minimum: quad.minimum, width: 1, height: 1 };
 
             for corner in face.quad_mesh_positions(&generic_quad, 1.0) {
-                let is_bottom_corner = corner[1] < (quad.minimum[1] as f32 + 0.5);
-                let ao_multiplier = if is_bottom_corner && n.y == 0 { 0.65 } else { 1.0 };
-                
+                // Suppression totale de l'occlusion ambiante (ao_multiplier retiré)
                 vertices.push(Vertex {
                     position: [corner[0] - 1.0 + offset_x, corner[1] - 1.0 + offset_y, corner[2] - 1.0 + offset_z],
                     normal,
-                    color: [color[0] * ao_multiplier, color[1] * ao_multiplier, color[2] * ao_multiplier],
+                    color,
                 });
             }
             indices.extend_from_slice(&face.quad_mesh_indices(start_index));
@@ -339,7 +369,7 @@ impl ChunkManager {
             rx,
             render_distance: 3,
             palette,
-            world_type: WorldType::Hills,
+            world_type: WorldType::Empty,
             seed: 42,
             modified_blocks: HashMap::new(),
         }
@@ -387,21 +417,61 @@ impl ChunkManager {
         });
     }
 
-    fn modify_block(&mut self, pos: Vec3, material: u16, device: &wgpu::Device) {
-        let cx = (pos.x / 32.0).floor() as i32;
-        let cy = (pos.y / 32.0).floor() as i32;
-        let cz = (pos.z / 32.0).floor() as i32;
+    fn modify_cube(&mut self, pos: Vec3, material: u16, size: u32, device: &wgpu::Device) {
+        let depth = match size {
+            1 => 5, // Sub-cube feuille (1x1)
+            2 => 4, // Sub-cube moyen (2x2)
+            4 => 3, // Cube standard (4x4)
+            8 => 2, // Super-cube (8x8)
+            16 => 1, // Super-cube large (16x16)
+            _ => 5,
+        };
+        let s = size as i32;
+
+        let bx = (pos.x.floor() as i32).div_euclid(s) * s;
+        let by = (pos.y.floor() as i32).div_euclid(s) * s;
+        let bz = (pos.z.floor() as i32).div_euclid(s) * s;
+
+        let cx = bx.div_euclid(32);
+        let cy = by.div_euclid(32);
+        let cz = bz.div_euclid(32);
         let chunk_pos = (cx, cy, cz);
-        let lx = (pos.x.floor() as i32).rem_euclid(32) as u32;
-        let ly = (pos.y.floor() as i32).rem_euclid(32) as u32;
-        let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
 
-        self.modified_blocks.entry(chunk_pos).or_default().insert([lx, ly, lz], material);
+        let lx = bx.rem_euclid(32) as u32;
+        let ly = by.rem_euclid(32) as u32;
+        let lz = bz.rem_euclid(32) as u32;
 
-        if let Some(chunk) = self.loaded_chunks.get_mut(&chunk_pos) {
-            chunk.octree.insert(lx, ly, lz, 5, material);
-            let pal = self.palette.read().unwrap().clone();
-            let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
+        let chunk_map = self.modified_blocks.entry(chunk_pos).or_default();
+        for dz in 0..size {
+            for dy in 0..size {
+                for dx in 0..size {
+                    if material == 0 {
+                        chunk_map.remove(&[lx + dx, ly + dy, lz + dz]);
+                    } else {
+                        chunk_map.insert([lx + dx, ly + dy, lz + dz], material);
+                    }
+                }
+            }
+        }
+
+        let chunk = self.loaded_chunks.entry(chunk_pos).or_insert_with(|| {
+            let octree = generate_octree(chunk_pos, self.world_type, self.seed, self.modified_blocks.get(&chunk_pos));
+            let vb = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: 64, usage: wgpu::BufferUsages::VERTEX, mapped_at_creation: false,
+            });
+            let ib = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: 64, usage: wgpu::BufferUsages::INDEX, mapped_at_creation: false,
+            });
+            RenderChunk { octree, vertex_buffer: vb, index_buffer: ib, num_indices: 0 }
+        });
+
+        chunk.octree.insert(lx, ly, lz, depth, material);
+
+        let pal = self.palette.read().unwrap().clone();
+        let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
+        if payload.vertices.is_empty() || payload.indices.is_empty() {
+            chunk.num_indices = 0;
+        } else {
             chunk.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None, contents: bytemuck::cast_slice(&payload.vertices), usage: wgpu::BufferUsages::VERTEX,
             });
@@ -421,7 +491,7 @@ impl ChunkManager {
         let lz = (pos.z.floor() as i32).rem_euclid(32) as u32;
 
         if let Some(chunk) = self.loaded_chunks.get(&(cx, cy, cz)) {
-            chunk.octree.query(lx, ly, lz, 5)
+            chunk.octree.query(lx, ly, lz)
         } else {
             0
         }
@@ -560,6 +630,11 @@ fn get_glyph(c: char) -> [u8; 5] {
         '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
         '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
         ':' => [0b000, 0b010, 0b000, 0b010, 0b000],
+        '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
+        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
+        '[' => [0b110, 0b100, 0b100, 0b100, 0b110],
+        ']' => [0b011, 0b001, 0b001, 0b001, 0b011],
+        '|' => [0b010, 0b010, 0b010, 0b010, 0b010],
         _ => [0; 5],
     }
 }
@@ -590,112 +665,197 @@ fn draw_text_centered(verts: &mut Vec<UIVertex>, text: &str, cx: f32, cy: f32, p
     draw_text(verts, text, cx - total_w / 2.0, cy - total_h / 2.0, pw, ph, color);
 }
 
+const PRESET_SWATCHES: [[f32; 3]; 10] = [
+    [0.95, 0.95, 0.95], // Blanc
+    [0.10, 0.10, 0.12], // Noir
+    [0.90, 0.20, 0.20], // Rouge
+    [0.95, 0.50, 0.15], // Orange
+    [0.95, 0.85, 0.15], // Jaune
+    [0.20, 0.75, 0.25], // Vert
+    [0.15, 0.80, 0.85], // Cyan
+    [0.20, 0.45, 0.90], // Bleu
+    [0.65, 0.25, 0.85], // Violet
+    [0.55, 0.35, 0.20], // Marron
+];
+
 fn build_ui_vertices(
     selected_slot: usize,
     menu_open: bool,
-    hotbar_colors: &[[f32; 3]; 5],
+    hotbar_colors: &[[f32; 3]; 10],
     play_mode: PlayMode,
     world_type: WorldType,
+    edit_size: u32,
+    target_pos: Option<[i32; 3]>,
 ) -> Vec<UIVertex> {
     let mut verts = Vec::new();
-    let num_slots = hotbar_colors.len();
-    let font_pw = 0.0055;
-    let font_ph = 0.009;
+    let num_slots = 10;
+    let font_pw = 0.0050;
+    let font_ph = 0.0085;
 
-    let slot_width = 0.08;
-    let slot_spacing = 0.02;
-    let total_width = num_slots as f32 * slot_width + (num_slots - 1) as f32 * slot_spacing;
-    let start_x = -total_width / 2.0;
-    let y_bottom = -0.95;
-    let y_top = -0.85;
+    // --- BARRE DE SLOTS INFERIEURE EN JEU ---
+    let slot_w = 0.054;
+    let slot_gap = 0.009;
+    let total_w = num_slots as f32 * slot_w + (num_slots - 1) as f32 * slot_gap;
+    let start_x = -total_w / 2.0;
+    let y_bottom = -0.96;
+    let y_top = -0.86;
 
     for (i, &rgb) in hotbar_colors.iter().enumerate() {
-        let x0 = start_x + i as f32 * (slot_width + slot_spacing);
-        let x1 = x0 + slot_width;
+        let x0 = start_x + i as f32 * (slot_w + slot_gap);
+        let x1 = x0 + slot_w;
 
         if selected_slot == i {
-            add_quad(&mut verts, x0 - 0.01, y_bottom - 0.01, x1 + 0.01, y_top + 0.01, [1.0, 1.0, 0.0, 1.0]);
+            add_quad(&mut verts, x0 - 0.006, y_bottom - 0.006, x1 + 0.006, y_top + 0.006, [1.0, 0.9, 0.1, 1.0]);
         } else {
-            add_quad(&mut verts, x0 - 0.005, y_bottom - 0.005, x1 + 0.005, y_top + 0.005, [0.2, 0.2, 0.2, 0.8]);
+            add_quad(&mut verts, x0 - 0.003, y_bottom - 0.003, x1 + 0.003, y_top + 0.003, [0.15, 0.16, 0.20, 0.9]);
         }
         add_quad(&mut verts, x0, y_bottom, x1, y_top, [rgb[0], rgb[1], rgb[2], 1.0]);
+
+        let num_str = match i { 9 => "0", _ => &format!("{}", i + 1) };
+        draw_text_centered(&mut verts, num_str, (x0 + x1) / 2.0, y_top + 0.02, font_pw * 0.8, font_ph * 0.8, [0.9, 0.9, 0.9, 0.9]);
     }
 
+    let size_tag = match edit_size {
+        1 => "1X1 SUB",
+        2 => "2X2 SUB",
+        4 => "4X4 STD",
+        8 => "8X8 SUPER",
+        16 => "16X16 MEGA",
+        _ => "1X1",
+    };
+
     if !menu_open {
-        add_quad(&mut verts, -0.016, -0.0035, 0.016, 0.0035, [0.0, 0.0, 0.0, 0.6]);
-        add_quad(&mut verts, -0.0035, -0.026, 0.0035, 0.026, [0.0, 0.0, 0.0, 0.6]);
-        add_quad(&mut verts, -0.014, -0.002, 0.014, 0.002, [1.0, 1.0, 1.0, 0.9]);
-        add_quad(&mut verts, -0.002, -0.024, 0.002, 0.024, [1.0, 1.0, 1.0, 0.9]);
+        // Réticule central
+        add_quad(&mut verts, -0.012, -0.002, 0.012, 0.002, [1.0, 1.0, 1.0, 0.95]);
+        add_quad(&mut verts, -0.002, -0.020, 0.002, 0.020, [1.0, 1.0, 1.0, 0.95]);
 
+        // Bandeau HUD supérieur
         let mode_hud = if play_mode == PlayMode::Flying { "FLY" } else { "REAL" };
-        draw_text(&mut verts, mode_hud, -0.95, 0.90, 0.006, 0.011, [1.0, 1.0, 1.0, 0.85]);
-        draw_text(&mut verts, world_type.name(), -0.95, 0.84, 0.006, 0.011, [0.75, 0.85, 1.0, 0.85]);
-    } else {
-        add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.0, 0.0, 0.0, 0.65]);
+        let hud_title = format!("MODE: {}  |  WORLD: {}  |  OCTREE SIZE: {}", mode_hud, world_type.name(), size_tag);
+        draw_text(&mut verts, &hud_title, -0.96, 0.92, font_pw, font_ph, [1.0, 1.0, 1.0, 0.95]);
 
-        let px0 = -0.48; let px1 = 0.48;
-        let py0 = -0.68; let py1 = 0.62;
-        add_quad(&mut verts, px0 - 0.008, py0 - 0.008, px1 + 0.008, py1 + 0.008, [0.4, 0.4, 0.45, 1.0]);
-        add_quad(&mut verts, px0, py0, px1, py1, [0.12, 0.12, 0.15, 0.95]);
-
-        let swatch_w = 0.11;
-        let swatch_gap = 0.025;
-        let swatches_total = num_slots as f32 * swatch_w + (num_slots - 1) as f32 * swatch_gap;
-        let s_start_x = -swatches_total / 2.0;
-        let sy0 = 0.46;
-        let sy1 = 0.56;
-
-        for (i, &rgb) in hotbar_colors.iter().enumerate() {
-            let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
-            let sx1 = sx0 + swatch_w;
-
-            if selected_slot == i {
-                add_quad(&mut verts, sx0 - 0.012, sy0 - 0.012, sx1 + 0.012, sy1 + 0.012, [1.0, 1.0, 0.2, 1.0]);
-            } else {
-                add_quad(&mut verts, sx0 - 0.006, sy0 - 0.006, sx1 + 0.006, sy1 + 0.006, [0.25, 0.25, 0.3, 1.0]);
-            }
-            add_quad(&mut verts, sx0, sy0, sx1, sy1, [rgb[0], rgb[1], rgb[2], 1.0]);
+        if let Some(tpos) = target_pos {
+            let target_str = format!("AIM: [{}, {}, {}]", tpos[0], tpos[1], tpos[2]);
+            draw_text(&mut verts, &target_str, -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.3, 0.9, 0.9, 0.9]);
+        } else {
+            draw_text(&mut verts, "AIM: [GROUND PLANE Y:0]", -0.96, 0.86, font_pw * 0.9, font_ph * 0.9, [0.6, 0.7, 0.8, 0.8]);
         }
 
+        draw_text(&mut verts, "[E] PALETTE / TOOLS  [Q/R] SIZE  [LMB] PLACE  [RMB] REMOVE", -0.96, 0.80, font_pw * 0.8, font_ph * 0.8, [0.9, 0.85, 0.4, 0.85]);
+    } else {
+        // --- FENETRE MODALE COMPLETE (TOUCHE E) ---
+        add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.78]);
+
+        let px0 = -0.56; let px1 = 0.56;
+        let py0 = -0.68; let py1 = 0.68;
+        add_quad(&mut verts, px0 - 0.006, py0 - 0.006, px1 + 0.006, py1 + 0.006, [0.25, 0.30, 0.40, 1.0]);
+        add_quad(&mut verts, px0, py0, px1, py1, [0.10, 0.12, 0.16, 0.98]);
+
+        draw_text_centered(&mut verts, "VOXEL STUDIO - COLOR & OCTREE", 0.0, 0.61, font_pw * 1.1, font_ph * 1.1, [1.0, 0.9, 0.2, 1.0]);
+
+        // Rangée 1 : 10 Slots
+        let sw_w = 0.082;
+        let sw_gap = 0.015;
+        let sw_tot = 10.0 * sw_w + 9.0 * sw_gap;
+        let s_start_x = -sw_tot / 2.0;
+        let sy0 = 0.46;
+        let sy1 = 0.55;
+
+        for (i, &rgb) in hotbar_colors.iter().enumerate() {
+            let sx0 = s_start_x + i as f32 * (sw_w + sw_gap);
+            let sx1 = sx0 + sw_w;
+
+            if selected_slot == i {
+                add_quad(&mut verts, sx0 - 0.008, sy0 - 0.008, sx1 + 0.008, sy1 + 0.008, [1.0, 0.9, 0.1, 1.0]);
+            } else {
+                add_quad(&mut verts, sx0 - 0.004, sy0 - 0.004, sx1 + 0.004, sy1 + 0.004, [0.22, 0.24, 0.30, 1.0]);
+            }
+            add_quad(&mut verts, sx0, sy0, sx1, sy1, [rgb[0], rgb[1], rgb[2], 1.0]);
+
+            let num_str = match i { 9 => "0", _ => &format!("{}", i + 1) };
+            draw_text_centered(&mut verts, num_str, (sx0 + sx1) / 2.0, sy1 + 0.022, font_pw * 0.8, font_ph * 0.8, [0.8, 0.8, 0.8, 0.9]);
+        }
+
+        // Rangée 2 : Ajusteur RVB & Échantillons rapides
         let [cur_r, cur_g, cur_b] = hotbar_colors[selected_slot];
+        add_quad(&mut verts, 0.24, 0.20, 0.46, 0.40, [0.25, 0.28, 0.35, 1.0]);
+        add_quad(&mut verts, 0.248, 0.208, 0.452, 0.392, [cur_r, cur_g, cur_b, 1.0]);
+        draw_text_centered(&mut verts, "ACTIVE COLOR", 0.35, 0.42, font_pw * 0.8, font_ph * 0.8, [0.85, 0.85, 0.85, 0.9]);
 
-        add_quad(&mut verts, 0.215, 0.195, 0.385, 0.395, [0.4, 0.4, 0.45, 1.0]);
-        add_quad(&mut verts, 0.22, 0.20, 0.38, 0.39, [cur_r, cur_g, cur_b, 1.0]);
-
-        let sl_x0 = -0.30;
-        let sl_x1 = 0.15;
+        let sl_x0 = -0.32;
+        let sl_x1 = 0.18;
         let channels = [
-            ("R", cur_r, 0.34, 0.38, [0.9, 0.25, 0.25, 1.0]),
-            ("G", cur_g, 0.27, 0.31, [0.25, 0.85, 0.35, 1.0]),
-            ("B", cur_b, 0.20, 0.24, [0.25, 0.45, 0.95, 1.0]),
+            ("R", cur_r, 0.35, 0.39, [0.90, 0.25, 0.25, 1.0]),
+            ("G", cur_g, 0.28, 0.32, [0.25, 0.85, 0.30, 1.0]),
+            ("B", cur_b, 0.21, 0.25, [0.25, 0.50, 0.95, 1.0]),
         ];
 
         for (lbl, val, y0, y1, bar_col) in channels {
-            draw_text_centered(&mut verts, lbl, -0.34, (y0 + y1) / 2.0, font_pw, font_ph, bar_col);
-            add_quad(&mut verts, sl_x0, y0, sl_x1, y1, [0.18, 0.18, 0.22, 1.0]);
+            draw_text_centered(&mut verts, lbl, -0.37, (y0 + y1) / 2.0, font_pw, font_ph, bar_col);
+            add_quad(&mut verts, sl_x0, y0, sl_x1, y1, [0.18, 0.20, 0.25, 1.0]);
             let filled_x = sl_x0 + val * (sl_x1 - sl_x0);
             add_quad(&mut verts, sl_x0, y0, filled_x, y1, bar_col);
-            add_quad(&mut verts, filled_x - 0.012, y0 - 0.008, filled_x + 0.012, y1 + 0.008, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, filled_x - 0.010, y0 - 0.006, filled_x + 0.010, y1 + 0.006, [1.0, 1.0, 1.0, 1.0]);
         }
 
-        let mode_text = if play_mode == PlayMode::Flying { "MODE: FLYING" } else { "MODE: REAL" };
-        add_quad(&mut verts, -0.305, 0.045, 0.305, 0.145, [0.35, 0.5, 0.75, 1.0]);
-        add_quad(&mut verts, -0.30, 0.05, 0.30, 0.14, [0.2, 0.32, 0.55, 1.0]);
-        draw_text_centered(&mut verts, mode_text, 0.0, 0.095, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        // Nuancier rapide (1-clic pour changer la couleur active)
+        let pw_w = 0.076;
+        let pw_gap = 0.012;
+        let pw_tot = 10.0 * pw_w + 9.0 * pw_gap;
+        let pw_start_x = -pw_tot / 2.0;
+        let pwy0 = 0.08;
+        let pwy1 = 0.14;
 
-        add_quad(&mut verts, -0.305, -0.075, 0.305, 0.025, [0.5, 0.4, 0.7, 1.0]);
-        add_quad(&mut verts, -0.30, -0.07, 0.30, 0.02, [0.35, 0.25, 0.5, 1.0]);
-        draw_text_centered(&mut verts, world_type.name(), 0.0, -0.025, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        draw_text_centered(&mut verts, "QUICK PALETTE CHIPS", 0.0, 0.165, font_pw * 0.8, font_ph * 0.8, [0.75, 0.75, 0.8, 0.9]);
+        for (i, &rgb) in PRESET_SWATCHES.iter().enumerate() {
+            let px0 = pw_start_x + i as f32 * (pw_w + pw_gap);
+            let px1 = px0 + pw_w;
+            add_quad(&mut verts, px0 - 0.003, pwy0 - 0.003, px1 + 0.003, pwy1 + 0.003, [0.3, 0.3, 0.35, 1.0]);
+            add_quad(&mut verts, px0, pwy0, px1, pwy1, [rgb[0], rgb[1], rgb[2], 1.0]);
+        }
 
-        add_quad(&mut verts, -0.305, -0.195, 0.305, -0.095, [0.35, 0.6, 0.4, 1.0]);
-        add_quad(&mut verts, -0.30, -0.19, 0.30, -0.10, [0.2, 0.55, 0.3, 1.0]);
-        draw_text_centered(&mut verts, "RESUME", 0.0, -0.145, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        // Rangée 3 : Sélecteur de sous/super cubes octree
+        let sizes = [(1, "1X1 SUB"), (2, "2X2 SUB"), (4, "4X4 STD"), (8, "8X8 SUPER"), (16, "16X16 MEGA")];
+        let btn_w = 0.17;
+        let btn_gap = 0.02;
+        let btot = 5.0 * btn_w + 4.0 * btn_gap;
+        let bstart = -btot / 2.0;
+        let by0 = -0.07;
+        let by1 = 0.01;
 
-        add_quad(&mut verts, -0.305, -0.315, 0.305, -0.215, [0.6, 0.3, 0.3, 1.0]);
-        add_quad(&mut verts, -0.30, -0.31, 0.30, -0.22, [0.5, 0.2, 0.2, 1.0]);
-        draw_text_centered(&mut verts, "QUIT", 0.0, -0.265, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+        draw_text_centered(&mut verts, "OCTREE VOXEL RESOLUTION", 0.0, 0.035, font_pw * 0.85, font_ph * 0.85, [0.85, 0.85, 0.85, 0.9]);
+        for (i, &(sz, lbl)) in sizes.iter().enumerate() {
+            let bx0 = bstart + i as f32 * (btn_w + btn_gap);
+            let bx1 = bx0 + btn_w;
+            let is_cur = edit_size == sz;
+            let border_col = if is_cur { [1.0, 0.85, 0.2, 1.0] } else { [0.25, 0.30, 0.40, 1.0] };
+            let bg_col = if is_cur { [0.35, 0.30, 0.10, 1.0] } else { [0.15, 0.18, 0.24, 1.0] };
 
-        draw_text_centered(&mut verts, "F2: PRESET   F5: SAVE   F9: LOAD", 0.0, -0.42, font_pw * 0.9, font_ph * 0.9, [0.8, 0.8, 0.85, 0.9]);
+            add_quad(&mut verts, bx0 - 0.004, by0 - 0.004, bx1 + 0.004, by1 + 0.004, border_col);
+            add_quad(&mut verts, bx0, by0, bx1, by1, bg_col);
+            draw_text_centered(&mut verts, lbl, (bx0 + bx1) / 2.0, (by0 + by1) / 2.0, font_pw * 0.85, font_ph * 0.85, [1.0, 1.0, 1.0, 1.0]);
+        }
+
+        // Rangée 4 : Boutons d'actions système
+        let mode_text = if play_mode == PlayMode::Flying { "MODE: FLY" } else { "MODE: REAL" };
+        add_quad(&mut verts, -0.45, -0.22, -0.16, -0.13, [0.20, 0.35, 0.55, 1.0]);
+        draw_text_centered(&mut verts, mode_text, -0.305, -0.175, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        let world_label = format!("PRESET: {}", world_type.name());
+        add_quad(&mut verts, -0.14, -0.22, 0.15, -0.13, [0.35, 0.25, 0.50, 1.0]);
+        draw_text_centered(&mut verts, &world_label, 0.005, -0.175, font_pw * 0.8, font_ph * 0.8, [1.0, 1.0, 1.0, 1.0]);
+
+        add_quad(&mut verts, 0.17, -0.22, 0.46, -0.13, [0.60, 0.30, 0.20, 1.0]);
+        draw_text_centered(&mut verts, "CLEAR ALL", 0.315, -0.175, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        // Rangée 5 : Reprendre / Quitter
+        add_quad(&mut verts, -0.32, -0.36, -0.02, -0.27, [0.20, 0.55, 0.30, 1.0]);
+        draw_text_centered(&mut verts, "RESUME (E)", -0.17, -0.315, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        add_quad(&mut verts, 0.02, -0.36, 0.32, -0.27, [0.55, 0.20, 0.20, 1.0]);
+        draw_text_centered(&mut verts, "QUIT", 0.17, -0.315, font_pw, font_ph, [1.0, 1.0, 1.0, 1.0]);
+
+        draw_text_centered(&mut verts, "SHORTCUTS: [E] MENU | [Q/R] SIZE | [1-0] SLOTS | [F5] SAVE | [F9] LOAD", 0.0, -0.47, font_pw * 0.8, font_ph * 0.8, [0.75, 0.80, 0.90, 0.85]);
     }
 
     verts
@@ -721,11 +881,13 @@ struct State {
     play_mode: PlayMode,
     velocity: Vec3,
     selected_slot: usize,
-    hotbar_colors: [[f32; 3]; 5],
+    hotbar_colors: [[f32; 3]; 10],
     palette: Arc<RwLock<Palette>>,
     menu_open: bool,
     cursor_pos: [f32; 2],
     active_slider: Option<usize>,
+    edit_size: u32,
+    last_target: Option<[i32; 3]>,
 }
 
 impl State {
@@ -746,7 +908,7 @@ impl State {
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
 
-        let camera = Camera { position: Vec3::new(16.0, 45.0, 48.0), yaw: -std::f32::consts::FRAC_PI_2, pitch: -0.4 };
+        let camera = Camera { position: Vec3::new(16.0, 12.0, 26.0), yaw: -std::f32::consts::FRAC_PI_2, pitch: -0.3 };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytemuck::cast_slice(&[CameraUniform { view_proj: camera.view_proj(1.0).to_cols_array_2d() }]), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -782,38 +944,38 @@ impl State {
         });
 
         let hotbar_colors = [
-            [0.50, 0.50, 0.50],
-            [0.20, 0.70, 0.30],
-            [0.80, 0.20, 0.20],
-            [0.20, 0.45, 0.85],
-            [0.95, 0.75, 0.20],
+            [0.55, 0.55, 0.58], // 1
+            [0.22, 0.75, 0.32], // 2
+            [0.85, 0.20, 0.20], // 3
+            [0.20, 0.48, 0.90], // 4
+            [0.95, 0.78, 0.18], // 5
+            [0.15, 0.85, 0.85], // 6
+            [0.82, 0.25, 0.85], // 7
+            [0.95, 0.50, 0.15], // 8
+            [0.95, 0.95, 0.95], // 9
+            [0.20, 0.22, 0.25], // 0
         ];
 
         let palette = Arc::new(RwLock::new(hotbar_colors.to_vec()));
-        let mut chunk_manager = ChunkManager::new(Arc::clone(&palette));
+        let chunk_manager = ChunkManager::new(Arc::clone(&palette));
 
-        let initial_ui = build_ui_vertices(0, false, &hotbar_colors, PlayMode::Flying, chunk_manager.world_type);
+        let initial_ui = build_ui_vertices(0, false, &hotbar_colors, PlayMode::Flying, chunk_manager.world_type, 4, None);
         let ui_vertices_count = initial_ui.len() as u32;
         let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("UI Buffer"),
-            size: (16384 * std::mem::size_of::<UIVertex>()) as wgpu::BufferAddress,
+            size: (32768 * std::mem::size_of::<UIVertex>()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         queue.write_buffer(&ui_vertex_buffer, 0, bytemuck::cast_slice(&initial_ui));
-
-        let octree = generate_octree((0, 0, 0), chunk_manager.world_type, chunk_manager.seed, None);
-        let initial_payload = generate_mesh(&octree, (0, 0, 0), &palette.read().unwrap());
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&initial_payload.vertices), usage: wgpu::BufferUsages::VERTEX });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&initial_payload.indices), usage: wgpu::BufferUsages::INDEX });
-        chunk_manager.loaded_chunks.insert((0, 0, 0), RenderChunk { octree, vertex_buffer, index_buffer, num_indices: initial_payload.indices.len() as u32 });
 
         Self {
             window, surface, device, queue, config, size, render_pipeline, ui_pipeline, ui_vertex_buffer, ui_vertices_count,
             camera_buffer, camera_bind_group, depth_texture_view, camera,
             input: InputState::default(), chunk_manager,
             play_mode: PlayMode::Flying, velocity: Vec3::ZERO, selected_slot: 0, hotbar_colors,
-            palette, menu_open: false, cursor_pos: [0.0, 0.0], active_slider: None,
+            palette, menu_open: false, cursor_pos: [0.0, 0.0], active_slider: None, edit_size: 4,
+            last_target: None,
         }
     }
 
@@ -838,7 +1000,7 @@ impl State {
 
         let json = serde_json::to_string_pretty(&data)?;
         std::fs::write(filename, json)?;
-        println!("Game saved to {}", filename);
+        println!("Saved: {}", filename);
         Ok(())
     }
 
@@ -865,18 +1027,32 @@ impl State {
         self.chunk_manager.loaded_chunks.clear();
         self.chunk_manager.loading_chunks.clear();
         self.update_ui();
-        println!("Game loaded from {}", filename);
+        println!("Loaded: {}", filename);
         Ok(())
     }
 
-    pub fn cycle_world_generator(&mut self) {
-        self.chunk_manager.world_type = self.chunk_manager.world_type.next();
-        self.velocity = Vec3::ZERO;
+    pub fn clear_all_blocks(&mut self) {
         self.chunk_manager.modified_blocks.clear();
         self.chunk_manager.loaded_chunks.clear();
         self.chunk_manager.loading_chunks.clear();
         self.update_ui();
-        println!("Switched to preset: {:?}", self.chunk_manager.world_type);
+    }
+
+    pub fn cycle_world_generator(&mut self) {
+        self.chunk_manager.world_type = self.chunk_manager.world_type.next();
+        self.clear_all_blocks();
+    }
+
+    pub fn cycle_cube_size(&mut self, forward: bool) {
+        let sizes = [1, 2, 4, 8, 16];
+        let cur_idx = sizes.iter().position(|&s| s == self.edit_size).unwrap_or(2);
+        let next_idx = if forward {
+            (cur_idx + 1).min(sizes.len() - 1)
+        } else {
+            cur_idx.saturating_sub(1)
+        };
+        self.edit_size = sizes[next_idx];
+        self.update_ui();
     }
 
     fn toggle_menu(&mut self) {
@@ -920,6 +1096,8 @@ impl State {
             &self.hotbar_colors,
             self.play_mode,
             self.chunk_manager.world_type,
+            self.edit_size,
+            self.last_target,
         );
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
@@ -942,10 +1120,14 @@ impl State {
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size; self.config.width = new_size.width; self.config.height = new_size.height;
+            self.size = new_size; 
+            self.config.width = new_size.width; 
+            self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.depth_texture_view = self.device.create_texture(&wgpu::TextureDescriptor {
-                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: DEPTH_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, label: None, view_formats: &[],
+                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 }, 
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, 
+                format: DEPTH_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, label: None, view_formats: &[],
             }).create_view(&wgpu::TextureViewDescriptor::default());
         }
     }
@@ -963,7 +1145,7 @@ impl State {
 
         match self.play_mode {
             PlayMode::Flying => {
-                let speed = 24.0;
+                let speed = 26.0;
                 if self.input.up { movement.y += 1.0; } if self.input.down { movement.y -= 1.0; }
                 if movement.length_squared() > 0.0 { movement = movement.normalize(); }
                 self.camera.position += movement * speed * dt;
@@ -971,14 +1153,12 @@ impl State {
             PlayMode::Real => {
                 let surface_y = self.chunk_manager.get_surface_y(self.camera.position.x, self.camera.position.z);
 
-                // Void recovery
                 let void_threshold = surface_y.map(|sy| sy - 15.0).unwrap_or(-10.0);
                 if self.camera.position.y < void_threshold {
-                    self.camera.position.y = surface_y.unwrap_or(36.0) + 1.8;
+                    self.camera.position.y = surface_y.unwrap_or(12.0) + 1.8;
                     self.velocity = Vec3::ZERO;
                 }
 
-                // Anti-suffocation / Unstuck
                 if self.player_collides_at(self.camera.position) {
                     let mut freed = false;
                     for _ in 0..80 {
@@ -1010,7 +1190,6 @@ impl State {
                 }
 
                 self.velocity.y -= 38.0 * dt;
-
                 let on_ground = self.player_collides_at(self.camera.position - Vec3::new(0.0, 0.08, 0.0));
                 if self.input.up && on_ground { 
                     self.velocity.y = 11.5; 
@@ -1031,33 +1210,80 @@ impl State {
             }
         }
 
-        if self.input.action_add || self.input.action_remove || self.input.action_pick {
-            let dir = self.camera.forward();
-            let mut current_pos = self.camera.position;
-            let step = 0.05; 
-            for _ in 0..200 { 
-                current_pos += dir * step;
-                let mat = self.chunk_manager.get_material(current_pos);
-                if mat != 0 {
-                    if self.input.action_pick {
-                        let pal = self.palette.read().unwrap();
-                        if let Some(&color) = pal.get((mat - 1) as usize) {
-                            self.hotbar_colors[self.selected_slot] = color;
-                            drop(pal);
-                            self.update_ui();
-                        }
-                    } else if self.input.action_remove { 
-                        self.chunk_manager.modify_block(current_pos, 0, &self.device); 
-                    } else if self.input.action_add { 
-                        let place_pos = current_pos - dir * step;
-                        if self.play_mode == PlayMode::Flying || !self.player_collides_at(self.camera.position) {
-                            let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
-                            self.chunk_manager.modify_block(place_pos, mat_id, &self.device); 
-                        }
-                    }
-                    break;
-                }
+        // --- RAYCAST & PLACEMENT LIBRE ---
+        let dir = self.camera.forward();
+        let mut current_pos = self.camera.position;
+        let step = 0.08;
+        let mut hit = false;
+        let mut hit_pos = Vec3::ZERO;
+        let mut prev_pos = current_pos;
+
+        for _ in 0..220 { 
+            current_pos += dir * step;
+            let mat = self.chunk_manager.get_material(current_pos);
+            if mat != 0 {
+                hit = true;
+                hit_pos = current_pos;
+                break;
             }
+            prev_pos = current_pos;
+        }
+
+        let s = self.edit_size as i32;
+        if hit {
+            self.last_target = Some([
+                (hit_pos.x.floor() as i32).div_euclid(s) * s,
+                (hit_pos.y.floor() as i32).div_euclid(s) * s,
+                (hit_pos.z.floor() as i32).div_euclid(s) * s,
+            ]);
+        } else if dir.y.abs() > 0.02 {
+            let t = -self.camera.position.y / dir.y;
+            if t > 0.5 && t < 100.0 {
+                let g = self.camera.position + dir * t;
+                self.last_target = Some([
+                    (g.x.floor() as i32).div_euclid(s) * s,
+                    0,
+                    (g.z.floor() as i32).div_euclid(s) * s,
+                ]);
+            } else {
+                self.last_target = None;
+            }
+        } else {
+            self.last_target = None;
+        }
+
+        if self.input.action_add || self.input.action_remove || self.input.action_pick {
+            if hit {
+                if self.input.action_pick {
+                    let mat = self.chunk_manager.get_material(hit_pos);
+                    let pal = self.palette.read().unwrap();
+                    if let Some(&color) = pal.get((mat - 1) as usize) {
+                        self.hotbar_colors[self.selected_slot] = color;
+                        drop(pal);
+                        self.update_ui();
+                    }
+                } else if self.input.action_remove { 
+                    self.chunk_manager.modify_cube(hit_pos, 0, self.edit_size, &self.device); 
+                } else if self.input.action_add { 
+                    let place_pos = prev_pos;
+                    if self.play_mode == PlayMode::Flying || !self.player_collides_at(self.camera.position) {
+                        let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
+                        self.chunk_manager.modify_cube(place_pos, mat_id, self.edit_size, &self.device); 
+                    }
+                }
+            } else if self.input.action_add {
+                // Monde vide : placement directement sur le plan de référence y=0 ou devant soi
+                let mut place_pos = self.camera.position + dir * 6.0;
+                if dir.y.abs() > 0.02 {
+                    let t = -self.camera.position.y / dir.y;
+                    if t > 0.5 && t < 100.0 {
+                        place_pos = self.camera.position + dir * t;
+                    }
+                }
+                let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
+                self.chunk_manager.modify_cube(place_pos, mat_id, self.edit_size, &self.device);
+            }
+
             self.input.action_add = false; 
             self.input.action_remove = false;
             self.input.action_pick = false;
@@ -1066,6 +1292,7 @@ impl State {
         let aspect = if self.config.height > 0 { self.config.width as f32 / self.config.height as f32 } else { 1.0 };
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[CameraUniform { view_proj: self.camera.view_proj(aspect).to_cols_array_2d() }]));
         self.chunk_manager.update(self.camera.position, &self.device);
+        self.update_ui();
     }
 
     fn render(&mut self) {
@@ -1082,7 +1309,7 @@ impl State {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.4, g: 0.7, b: 0.95, a: 1.0 }), store: wgpu::StoreOp::Store }, depth_slice: None })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.12, g: 0.14, b: 0.18, a: 1.0 }), store: wgpu::StoreOp::Store }, depth_slice: None })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.depth_texture_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });
@@ -1090,9 +1317,11 @@ impl State {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             for chunk in self.chunk_manager.loaded_chunks.values() {
-                render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..chunk.num_indices, 0, 0..1);
+                if chunk.num_indices > 0 {
+                    render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..chunk.num_indices, 0, 0..1);
+                }
             }
         }
 
@@ -1119,7 +1348,7 @@ impl ApplicationHandler for App {
         if self.state.is_none() {
             #[allow(unused_mut)]
             let mut window_attributes = Window::default_attributes()
-                .with_title("Voxel Engine")
+                .with_title("Voxel Engine - Octree Studio")
                 .with_inner_size(LogicalSize::new(1280.0, 720.0))
                 .with_visible(true);
             #[cfg(target_os = "linux")]
@@ -1151,8 +1380,8 @@ impl ApplicationHandler for App {
 
                     if state.menu_open {
                         if let Some(channel) = state.active_slider {
-                            let sl_x0 = -0.30;
-                            let sl_x1 = 0.15;
+                            let sl_x0 = -0.32;
+                            let sl_x1 = 0.18;
                             let val = ((ndc_x - sl_x0) / (sl_x1 - sl_x0)).clamp(0.0, 1.0);
                             state.hotbar_colors[state.selected_slot][channel] = val;
                             state.update_ui();
@@ -1165,14 +1394,18 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::PixelDelta(pos) => if pos.y > 0.0 { -1 } else if pos.y < 0.0 { 1 } else { 0 },
                     };
                     if step != 0 {
-                        state.selected_slot = (state.selected_slot as i32 + step).rem_euclid(5) as usize;
+                        state.selected_slot = (state.selected_slot as i32 + step).rem_euclid(10) as usize;
                         state.update_ui();
                     }
                 }
                 WindowEvent::KeyboardInput { event: key_event, .. } => {
                     let is_pressed = key_event.state == ElementState::Pressed;
                     
-                    if key_event.physical_key == PhysicalKey::Code(KeyCode::Escape) && is_pressed {
+                    // Touche E et Échap ouvrent et ferment le menu
+                    if (key_event.physical_key == PhysicalKey::Code(KeyCode::KeyE)
+                        || key_event.physical_key == PhysicalKey::Code(KeyCode::Escape))
+                        && is_pressed
+                    {
                         state.toggle_menu();
                         return;
                     }
@@ -1183,11 +1416,18 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::F5) => { let _ = state.save_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::F9) => { let _ = state.load_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::KeyM) => state.toggle_play_mode(),
+                            PhysicalKey::Code(KeyCode::KeyQ) | PhysicalKey::Code(KeyCode::KeyZ) => state.cycle_cube_size(false),
+                            PhysicalKey::Code(KeyCode::KeyR) | PhysicalKey::Code(KeyCode::KeyX) => state.cycle_cube_size(true),
                             PhysicalKey::Code(KeyCode::Digit1) => { state.selected_slot = 0; state.update_ui(); },
                             PhysicalKey::Code(KeyCode::Digit2) => { state.selected_slot = 1; state.update_ui(); },
                             PhysicalKey::Code(KeyCode::Digit3) => { state.selected_slot = 2; state.update_ui(); },
                             PhysicalKey::Code(KeyCode::Digit4) => { state.selected_slot = 3; state.update_ui(); },
                             PhysicalKey::Code(KeyCode::Digit5) => { state.selected_slot = 4; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit6) => { state.selected_slot = 5; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit7) => { state.selected_slot = 6; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit8) => { state.selected_slot = 7; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit9) => { state.selected_slot = 8; state.update_ui(); },
+                            PhysicalKey::Code(KeyCode::Digit0) => { state.selected_slot = 9; state.update_ui(); },
                             PhysicalKey::Code(KeyCode::KeyC) if !state.menu_open => state.input.action_pick = true,
                             _ => {}
                         }
@@ -1211,27 +1451,30 @@ impl ApplicationHandler for App {
                             if element_state == ElementState::Pressed {
                                 let [mx, my] = state.cursor_pos;
 
-                                let swatch_w = 0.11;
-                                let swatch_gap = 0.025;
-                                let s_start_x = -(5.0 * swatch_w + 4.0 * swatch_gap) / 2.0;
-                                for i in 0..5 {
-                                    let sx0 = s_start_x + i as f32 * (swatch_w + swatch_gap);
-                                    let sx1 = sx0 + swatch_w;
-                                    if mx >= sx0 && mx <= sx1 && my >= 0.46 && my <= 0.56 {
+                                // 10 Slots de couleurs
+                                let sw_w = 0.082;
+                                let sw_gap = 0.015;
+                                let sw_tot = 10.0 * sw_w + 9.0 * sw_gap;
+                                let s_start_x = -sw_tot / 2.0;
+                                for i in 0..10 {
+                                    let sx0 = s_start_x + i as f32 * (sw_w + sw_gap);
+                                    let sx1 = sx0 + sw_w;
+                                    if mx >= sx0 && mx <= sx1 && my >= 0.46 && my <= 0.55 {
                                         state.selected_slot = i;
                                         state.update_ui();
                                         return;
                                     }
                                 }
 
-                                let sl_x0 = -0.30;
-                                let sl_x1 = 0.15;
+                                // Curseurs RVB
+                                let sl_x0 = -0.32;
+                                let sl_x1 = 0.18;
                                 if mx >= sl_x0 - 0.02 && mx <= sl_x1 + 0.02 {
-                                    let slider_clicked = if my >= 0.32 && my <= 0.40 {
+                                    let slider_clicked = if my >= 0.33 && my <= 0.41 {
                                         Some(0)
-                                    } else if my >= 0.25 && my <= 0.33 {
+                                    } else if my >= 0.26 && my <= 0.34 {
                                         Some(1)
-                                    } else if my >= 0.18 && my <= 0.26 {
+                                    } else if my >= 0.19 && my <= 0.27 {
                                         Some(2)
                                     } else {
                                         None
@@ -1246,26 +1489,63 @@ impl ApplicationHandler for App {
                                     }
                                 }
 
-                                // Mode Button
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.05 && my <= 0.14 {
+                                // Nuancier rapide
+                                let pw_w = 0.076;
+                                let pw_gap = 0.012;
+                                let pw_tot = 10.0 * pw_w + 9.0 * pw_gap;
+                                let pw_start_x = -pw_tot / 2.0;
+                                for (i, &preset_col) in PRESET_SWATCHES.iter().enumerate() {
+                                    let px0 = pw_start_x + i as f32 * (pw_w + pw_gap);
+                                    let px1 = px0 + pw_w;
+                                    if mx >= px0 && mx <= px1 && my >= 0.08 && my <= 0.14 {
+                                        state.hotbar_colors[state.selected_slot] = preset_col;
+                                        state.update_ui();
+                                        return;
+                                    }
+                                }
+
+                                // Sélecteur de résolutions d'octree (Sub & Super Cubes)
+                                let sizes = [1, 2, 4, 8, 16];
+                                let btn_w = 0.17;
+                                let btn_gap = 0.02;
+                                let btot = 5.0 * btn_w + 4.0 * btn_gap;
+                                let bstart = -btot / 2.0;
+                                for (i, &sz) in sizes.iter().enumerate() {
+                                    let bx0 = bstart + i as f32 * (btn_w + btn_gap);
+                                    let bx1 = bx0 + btn_w;
+                                    if mx >= bx0 && mx <= bx1 && my >= -0.07 && my <= 0.01 {
+                                        state.edit_size = sz;
+                                        state.update_ui();
+                                        return;
+                                    }
+                                }
+
+                                // Bouton Mode
+                                if mx >= -0.45 && mx <= -0.16 && my >= -0.22 && my <= -0.13 {
                                     state.toggle_play_mode();
                                     return;
                                 }
 
-                                // World Preset Button
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.07 && my <= 0.02 {
+                                // Bouton Preset Monde
+                                if mx >= -0.14 && mx <= 0.15 && my >= -0.22 && my <= -0.13 {
                                     state.cycle_world_generator();
                                     return;
                                 }
 
-                                // Resume Button
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.19 && my <= -0.10 {
+                                // Bouton Nettoyer la scène
+                                if mx >= 0.17 && mx <= 0.46 && my >= -0.22 && my <= -0.13 {
+                                    state.clear_all_blocks();
+                                    return;
+                                }
+
+                                // Bouton Reprendre
+                                if mx >= -0.32 && mx <= -0.02 && my >= -0.36 && my <= -0.27 {
                                     state.toggle_menu();
                                     return;
                                 }
 
-                                // Quit Button
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.31 && my <= -0.22 {
+                                // Bouton Quitter
+                                if mx >= 0.02 && mx <= 0.32 && my >= -0.36 && my <= -0.27 {
                                     event_loop.exit();
                                     return;
                                 }
@@ -1284,8 +1564,12 @@ impl ApplicationHandler for App {
                 }
                 WindowEvent::Resized(size) => { state.resize(size); state.window.request_redraw(); }
                 WindowEvent::RedrawRequested => {
-                    let now = Instant::now(); let dt = now.duration_since(self.last_frame).as_secs_f32(); self.last_frame = now;
-                    state.update(dt); state.render(); state.window.request_redraw();
+                    let now = Instant::now(); 
+                    let dt = now.duration_since(self.last_frame).as_secs_f32(); 
+                    self.last_frame = now;
+                    state.update(dt); 
+                    state.render(); 
+                    state.window.request_redraw();
                 }
                 _ => {}
             }
@@ -1303,7 +1587,11 @@ impl ApplicationHandler for App {
             }
         }
     }
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) { if let Some(state) = self.state.as_mut() { state.window.request_redraw(); } }
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) { 
+        if let Some(state) = self.state.as_mut() { 
+            state.window.request_redraw(); 
+        } 
+    }
 }
 
 pub fn main() {
