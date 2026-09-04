@@ -939,6 +939,7 @@ impl ApplicationHandler for App {
                             if element_state == ElementState::Pressed {
                                 let [mx, my] = state.cursor_pos;
 
+                                // 1. Sélection d'un slot
                                 let swatch_w = 0.11;
                                 let swatch_gap = 0.025;
                                 let s_start_x = -(5.0 * swatch_w + 4.0 * swatch_gap) / 2.0;
@@ -952,6 +953,7 @@ impl ApplicationHandler for App {
                                     }
                                 }
 
+                                // 2. Clic sur les curseurs RVB
                                 let sl_x0 = -0.30;
                                 let sl_x1 = 0.15;
                                 if mx >= sl_x0 - 0.02 && mx <= sl_x1 + 0.02 {
@@ -974,16 +976,19 @@ impl ApplicationHandler for App {
                                     }
                                 }
 
+                                // 3. Bouton Mode
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.01 && my <= 0.08 {
                                     state.toggle_play_mode();
                                     return;
                                 }
 
+                                // 4. Bouton RESUME
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.15 && my <= -0.06 {
                                     state.toggle_menu();
                                     return;
                                 }
 
+                                // 5. Bouton QUIT
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.29 && my <= -0.20 {
                                     event_loop.exit();
                                     return;
@@ -994,8 +999,8 @@ impl ApplicationHandler for App {
                         }
                     } else if element_state == ElementState::Pressed {
                         match button {
-                            MouseButton::Left => state.input.action_remove = true,
-                            MouseButton::Right => state.input.action_add = true,
+                            MouseButton::Left => state.input.action_add = true,
+                            MouseButton::Right => state.input.action_remove = true,
                             MouseButton::Middle => state.input.action_pick = true,
                             _ => {}
                         }
