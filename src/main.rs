@@ -365,7 +365,7 @@ fn sample_triangle(
     }
 }
 
-// --- BACKGROUND PARALLEL VOXELIZATION & MESHING ---
+// --- BACKGROUND PARALLEL VOXELIZATION & MESHING WITH HIERARCHICAL NODES ---
 
 fn run_background_voxelization(
     path: PathBuf,
@@ -392,46 +392,96 @@ fn run_background_voxelization(
     let mut max_bound = Vec3::splat(f32::MIN);
     let mut all_triangles = Vec::new();
 
-    for mesh in document.meshes() {
-        for primitive in mesh.primitives() {
-            let reader = primitive.reader(|b| Some(&buffers[b.index()]));
-            let positions: Vec<Vec3> = match reader.read_positions() {
-                Some(iter) => iter.map(Vec3::from).collect(),
-                None => continue,
-            };
-
-            for p in &positions {
-                min_bound = min_bound.min(*p);
-                max_bound = max_bound.max(*p);
-            }
-
-            let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
-                .map(|iter| iter.into_f32().collect())
-                .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
-
-            let colors: Vec<[f32; 3]> = reader.read_colors(0)
-                .map(|iter| iter.into_rgb_f32().collect())
-                .unwrap_or_else(|| vec![[1.0, 1.0, 1.0]; positions.len()]);
-
-            let pbr = primitive.material().pbr_metallic_roughness();
-            let base_factor = pbr.base_color_factor();
-            let tex_index = pbr.base_color_texture().map(|t| t.texture().source().index());
-
-            let indices: Vec<u32> = reader.read_indices()
-                .map(|iter| iter.into_u32().collect())
-                .unwrap_or_else(|| (0..positions.len() as u32).collect());
-
-            for chunk in indices.chunks_exact(3) {
-                let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
-                all_triangles.push((
-                    [positions[i0], positions[i1], positions[i2]],
-                    [uvs[i0], uvs[i1], uvs[i2]],
-                    [colors[i0], colors[i1], colors[i2]],
-                    [base_factor[0], base_factor[1], base_factor[2]],
-                    tex_index,
-                ));
+    // 1. Détermination des nœuds racines de la scène
+    let mut root_nodes: Vec<gltf::Node> = Vec::new();
+    if let Some(scene) = document.default_scene() {
+        root_nodes.extend(scene.nodes());
+    } else if let Some(scene) = document.scenes().next() {
+        root_nodes.extend(scene.nodes());
+    } else {
+        let mut child_indices = HashSet::new();
+        for node in document.nodes() {
+            for child in node.children() {
+                child_indices.insert(child.index());
             }
         }
+        for node in document.nodes() {
+            if !child_indices.contains(&node.index()) {
+                root_nodes.push(node);
+            }
+        }
+    }
+
+    // 2. Parcours hiérarchique avec accumulation de matrices monde
+    let mut stack: Vec<(gltf::Node, Mat4)> = root_nodes
+        .into_iter()
+        .map(|node| (node, Mat4::IDENTITY))
+        .collect();
+
+    while let Some((node, parent_mat)) = stack.pop() {
+        let local_mat = Mat4::from_cols_array_2d(&node.transform().matrix());
+        let world_mat = parent_mat * local_mat;
+
+        if let Some(mesh) = node.mesh() {
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|b| Some(&buffers[b.index()]));
+                let positions: Vec<Vec3> = match reader.read_positions() {
+                    Some(iter) => iter.map(|p| world_mat.transform_point3(Vec3::from(p))).collect(),
+                    None => continue,
+                };
+
+                for p in &positions {
+                    min_bound = min_bound.min(*p);
+                    max_bound = max_bound.max(*p);
+                }
+
+                let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
+                    .map(|iter| iter.into_f32().collect())
+                    .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+
+                let colors: Vec<[f32; 3]> = reader.read_colors(0)
+                    .map(|iter| iter.into_rgb_f32().collect())
+                    .unwrap_or_else(|| vec![[1.0, 1.0, 1.0]; positions.len()]);
+
+                let pbr = primitive.material().pbr_metallic_roughness();
+                let base_factor = pbr.base_color_factor();
+                let tex_index = pbr.base_color_texture().map(|t| t.texture().source().index());
+
+                let indices: Vec<u32> = reader.read_indices()
+                    .map(|iter| iter.into_u32().collect())
+                    .unwrap_or_else(|| (0..positions.len() as u32).collect());
+
+                for chunk in indices.chunks_exact(3) {
+                    let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
+                    if i0 < positions.len() && i1 < positions.len() && i2 < positions.len() {
+                        all_triangles.push((
+                            [positions[i0], positions[i1], positions[i2]],
+                            [
+                                if i0 < uvs.len() { uvs[i0] } else { [0.0, 0.0] },
+                                if i1 < uvs.len() { uvs[i1] } else { [0.0, 0.0] },
+                                if i2 < uvs.len() { uvs[i2] } else { [0.0, 0.0] },
+                            ],
+                            [
+                                if i0 < colors.len() { colors[i0] } else { [1.0, 1.0, 1.0] },
+                                if i1 < colors.len() { colors[i1] } else { [1.0, 1.0, 1.0] },
+                                if i2 < colors.len() { colors[i2] } else { [1.0, 1.0, 1.0] },
+                            ],
+                            [base_factor[0], base_factor[1], base_factor[2]],
+                            tex_index,
+                        ));
+                    }
+                }
+            }
+        }
+
+        for child in node.children() {
+            stack.push((child, world_mat));
+        }
+    }
+
+    if all_triangles.is_empty() {
+        let _ = tx.send(VoxelizeMsg::Done(Err("No valid mesh geometry found in GLB".into())));
+        return;
     }
 
     let extent = max_bound - min_bound;
@@ -2021,6 +2071,15 @@ impl State {
                 let c_min = Vec3::new((pos.0 * 32) as f32, (pos.1 * 32) as f32, (pos.2 * 32) as f32);
                 min_bound = min_bound.min(c_min);
                 max_bound = max_bound.max(c_min + Vec3::splat(32.0));
+            }
+        }
+
+        for edit in &self.chunk_manager.cube_edits {
+            if edit.material != 0 {
+                has_blocks = true;
+                let p = Vec3::from_array(edit.pos);
+                min_bound = min_bound.min(p);
+                max_bound = max_bound.max(p + Vec3::splat(edit.size));
             }
         }
 
