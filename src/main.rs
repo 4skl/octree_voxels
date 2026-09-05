@@ -16,14 +16,16 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
-use glam::{Vec3, Mat4, IVec3};
-use block_mesh::{visible_block_faces, UnitQuadBuffer, Voxel, VoxelVisibility, MergeVoxel, RIGHT_HANDED_Y_UP_CONFIG};
-use ndshape::{ConstShape, ConstShape3u32};
+use glam::{Vec3, Mat4};
 use noise::{NoiseFn, Fbm, Perlin};
 use serde::{Serialize, Deserialize};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-type ChunkShape = ConstShape3u32<34, 34, 34>; 
+const CHUNK_SIZE: f32 = 32.0;
+const MAX_DEPTH: u8 = 8;               // Grid resolution = 256 per chunk axis
+const GRID_RES: u32 = 1 << MAX_DEPTH;  // 256
+const MIN_VOXEL_SIZE: f32 = CHUNK_SIZE / (GRID_RES as f32); // 0.125 (1/8 micro-voxel)
+
 type ChunkPos = (i32, i32, i32);
 pub type Palette = Vec<[f32; 3]>;
 
@@ -70,6 +72,13 @@ impl WorldType {
 
 fn default_ortho_size() -> f32 { 36.0 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CubeEdit {
+    pub pos: [f32; 3],
+    pub size: f32,
+    pub material: u16,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SaveData {
     pub player_pos: [f32; 3],
@@ -84,11 +93,11 @@ pub struct SaveData {
     pub seed: u32,
     pub hotbar_colors: [[f32; 3]; 10],
     pub palette: Vec<[f32; 3]>,
-    pub modified_blocks: Vec<([i32; 3], Vec<([u32; 3], u16)>)>,
-    pub full_chunk_overrides: Vec<([i32; 3], u16)>,
+    #[serde(default)]
+    pub cube_edits: Vec<CubeEdit>,
 }
 
-// --- OCTREE ---
+// --- OCTREE WITH AUTOMATIC SIBLING MERGING ---
 
 #[derive(Clone, Copy, Default)]
 pub struct OctreeNode {
@@ -108,15 +117,27 @@ impl Octree {
         Self { nodes: vec![OctreeNode::default()], root_index: 0 } 
     }
 
-    pub fn insert(&mut self, mut x: u32, mut y: u32, mut z: u32, depth: u8, material: u16) {
+    pub fn insert_cube(&mut self, mut x: u32, mut y: u32, mut z: u32, depth: u8, material: u16, auto_collapse: bool) {
+        if depth == 0 {
+            self.nodes[self.root_index as usize] = OctreeNode {
+                child_mask: if material != 0 { 0xFF } else { 0 },
+                material_id: material,
+                child_pointer: 0,
+            };
+            return;
+        }
+
         let mut current_idx = self.root_index as usize;
-        let mut half_size = 16;
+        let mut half_size = GRID_RES / 2;
 
         for _ in 0..depth {
             let old_mat = self.nodes[current_idx].material_id;
             let child_ptr = self.nodes[current_idx].child_pointer;
 
             if child_ptr == 0 {
+                if old_mat == material {
+                    return;
+                }
                 let new_ptr = self.nodes.len() as u32;
                 self.nodes.resize(self.nodes.len() + 8, OctreeNode::default());
                 if old_mat != 0 {
@@ -142,9 +163,11 @@ impl Octree {
 
         self.nodes[current_idx].material_id = material;
         self.nodes[current_idx].child_pointer = 0;
-        self.nodes[current_idx].child_mask = 0;
+        self.nodes[current_idx].child_mask = if material != 0 { 0xFF } else { 0 };
 
-        self.collapse(self.root_index as usize);
+        if auto_collapse {
+            self.collapse(self.root_index as usize);
+        }
     }
 
     pub fn collapse(&mut self, node_idx: usize) -> bool {
@@ -153,8 +176,8 @@ impl Octree {
             return true;
         }
 
-        let first_mat = self.nodes[child_ptr as usize].material_id;
         let mut all_same = true;
+        let first_mat = self.nodes[child_ptr as usize].material_id;
 
         for i in 0..8 {
             let c_idx = (child_ptr + i) as usize;
@@ -182,70 +205,31 @@ impl Octree {
         false
     }
 
-    pub fn query(&self, mut x: u32, mut y: u32, mut z: u32) -> u16 {
+    pub fn query_node(&self, mut x: u32, mut y: u32, mut z: u32) -> (u16, u32) {
         let mut current_idx = self.root_index as usize;
-        let mut half_size = 16;
-        for _ in 0..5 {
+        let mut size = GRID_RES;
+        for _ in 0..MAX_DEPTH {
             let node = &self.nodes[current_idx];
             if node.child_pointer == 0 {
-                return node.material_id;
+                return (node.material_id, size);
             }
+            let half = size / 2;
             let mut octant = 0;
-            if x >= half_size { octant |= 1; x -= half_size; }
-            if y >= half_size { octant |= 2; y -= half_size; }
-            if z >= half_size { octant |= 4; z -= half_size; }
+            if x >= half { octant |= 1; x -= half; }
+            if y >= half { octant |= 2; y -= half; }
+            if z >= half { octant |= 4; z -= half; }
 
             if (node.child_mask & (1 << octant)) == 0 {
-                return 0;
+                return (0, half);
             }
             current_idx = (node.child_pointer + octant) as usize;
-            half_size >>= 1;
+            size = half;
         }
-        self.nodes[current_idx].material_id
-    }
-
-    pub fn flatten_into(&self, node_idx: usize, x: u32, y: u32, z: u32, size: u32, voxels: &mut [Block]) {
-        let node = &self.nodes[node_idx];
-        if node.child_pointer == 0 {
-            if node.material_id != 0 {
-                for dz in 0..size {
-                    for dy in 0..size {
-                        for dx in 0..size {
-                            let idx = ChunkShape::linearize([x + dx, y + dy, z + dz]);
-                            voxels[idx as usize] = Block(node.material_id);
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        let half_size = size / 2;
-        for i in 0..8 {
-            if (node.child_mask & (1 << i)) != 0 {
-                let cx = x + if (i & 1) != 0 { half_size } else { 0 };
-                let cy = y + if (i & 2) != 0 { half_size } else { 0 };
-                let cz = z + if (i & 4) != 0 { half_size } else { 0 };
-                let child_idx = (node.child_pointer + i) as usize;
-                self.flatten_into(child_idx, cx, cy, cz, half_size, voxels);
-            }
-        }
+        (self.nodes[current_idx].material_id, size)
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub struct Block(pub u16);
-
-impl Voxel for Block {
-    fn get_visibility(&self) -> VoxelVisibility { 
-        if self.0 == 0 { VoxelVisibility::Empty } else { VoxelVisibility::Opaque } 
-    }
-}
-impl MergeVoxel for Block {
-    type MergeValue = u16; 
-    fn merge_value(&self) -> Self::MergeValue { self.0 }
-}
-
-// --- RENDERING & MESHING ---
+// --- DIRECT OCTREE MESHING ---
 
 struct MeshPayload { vertices: Vec<Vertex>, indices: Vec<u32> }
 
@@ -253,17 +237,9 @@ fn generate_octree(
     chunk_pos: ChunkPos,
     world_type: WorldType,
     seed: u32,
-    deltas: Option<&HashMap<[u32; 3], u16>>,
-    full_override: Option<u16>,
+    edits: &[CubeEdit],
 ) -> Octree {
     let mut octree = Octree::new();
-    if let Some(mat) = full_override {
-        if mat != 0 {
-            octree.insert(0, 0, 0, 0, mat);
-        }
-        return octree;
-    }
-
     let fbm = Fbm::<Perlin>::new(seed);
     let world_x_offset = chunk_pos.0 * 32;
     let world_z_offset = chunk_pos.2 * 32;
@@ -275,8 +251,8 @@ fn generate_octree(
                 for x in 0..32 {
                     for z in 0..32 {
                         for y in 0..4 {
-                            let material = if y == 3 { 2 } else { 1 };
-                            octree.insert(x, y, z, 5, material);
+                            let mat = if y == 3 { 2 } else { 1 };
+                            octree.insert_cube(x * 8, y * 8, z * 8, 5, mat, false);
                         }
                     }
                 }
@@ -285,14 +261,12 @@ fn generate_octree(
         WorldType::Hills => {
             for x in 0..32 {
                 for z in 0..32 {
-                    let world_x = (x as i32 + world_x_offset) as f64 * 0.04;
-                    let world_z = (z as i32 + world_z_offset) as f64 * 0.04;
-                    let noise_val = fbm.get([world_x, world_z]);
-                    let height = ((noise_val + 1.0) * 12.0).clamp(0.0, 31.0) as u32;
-
+                    let wx = (x as i32 + world_x_offset) as f64 * 0.04;
+                    let wz = (z as i32 + world_z_offset) as f64 * 0.04;
+                    let height = ((fbm.get([wx, wz]) + 1.0) * 12.0).clamp(0.0, 31.0) as u32;
                     for y in 0..=height {
-                        let material = if y == height { 2 } else { 1 };
-                        octree.insert(x, y, z, 5, material);
+                        let mat = if y == height { 2 } else { 1 };
+                        octree.insert_cube(x * 8, y * 8, z * 8, 5, mat, false);
                     }
                 }
             }
@@ -300,14 +274,12 @@ fn generate_octree(
         WorldType::Mountains => {
             for x in 0..32 {
                 for z in 0..32 {
-                    let world_x = (x as i32 + world_x_offset) as f64 * 0.025;
-                    let world_z = (z as i32 + world_z_offset) as f64 * 0.025;
-                    let n = fbm.get([world_x, world_z]).abs();
-                    let height = (n * 30.0 + 2.0).clamp(0.0, 31.0) as u32;
-
+                    let wx = (x as i32 + world_x_offset) as f64 * 0.025;
+                    let wz = (z as i32 + world_z_offset) as f64 * 0.025;
+                    let height = (fbm.get([wx, wz]).abs() * 30.0 + 2.0).clamp(0.0, 31.0) as u32;
                     for y in 0..=height {
-                        let material = if y >= 25 { 3 } else if y == height { 2 } else { 1 };
-                        octree.insert(x, y, z, 5, material);
+                        let mat = if y >= 25 { 3 } else if y == height { 2 } else { 1 };
+                        octree.insert_cube(x * 8, y * 8, z * 8, 5, mat, false);
                     }
                 }
             }
@@ -322,7 +294,7 @@ fn generate_octree(
                         let wz = (z as i32 + world_z_offset) as f64 * 0.05;
                         let density = fbm.get([wx, wy, wz]) - ((y as f64 + world_y_offset as f64) - 16.0) * 0.04;
                         if density > 0.12 {
-                            octree.insert(x, y, z, 5, 2);
+                            octree.insert_cube(x * 8, y * 8, z * 8, 5, 2, false);
                         }
                     }
                 }
@@ -330,70 +302,177 @@ fn generate_octree(
         }
     }
 
-    if let Some(mods) = deltas {
-        for (&[x, y, z], &material) in mods {
-            octree.insert(x, y, z, 5, material);
+    for edit in edits {
+        let chunk_min_x = (chunk_pos.0 * 32) as f32;
+        let chunk_min_y = (chunk_pos.1 * 32) as f32;
+        let chunk_min_z = (chunk_pos.2 * 32) as f32;
+
+        if edit.pos[0] + edit.size > chunk_min_x && edit.pos[0] < chunk_min_x + 32.0
+            && edit.pos[1] + edit.size > chunk_min_y && edit.pos[1] < chunk_min_y + 32.0
+            && edit.pos[2] + edit.size > chunk_min_z && edit.pos[2] < chunk_min_z + 32.0
+        {
+            if edit.size >= 32.0 {
+                octree.insert_cube(0, 0, 0, 0, edit.material, false);
+            } else {
+                let lx = edit.pos[0] - chunk_min_x;
+                let ly = edit.pos[1] - chunk_min_y;
+                let lz = edit.pos[2] - chunk_min_z;
+
+                let gx = (lx * 8.0).round() as u32;
+                let gy = (ly * 8.0).round() as u32;
+                let gz = (lz * 8.0).round() as u32;
+
+                let grid_size = (edit.size * 8.0).round().max(1.0) as u32;
+                let depth = MAX_DEPTH - grid_size.trailing_zeros().min(MAX_DEPTH as u32) as u8;
+
+                octree.insert_cube(gx, gy, gz, depth, edit.material, false);
+            }
         }
     }
 
+    octree.collapse(octree.root_index as usize);
     octree
 }
 
 const QUAD_UVS: [[f32; 2]; 4] = [
     [0.0, 0.0],
     [1.0, 0.0],
-    [0.0, 1.0],
     [1.0, 1.0],
+    [0.0, 1.0],
 ];
 
+fn emit_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    corners: [[f32; 3]; 4],
+    normal: [f32; 3],
+    color: [f32; 3],
+) {
+    let start = vertices.len() as u32;
+    for (i, &pos) in corners.iter().enumerate() {
+        vertices.push(Vertex {
+            position: pos,
+            normal,
+            color,
+            uv: QUAD_UVS[i],
+        });
+    }
+    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+fn is_face_occluded(
+    octree: &Octree,
+    gx: u32, gy: u32, gz: u32,
+    size: u32,
+    axis: usize,
+    positive: bool,
+) -> bool {
+    let (target_coord, limit) = match axis {
+        0 => (if positive { gx + size } else { gx.wrapping_sub(1) }, GRID_RES),
+        1 => (if positive { gy + size } else { gy.wrapping_sub(1) }, GRID_RES),
+        _ => (if positive { gz + size } else { gz.wrapping_sub(1) }, GRID_RES),
+    };
+
+    if target_coord >= limit { return false; }
+
+    let (cx, cy, cz) = match axis {
+        0 => (target_coord, gy + size / 2, gz + size / 2),
+        1 => (gx + size / 2, target_coord, gz + size / 2),
+        _ => (gx + size / 2, gy + size / 2, target_coord),
+    };
+
+    let (mat, n_size) = octree.query_node(cx, cy, cz);
+    if mat == 0 { return false; }
+    if n_size >= size { return true; }
+
+    let q1 = size / 4;
+    let q3 = (size * 3) / 4;
+    let pts = match axis {
+        0 => [(target_coord, gy + q1, gz + q1), (target_coord, gy + q3, gz + q1), (target_coord, gy + q1, gz + q3), (target_coord, gy + q3, gz + q3)],
+        1 => [(gx + q1, target_coord, gz + q1), (gx + q3, target_coord, gz + q1), (gx + q1, target_coord, gz + q3), (gx + q3, target_coord, gz + q3)],
+        _ => [(gx + q1, gy + q1, target_coord), (gx + q3, gy + q1, target_coord), (gx + q1, gy + q3, target_coord), (gx + q3, gy + q3, target_coord)],
+    };
+
+    pts.iter().all(|&(px, py, pz)| octree.query_node(px, py, pz).0 != 0)
+}
+
+fn mesh_octree_node(
+    octree: &Octree,
+    node_idx: usize,
+    gx: u32, gy: u32, gz: u32,
+    size: u32,
+    chunk_pos: ChunkPos,
+    palette: &[[f32; 3]],
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+) {
+    let node = &octree.nodes[node_idx];
+    if node.child_pointer != 0 {
+        let half = size / 2;
+        for i in 0..8 {
+            if (node.child_mask & (1 << i)) != 0 {
+                let cx = gx + if (i & 1) != 0 { half } else { 0 };
+                let cy = gy + if (i & 2) != 0 { half } else { 0 };
+                let cz = gz + if (i & 4) != 0 { half } else { 0 };
+                mesh_octree_node(octree, (node.child_pointer + i) as usize, cx, cy, cz, half, chunk_pos, palette, vertices, indices);
+            }
+        }
+        return;
+    }
+
+    if node.material_id == 0 {
+        return;
+    }
+
+    let mat_id = node.material_id;
+    let color = if mat_id >= 1 && (mat_id as usize) <= palette.len() {
+        palette[(mat_id - 1) as usize]
+    } else {
+        [0.5, 0.5, 0.5]
+    };
+
+    let ox = (chunk_pos.0 * 32) as f32;
+    let oy = (chunk_pos.1 * 32) as f32;
+    let oz = (chunk_pos.2 * 32) as f32;
+
+    let x0 = ox + (gx as f32 / GRID_RES as f32) * 32.0;
+    let y0 = oy + (gy as f32 / GRID_RES as f32) * 32.0;
+    let z0 = oz + (gz as f32 / GRID_RES as f32) * 32.0;
+    let s = (size as f32 / GRID_RES as f32) * 32.0;
+    let x1 = x0 + s;
+    let y1 = y0 + s;
+    let z1 = z0 + s;
+
+    // +X face
+    if !is_face_occluded(octree, gx, gy, gz, size, 0, true) {
+        emit_quad(vertices, indices, [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]], [1.0, 0.0, 0.0], color);
+    }
+    // -X face
+    if !is_face_occluded(octree, gx, gy, gz, size, 0, false) {
+        emit_quad(vertices, indices, [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]], [-1.0, 0.0, 0.0], color);
+    }
+    // +Y face
+    if !is_face_occluded(octree, gx, gy, gz, size, 1, true) {
+        emit_quad(vertices, indices, [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]], [0.0, 1.0, 0.0], color);
+    }
+    // -Y face
+    if !is_face_occluded(octree, gx, gy, gz, size, 1, false) {
+        emit_quad(vertices, indices, [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]], [0.0, -1.0, 0.0], color);
+    }
+    // +Z face
+    if !is_face_occluded(octree, gx, gy, gz, size, 2, true) {
+        emit_quad(vertices, indices, [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]], [0.0, 0.0, 1.0], color);
+    }
+    // -Z face
+    if !is_face_occluded(octree, gx, gy, gz, size, 2, false) {
+        emit_quad(vertices, indices, [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]], [0.0, 0.0, -1.0], color);
+    }
+}
+
 fn generate_mesh(octree: &Octree, chunk_pos: ChunkPos, palette: &[[f32; 3]]) -> MeshPayload {
-    let mut voxels = vec![Block(0); ChunkShape::SIZE as usize];
-    octree.flatten_into(octree.root_index as usize, 1, 1, 1, 32, &mut voxels);
-
-    let mut buffer = UnitQuadBuffer::new();
-    visible_block_faces(&voxels, &ChunkShape {}, [0, 0, 0], [33, 33, 33], &RIGHT_HANDED_Y_UP_CONFIG.faces, &mut buffer);
-
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    let offset_x = (chunk_pos.0 * 32) as f32;
-    let offset_y = (chunk_pos.1 * 32) as f32;
-    let offset_z = (chunk_pos.2 * 32) as f32;
-
-    for (group, face) in buffer.groups.iter().zip(RIGHT_HANDED_Y_UP_CONFIG.faces.into_iter()) {
-        let n = face.signed_normal();
-        let normal = [n.x as f32, n.y as f32, n.z as f32];
-
-        for quad in group.into_iter() {
-            let start_index = vertices.len() as u32;
-            let pos1 = quad.minimum;
-            let mut pos2 = quad.minimum;
-            if n.x != 0 { pos2[0] += 1; }
-            if n.y != 0 { pos2[1] += 1; }
-            if n.z != 0 { pos2[2] += 1; }
-
-            let id1 = voxels[ChunkShape::linearize(pos1) as usize].0;
-            let id2 = voxels[ChunkShape::linearize(pos2) as usize].0;
-            let mat_id = if id1 != 0 { id1 } else { id2 };
-            
-            let color = if mat_id >= 1 && (mat_id as usize) <= palette.len() {
-                palette[(mat_id - 1) as usize]
-            } else {
-                [0.5, 0.5, 0.5]
-            };
-
-            let generic_quad = block_mesh::UnorientedQuad { minimum: quad.minimum, width: 1, height: 1 };
-
-            for (i, corner) in face.quad_mesh_positions(&generic_quad, 1.0).into_iter().enumerate() {
-                vertices.push(Vertex {
-                    position: [corner[0] - 1.0 + offset_x, corner[1] - 1.0 + offset_y, corner[2] - 1.0 + offset_z],
-                    normal,
-                    color,
-                    uv: QUAD_UVS[i % 4],
-                });
-            }
-            indices.extend_from_slice(&face.quad_mesh_indices(start_index));
-        }
-    }
+    mesh_octree_node(octree, octree.root_index as usize, 0, 0, 0, GRID_RES, chunk_pos, palette, &mut vertices, &mut indices);
     MeshPayload { vertices, indices }
 }
 
@@ -446,8 +525,10 @@ fn update_chunk_buffers(
 }
 
 pub struct RaycastHit {
-    pub voxel_pos: IVec3,
-    pub normal: IVec3,
+    pub hit_pos: Vec3,
+    pub voxel_min: Vec3,
+    pub voxel_size: f32,
+    pub normal: Vec3,
     pub material: u16,
 }
 
@@ -460,8 +541,7 @@ struct ChunkManager {
     palette: Arc<RwLock<Palette>>,
     pub world_type: WorldType,
     pub seed: u32,
-    pub modified_blocks: HashMap<ChunkPos, HashMap<[u32; 3], u16>>,
-    pub full_chunk_overrides: HashMap<ChunkPos, u16>,
+    pub cube_edits: Vec<CubeEdit>,
 }
 
 impl ChunkManager {
@@ -476,92 +556,203 @@ impl ChunkManager {
             palette,
             world_type: WorldType::Empty,
             seed: 42,
-            modified_blocks: HashMap::new(),
-            full_chunk_overrides: HashMap::new(),
+            cube_edits: Vec::new(),
         }
     }
 
-    pub fn get_material_at_voxel(&self, v: IVec3) -> u16 {
-        let cx = v.x.div_euclid(32);
-        let cy = v.y.div_euclid(32);
-        let cz = v.z.div_euclid(32);
-
-        if let Some(&mat) = self.full_chunk_overrides.get(&(cx, cy, cz)) {
-            return mat;
-        }
-
-        let lx = v.x.rem_euclid(32) as u32;
-        let ly = v.y.rem_euclid(32) as u32;
-        let lz = v.z.rem_euclid(32) as u32;
+    pub fn get_voxel_info_at(&self, p: Vec3) -> (u16, f32, Vec3) {
+        let cx = (p.x / 32.0).floor() as i32;
+        let cy = (p.y / 32.0).floor() as i32;
+        let cz = (p.z / 32.0).floor() as i32;
 
         if let Some(chunk) = self.loaded_chunks.get(&(cx, cy, cz)) {
-            chunk.octree.query(lx, ly, lz)
+            let lx = (p.x - cx as f32 * 32.0).clamp(0.0, 31.999);
+            let ly = (p.y - cy as f32 * 32.0).clamp(0.0, 31.999);
+            let lz = (p.z - cz as f32 * 32.0).clamp(0.0, 31.999);
+
+            let gx = ((lx / 32.0) * GRID_RES as f32) as u32;
+            let gy = ((ly / 32.0) * GRID_RES as f32) as u32;
+            let gz = ((lz / 32.0) * GRID_RES as f32) as u32;
+
+            let (mat, gsize) = chunk.octree.query_node(gx, gy, gz);
+            let size = (gsize as f32 / GRID_RES as f32) * 32.0;
+            let min_gx = (gx / gsize) * gsize;
+            let min_gy = (gy / gsize) * gsize;
+            let min_gz = (gz / gsize) * gsize;
+            let vmin = Vec3::new(
+                cx as f32 * 32.0 + (min_gx as f32 / GRID_RES as f32) * 32.0,
+                cy as f32 * 32.0 + (min_gy as f32 / GRID_RES as f32) * 32.0,
+                cz as f32 * 32.0 + (min_gz as f32 / GRID_RES as f32) * 32.0,
+            );
+            (mat, size, vmin)
         } else {
-            0
+            (0, 4.0, p)
         }
     }
 
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RaycastHit> {
-        let mut voxel = glam::ivec3(
-            origin.x.floor() as i32,
-            origin.y.floor() as i32,
-            origin.z.floor() as i32,
+        if dir.length_squared() < 1e-6 { return None; }
+        let dir = dir.normalize();
+
+        let scale = 8.0_f32;
+        let cell_size = 0.125_f32;
+
+        let mut current_cell = glam::ivec3(
+            (origin.x * scale).floor() as i32,
+            (origin.y * scale).floor() as i32,
+            (origin.z * scale).floor() as i32,
         );
 
-        let step = glam::ivec3(
-            if dir.x > 0.0 { 1 } else { -1 },
-            if dir.y > 0.0 { 1 } else { -1 },
-            if dir.z > 0.0 { 1 } else { -1 },
-        );
+        let step_x = if dir.x > 0.0 { 1 } else if dir.x < 0.0 { -1 } else { 0 };
+        let step_y = if dir.y > 0.0 { 1 } else if dir.y < 0.0 { -1 } else { 0 };
+        let step_z = if dir.z > 0.0 { 1 } else if dir.z < 0.0 { -1 } else { 0 };
 
-        let delta_t = Vec3::new(
-            if dir.x.abs() > 1e-6 { (1.0 / dir.x).abs() } else { f32::MAX },
-            if dir.y.abs() > 1e-6 { (1.0 / dir.y).abs() } else { f32::MAX },
-            if dir.z.abs() > 1e-6 { (1.0 / dir.z).abs() } else { f32::MAX },
-        );
+        let delta_tx = if step_x != 0 { (cell_size / dir.x).abs() } else { f32::MAX };
+        let delta_ty = if step_y != 0 { (cell_size / dir.y).abs() } else { f32::MAX };
+        let delta_tz = if step_z != 0 { (cell_size / dir.z).abs() } else { f32::MAX };
 
-        let mut t_max = Vec3::new(
-            if dir.x > 0.0 { (voxel.x as f32 + 1.0 - origin.x) * delta_t.x } else { (origin.x - voxel.x as f32) * delta_t.x },
-            if dir.y > 0.0 { (voxel.y as f32 + 1.0 - origin.y) * delta_t.y } else { (origin.y - voxel.y as f32) * delta_t.y },
-            if dir.z > 0.0 { (voxel.z as f32 + 1.0 - origin.z) * delta_t.z } else { (origin.z - voxel.z as f32) * delta_t.z },
-        );
+        let next_voxel_boundary_x = if step_x > 0 { (current_cell.x + 1) as f32 * cell_size } else { current_cell.x as f32 * cell_size };
+        let next_voxel_boundary_y = if step_y > 0 { (current_cell.y + 1) as f32 * cell_size } else { current_cell.y as f32 * cell_size };
+        let next_voxel_boundary_z = if step_z > 0 { (current_cell.z + 1) as f32 * cell_size } else { current_cell.z as f32 * cell_size };
 
-        let mut normal = glam::IVec3::ZERO;
-        let mut dist = 0.0;
+        let mut t_max_x = if step_x != 0 { (next_voxel_boundary_x - origin.x) / dir.x } else { f32::MAX };
+        let mut t_max_y = if step_y != 0 { (next_voxel_boundary_y - origin.y) / dir.y } else { f32::MAX };
+        let mut t_max_z = if step_z != 0 { (next_voxel_boundary_z - origin.z) / dir.z } else { f32::MAX };
 
-        while dist < max_dist {
-            let mat = self.get_material_at_voxel(voxel);
-            if mat != 0 {
-                return Some(RaycastHit { voxel_pos: voxel, normal, material: mat });
+        let mut normal = Vec3::ZERO;
+        let mut dist = 0.0_f32;
+        let max_steps = (max_dist * scale * 1.8) as i32;
+
+        for _ in 0..max_steps {
+            if dist > max_dist { break; }
+
+            let cx = current_cell.x.div_euclid(256);
+            let cy = current_cell.y.div_euclid(256);
+            let cz = current_cell.z.div_euclid(256);
+
+            if let Some(chunk) = self.loaded_chunks.get(&(cx, cy, cz)) {
+                let gx = current_cell.x.rem_euclid(256) as u32;
+                let gy = current_cell.y.rem_euclid(256) as u32;
+                let gz = current_cell.z.rem_euclid(256) as u32;
+
+                let (mat, gsize) = chunk.octree.query_node(gx, gy, gz);
+                if mat != 0 {
+                    let voxel_size = gsize as f32 * cell_size;
+                    let min_gx = (gx / gsize) * gsize;
+                    let min_gy = (gy / gsize) * gsize;
+                    let min_gz = (gz / gsize) * gsize;
+                    let voxel_min = Vec3::new(
+                        cx as f32 * 32.0 + min_gx as f32 * cell_size,
+                        cy as f32 * 32.0 + min_gy as f32 * cell_size,
+                        cz as f32 * 32.0 + min_gz as f32 * cell_size,
+                    );
+                    let hit_pos = origin + dir * dist;
+                    return Some(RaycastHit {
+                        hit_pos,
+                        voxel_min,
+                        voxel_size,
+                        normal,
+                        material: mat,
+                    });
+                }
             }
 
-            if t_max.x < t_max.y {
-                if t_max.x < t_max.z {
-                    voxel.x += step.x;
-                    dist = t_max.x;
-                    t_max.x += delta_t.x;
-                    normal = glam::ivec3(-step.x, 0, 0);
+            if t_max_x < t_max_y {
+                if t_max_x < t_max_z {
+                    current_cell.x += step_x;
+                    dist = t_max_x;
+                    t_max_x += delta_tx;
+                    normal = Vec3::new(-step_x as f32, 0.0, 0.0);
                 } else {
-                    voxel.z += step.z;
-                    dist = t_max.z;
-                    t_max.z += delta_t.z;
-                    normal = glam::ivec3(0, 0, -step.z);
+                    current_cell.z += step_z;
+                    dist = t_max_z;
+                    t_max_z += delta_tz;
+                    normal = Vec3::new(0.0, 0.0, -step_z as f32);
                 }
             } else {
-                if t_max.y < t_max.z {
-                    voxel.y += step.y;
-                    dist = t_max.y;
-                    t_max.y += delta_t.y;
-                    normal = glam::ivec3(0, -step.y, 0);
+                if t_max_y < t_max_z {
+                    current_cell.y += step_y;
+                    dist = t_max_y;
+                    t_max_y += delta_ty;
+                    normal = Vec3::new(0.0, -step_y as f32, 0.0);
                 } else {
-                    voxel.z += step.z;
-                    dist = t_max.z;
-                    t_max.z += delta_t.z;
-                    normal = glam::ivec3(0, 0, -step.z);
+                    current_cell.z += step_z;
+                    dist = t_max_z;
+                    t_max_z += delta_tz;
+                    normal = Vec3::new(0.0, 0.0, -step_z as f32);
                 }
             }
         }
         None
+    }
+
+    fn get_or_create_chunk<'a>(&'a mut self, chunk_pos: ChunkPos, device: &wgpu::Device) -> &'a mut RenderChunk {
+        let wtype = self.world_type;
+        let seed = self.seed;
+        let edits = self.cube_edits.clone();
+        self.loaded_chunks.entry(chunk_pos).or_insert_with(|| {
+            let octree = generate_octree(chunk_pos, wtype, seed, &edits);
+            let vb = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: 1024, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            });
+            let ib = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None, size: 1024, usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            });
+            RenderChunk { octree, vertex_buffer: vb, index_buffer: ib, num_indices: 0, vertex_capacity: 1024, index_capacity: 1024 }
+        })
+    }
+
+    fn modify_cube(&mut self, pos: Vec3, material: u16, size: f32, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let edit = CubeEdit {
+            pos: [pos.x, pos.y, pos.z],
+            size,
+            material,
+        };
+        self.cube_edits.push(edit);
+
+        let pal = self.palette.read().unwrap().clone();
+
+        if size >= 32.0 {
+            let num_chunks = (size / 32.0).round() as i32;
+            let start_cx = (pos.x / 32.0).floor() as i32;
+            let start_cy = (pos.y / 32.0).floor() as i32;
+            let start_cz = (pos.z / 32.0).floor() as i32;
+
+            for dx in 0..num_chunks {
+                for dy in 0..num_chunks {
+                    for dz in 0..num_chunks {
+                        let chunk_pos = (start_cx + dx, start_cy + dy, start_cz + dz);
+                        let chunk = self.get_or_create_chunk(chunk_pos, device);
+                        chunk.octree.insert_cube(0, 0, 0, 0, material, true);
+                        let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
+                        update_chunk_buffers(chunk, &payload, device, queue);
+                    }
+                }
+            }
+        } else {
+            let cx = (pos.x / 32.0).floor() as i32;
+            let cy = (pos.y / 32.0).floor() as i32;
+            let cz = (pos.z / 32.0).floor() as i32;
+            let chunk_pos = (cx, cy, cz);
+
+            let chunk = self.get_or_create_chunk(chunk_pos, device);
+
+            let lx = pos.x - (cx * 32) as f32;
+            let ly = pos.y - (cy * 32) as f32;
+            let lz = pos.z - (cz * 32) as f32;
+
+            let gx = (lx * 8.0).round() as u32;
+            let gy = (ly * 8.0).round() as u32;
+            let gz = (lz * 8.0).round() as u32;
+
+            let grid_size = (size * 8.0).round().max(1.0) as u32;
+            let depth = MAX_DEPTH - grid_size.trailing_zeros().min(MAX_DEPTH as u32) as u8;
+
+            chunk.octree.insert_cube(gx, gy, gz, depth, material, true);
+
+            let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
+            update_chunk_buffers(chunk, &payload, device, queue);
+        }
     }
 
     fn update(&mut self, player_pos: Vec3, device: &wgpu::Device) {
@@ -575,13 +766,12 @@ impl ChunkManager {
                     self.loading_chunks.insert(pos);
                     let tx_clone = self.tx.clone();
                     let pal_arc = Arc::clone(&self.palette);
-                    let deltas = self.modified_blocks.get(&pos).cloned();
-                    let full_override = self.full_chunk_overrides.get(&pos).copied();
+                    let edits = self.cube_edits.clone();
                     let wtype = self.world_type;
                     let seed = self.seed;
 
                     rayon::spawn(move || {
-                        let octree = generate_octree(pos, wtype, seed, deltas.as_ref(), full_override);
+                        let octree = generate_octree(pos, wtype, seed, &edits);
                         let pal = pal_arc.read().unwrap().clone();
                         let payload = generate_mesh(&octree, pos, &pal);
                         let _ = tx_clone.send((pos, octree, payload));
@@ -616,113 +806,19 @@ impl ChunkManager {
         });
     }
 
-    fn set_whole_chunk(&mut self, chunk_pos: ChunkPos, material: u16, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if material == 0 {
-            self.full_chunk_overrides.insert(chunk_pos, 0);
-        } else {
-            self.full_chunk_overrides.insert(chunk_pos, material);
-        }
-        self.modified_blocks.remove(&chunk_pos);
-
-        if let Some(chunk) = self.loaded_chunks.get_mut(&chunk_pos) {
-            chunk.octree = Octree::new();
-            if material != 0 {
-                chunk.octree.insert(0, 0, 0, 0, material);
-            }
-            let pal = self.palette.read().unwrap().clone();
-            let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
-            update_chunk_buffers(chunk, &payload, device, queue);
-        }
-    }
-
-    fn modify_cube(&mut self, pos: Vec3, material: u16, size: u32, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let s = size as i32;
-        let bx = (pos.x.floor() as i32).div_euclid(s) * s;
-        let by = (pos.y.floor() as i32).div_euclid(s) * s;
-        let bz = (pos.z.floor() as i32).div_euclid(s) * s;
-
-        if size >= 32 {
-            let chunks_count = (size / 32) as i32;
-            let start_cx = bx / 32;
-            let start_cy = by / 32;
-            let start_cz = bz / 32;
-
-            for dx in 0..chunks_count {
-                for dy in 0..chunks_count {
-                    for dz in 0..chunks_count {
-                        let cpos = (start_cx + dx, start_cy + dy, start_cz + dz);
-                        self.set_whole_chunk(cpos, material, device, queue);
-                    }
-                }
-            }
-            return;
-        }
-
-        let depth = match size {
-            1 => 5,
-            2 => 4,
-            4 => 3,
-            8 => 2,
-            16 => 1,
-            _ => 5,
-        };
-
-        let cx = bx.div_euclid(32);
-        let cy = by.div_euclid(32);
-        let cz = bz.div_euclid(32);
-        let chunk_pos = (cx, cy, cz);
-
-        let lx = bx.rem_euclid(32) as u32;
-        let ly = by.rem_euclid(32) as u32;
-        let lz = bz.rem_euclid(32) as u32;
-
-        let chunk_map = self.modified_blocks.entry(chunk_pos).or_default();
-        for dz in 0..size {
-            for dy in 0..size {
-                for dx in 0..size {
-                    if material == 0 {
-                        chunk_map.remove(&[lx + dx, ly + dy, lz + dz]);
-                    } else {
-                        chunk_map.insert([lx + dx, ly + dy, lz + dz], material);
-                    }
-                }
-            }
-        }
-
-        let chunk = self.loaded_chunks.entry(chunk_pos).or_insert_with(|| {
-            let octree = generate_octree(chunk_pos, self.world_type, self.seed, self.modified_blocks.get(&chunk_pos), self.full_chunk_overrides.get(&chunk_pos).copied());
-            let vb = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None, size: 1024, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-            });
-            let ib = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None, size: 1024, usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-            });
-            RenderChunk { octree, vertex_buffer: vb, index_buffer: ib, num_indices: 0, vertex_capacity: 1024, index_capacity: 1024 }
-        });
-
-        chunk.octree.insert(lx, ly, lz, depth, material);
-
-        let pal = self.palette.read().unwrap().clone();
-        let payload = generate_mesh(&chunk.octree, chunk_pos, &pal);
-        update_chunk_buffers(chunk, &payload, device, queue);
-    }
-
-    fn get_material(&self, pos: Vec3) -> u16 {
-        self.get_material_at_voxel(glam::ivec3(pos.x.floor() as i32, pos.y.floor() as i32, pos.z.floor() as i32))
-    }
-
     fn is_solid(&self, pos: Vec3) -> bool {
-        self.get_material(pos) != 0
+        self.get_voxel_info_at(pos).0 != 0
     }
 
     pub fn get_surface_y(&self, x: f32, z: f32) -> Option<f32> {
-        let px = x.floor() as i32;
-        let pz = z.floor() as i32;
-        for y in (-32..96).rev() {
-            let test_pos = Vec3::new(px as f32 + 0.5, y as f32 + 0.5, pz as f32 + 0.5);
+        let mut y = 96.0_f32;
+        while y >= -32.0 {
+            let test_pos = Vec3::new(x, y, z);
             if self.is_solid(test_pos) {
-                return Some(y as f32 + 1.0);
+                let (_, size, vmin) = self.get_voxel_info_at(test_pos);
+                return Some(vmin.y + size);
             }
+            y -= 0.5;
         }
         None
     }
@@ -791,13 +887,14 @@ impl Camera {
         let (sin_p, cos_p) = self.pitch.sin_cos();
         let (sin_y, cos_y) = self.yaw.sin_cos();
         let dir = Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p).normalize();
-        let view = Mat4::look_at_rh(self.position, self.position + dir, Vec3::Y);
+
+        let view = glam::camera::rh::view::look_at_mat4(self.position, self.position + dir, Vec3::Y);
         let proj = if self.is_ortho {
             let half_h = self.ortho_size * 0.5;
             let half_w = half_h * aspect;
-            Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -2500.0, 5000.0)
+            glam::camera::rh::proj::directx::orthographic(-half_w, half_w, -half_h, half_h, -2500.0, 5000.0)
         } else {
-            Mat4::perspective_rh((60.0_f32).to_radians(), aspect, 0.05, 5000.0)
+            glam::camera::rh::proj::directx::perspective((60.0_f32).to_radians(), aspect, 0.05, 5000.0)
         };
         proj * view
     }
@@ -858,7 +955,6 @@ fn add_line(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, thick
     ]);
 }
 
-// 5x7 Font Bitmap: 7 rows of 5-bit masks
 fn get_glyph_5x7(c: char) -> [u8; 7] {
     match c {
         'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
@@ -887,24 +983,6 @@ fn get_glyph_5x7(c: char) -> [u8; 7] {
         'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
         'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
         'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-        'a' => [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
-        'b' => [0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110],
-        'c' => [0b00000, 0b00000, 0b01110, 0b10000, 0b10000, 0b10001, 0b01110],
-        'd' => [0b00001, 0b00001, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111],
-        'e' => [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110],
-        'f' => [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
-        'g' => [0b00000, 0b00000, 0b01111, 0b10001, 0b01111, 0b00001, 0b01110],
-        'h' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
-        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'l' => [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'm' => [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10001, 0b10001],
-        'n' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
-        'o' => [0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110],
-        'p' => [0b00000, 0b00000, 0b11110, 0b10001, 0b11110, 0b10000, 0b10000],
-        'r' => [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
-        's' => [0b00000, 0b00000, 0b01110, 0b10000, 0b01110, 0b00001, 0b11110],
-        't' => [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
-        'u' => [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101],
         '0' => [0b01110, 0b10011, 0b10101, 0b10101, 0b11001, 0b10001, 0b01110],
         '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
         '2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
@@ -922,10 +1000,6 @@ fn get_glyph_5x7(c: char) -> [u8; 7] {
         '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
         '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
         ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
-        '|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        '*' => [0b00000, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0b00000],
-        '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
-        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
         _ => [0; 7],
     }
 }
@@ -1044,6 +1118,47 @@ fn get_focus_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
     (x0, y0, x1, y1)
 }
 
+fn compute_placement_pos(hit: &RaycastHit, edit_size: f32) -> Vec3 {
+    let s = edit_size;
+    let mut pos = Vec3::ZERO;
+
+    if hit.normal.x > 0.5 {
+        let face_x = hit.voxel_min.x + hit.voxel_size;
+        pos.x = (face_x / s).ceil() * s;
+        pos.y = (hit.hit_pos.y / s).floor() * s;
+        pos.z = (hit.hit_pos.z / s).floor() * s;
+    } else if hit.normal.x < -0.5 {
+        let face_x = hit.voxel_min.x;
+        pos.x = ((face_x - s) / s).floor() * s;
+        pos.y = (hit.hit_pos.y / s).floor() * s;
+        pos.z = (hit.hit_pos.z / s).floor() * s;
+    } else if hit.normal.y > 0.5 {
+        let face_y = hit.voxel_min.y + hit.voxel_size;
+        pos.y = (face_y / s).ceil() * s;
+        pos.x = (hit.hit_pos.x / s).floor() * s;
+        pos.z = (hit.hit_pos.z / s).floor() * s;
+    } else if hit.normal.y < -0.5 {
+        let face_y = hit.voxel_min.y;
+        pos.y = ((face_y - s) / s).floor() * s;
+        pos.x = (hit.hit_pos.x / s).floor() * s;
+        pos.z = (hit.hit_pos.z / s).floor() * s;
+    } else if hit.normal.z > 0.5 {
+        let face_z = hit.voxel_min.z + hit.voxel_size;
+        pos.z = (face_z / s).ceil() * s;
+        pos.x = (hit.hit_pos.x / s).floor() * s;
+        pos.y = (hit.hit_pos.y / s).floor() * s;
+    } else if hit.normal.z < -0.5 {
+        let face_z = hit.voxel_min.z;
+        pos.z = ((face_z - s) / s).floor() * s;
+        pos.x = (hit.hit_pos.x / s).floor() * s;
+        pos.y = (hit.hit_pos.y / s).floor() * s;
+    } else {
+        pos = (hit.hit_pos / s).floor() * s;
+    }
+
+    pos
+}
+
 fn build_ui_vertices(
     selected_slot: usize,
     active_menu: ActiveMenu,
@@ -1051,8 +1166,8 @@ fn build_ui_vertices(
     play_mode: PlayMode,
     is_ortho: bool,
     world_type: WorldType,
-    edit_size: u32,
-    target_pos: Option<[i32; 3]>,
+    edit_size: f32,
+    target_pos: Option<[f32; 3]>,
     aspect: f32,
     camera_forward: Vec3,
     camera_right: Vec3,
@@ -1127,7 +1242,11 @@ fn build_ui_vertices(
         draw_text_centered(&mut verts, num_str, (x0 + x1) / 2.0, y_top + 0.02, 1.0, aspect, [0.9, 0.9, 0.9, 0.9]);
     }
 
-    let size_str = format!("SIZE: {}X{}", edit_size, edit_size);
+    let size_str = if edit_size < 1.0 {
+        format!("SIZE: 1/{} ({:.3})", (1.0 / edit_size).round() as u32, edit_size)
+    } else {
+        format!("SIZE: {:.0}X{:.0}", edit_size, edit_size)
+    };
 
     match active_menu {
         ActiveMenu::None => {
@@ -1140,9 +1259,9 @@ fn build_ui_vertices(
             draw_text(&mut verts, &hud_title, -0.96, 0.92, 1.25, aspect, [1.0, 1.0, 1.0, 0.95]);
 
             if cursor_free {
-                draw_text(&mut verts, "CURSOR FREE / BORDERS ON  |  [+/-] ORTHO ZOOM", -0.96, 0.86, 1.0, aspect, [0.2, 0.95, 0.4, 0.95]);
+                draw_text(&mut verts, "CURSOR FREE / PLACING DISABLED  |  [+/-] ORTHO ZOOM", -0.96, 0.86, 1.0, aspect, [0.95, 0.45, 0.2, 0.95]);
             } else if let Some(tpos) = target_pos {
-                let target_str = format!("AIM: [{}, {}, {}] (SNAP)", tpos[0], tpos[1], tpos[2]);
+                let target_str = format!("AIM: [{:.3}, {:.3}, {:.3}] (SNAP)", tpos[0], tpos[1], tpos[2]);
                 draw_text(&mut verts, &target_str, -0.96, 0.86, 1.0, aspect, [0.3, 0.9, 0.9, 0.9]);
             } else {
                 draw_text(&mut verts, "AIM: [UNBOUNDED VOID - PLACES IN FRONT]", -0.96, 0.86, 1.0, aspect, [0.6, 0.7, 0.8, 0.8]);
@@ -1222,7 +1341,7 @@ fn build_ui_vertices(
             add_quad(&mut verts, -0.40, -0.10, -0.22, -0.02, [0.35, 0.40, 0.55, 1.0]);
             draw_text_centered(&mut verts, "/ 2 (F)", -0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
-            let active_sz_txt = format!("CURRENT: {}X{}", edit_size, edit_size);
+            let active_sz_txt = format!("CURRENT: {}", size_str);
             draw_text_centered(&mut verts, &active_sz_txt, 0.0, -0.06, 1.25, aspect, [1.0, 0.85, 0.2, 1.0]);
 
             add_quad(&mut verts, 0.22, -0.10, 0.40, -0.02, [0.35, 0.40, 0.55, 1.0]);
@@ -1299,8 +1418,8 @@ struct State {
     active_menu: ActiveMenu,
     cursor_pos: [f32; 2],
     active_slider: Option<usize>,
-    edit_size: u32,
-    last_target: Option<[i32; 3]>,
+    edit_size: f32,
+    last_target: Option<[f32; 3]>,
     cursor_free: bool,
     gimbal_dragging: bool,
     gimbal_drag_moved: bool,
@@ -1388,7 +1507,7 @@ impl State {
         let chunk_manager = ChunkManager::new(Arc::clone(&palette));
 
         let initial_ui = build_ui_vertices(
-            0, ActiveMenu::None, &hotbar_colors, PlayMode::Flying, camera.is_ortho, chunk_manager.world_type, 4, None, 1.0,
+            0, ActiveMenu::None, &hotbar_colors, PlayMode::Flying, camera.is_ortho, chunk_manager.world_type, 1.0, None, 1.0,
             camera.forward(), camera.right(), camera.up(), false,
         );
         let ui_vertices_count = initial_ui.len() as u32;
@@ -1405,7 +1524,7 @@ impl State {
             camera_buffer, camera_bind_group, depth_texture_view, camera,
             input: InputState::default(), chunk_manager,
             play_mode: PlayMode::Flying, velocity: Vec3::ZERO, selected_slot: 0, hotbar_colors,
-            palette, active_menu: ActiveMenu::None, cursor_pos: [0.0, 0.0], active_slider: None, edit_size: 4,
+            palette, active_menu: ActiveMenu::None, cursor_pos: [0.0, 0.0], active_slider: None, edit_size: 1.0,
             last_target: None, cursor_free: false, gimbal_dragging: false, gimbal_drag_moved: false, prev_cursor_pos: [0.0, 0.0],
         }
     }
@@ -1415,27 +1534,12 @@ impl State {
         let mut max_bound = Vec3::splat(f32::MIN);
         let mut has_blocks = false;
 
-        for (&(cx, cy, cz), block_map) in &self.chunk_manager.modified_blocks {
-            for (&[lx, ly, lz], &mat) in block_map {
-                if mat != 0 {
-                    has_blocks = true;
-                    let wx = (cx * 32 + lx as i32) as f32;
-                    let wy = (cy * 32 + ly as i32) as f32;
-                    let wz = (cz * 32 + lz as i32) as f32;
-                    min_bound = min_bound.min(Vec3::new(wx, wy, wz));
-                    max_bound = max_bound.max(Vec3::new(wx + 1.0, wy + 1.0, wz + 1.0));
-                }
-            }
-        }
-
-        for (&(cx, cy, cz), &mat) in &self.chunk_manager.full_chunk_overrides {
-            if mat != 0 {
+        for edit in &self.chunk_manager.cube_edits {
+            if edit.material != 0 {
                 has_blocks = true;
-                let wx = (cx * 32) as f32;
-                let wy = (cy * 32) as f32;
-                let wz = (cz * 32) as f32;
-                min_bound = min_bound.min(Vec3::new(wx, wy, wz));
-                max_bound = max_bound.max(Vec3::new(wx + 32.0, wy + 32.0, wz + 32.0));
+                let p = Vec3::from_array(edit.pos);
+                min_bound = min_bound.min(p);
+                max_bound = max_bound.max(p + Vec3::splat(edit.size));
             }
         }
 
@@ -1495,16 +1599,6 @@ impl State {
     }
 
     pub fn save_game(&self, filename: &str) -> std::io::Result<()> {
-        let serialized_deltas: Vec<([i32; 3], Vec<([u32; 3], u16)>)> = self.chunk_manager.modified_blocks.iter()
-            .map(|(&(cx, cy, cz), block_map)| {
-                ([cx, cy, cz], block_map.iter().map(|(&k, &v)| (k, v)).collect())
-            })
-            .collect();
-
-        let full_overrides: Vec<([i32; 3], u16)> = self.chunk_manager.full_chunk_overrides.iter()
-            .map(|(&(cx, cy, cz), &mat)| ([cx, cy, cz], mat))
-            .collect();
-
         let data = SaveData {
             player_pos: self.camera.position.to_array(),
             camera_yaw: self.camera.yaw,
@@ -1516,8 +1610,7 @@ impl State {
             seed: self.chunk_manager.seed,
             hotbar_colors: self.hotbar_colors,
             palette: self.palette.read().unwrap().clone(),
-            modified_blocks: serialized_deltas,
-            full_chunk_overrides: full_overrides,
+            cube_edits: self.chunk_manager.cube_edits.clone(),
         };
 
         let json = serde_json::to_string_pretty(&data)?;
@@ -1542,17 +1635,7 @@ impl State {
 
         self.chunk_manager.world_type = data.world_type;
         self.chunk_manager.seed = data.seed;
-        self.chunk_manager.modified_blocks.clear();
-        for (chunk_coords, edits) in data.modified_blocks {
-            let pos = (chunk_coords[0], chunk_coords[1], chunk_coords[2]);
-            self.chunk_manager.modified_blocks.insert(pos, edits.into_iter().collect());
-        }
-
-        self.chunk_manager.full_chunk_overrides.clear();
-        for (chunk_coords, mat) in data.full_chunk_overrides {
-            let pos = (chunk_coords[0], chunk_coords[1], chunk_coords[2]);
-            self.chunk_manager.full_chunk_overrides.insert(pos, mat);
-        }
+        self.chunk_manager.cube_edits = data.cube_edits;
 
         self.chunk_manager.loaded_chunks.clear();
         self.chunk_manager.loading_chunks.clear();
@@ -1563,8 +1646,7 @@ impl State {
     }
 
     pub fn clear_all_blocks(&mut self) {
-        self.chunk_manager.modified_blocks.clear();
-        self.chunk_manager.full_chunk_overrides.clear();
+        self.chunk_manager.cube_edits.clear();
         self.chunk_manager.loaded_chunks.clear();
         self.chunk_manager.loading_chunks.clear();
         self.update_ui();
@@ -1577,9 +1659,9 @@ impl State {
 
     pub fn scale_voxel_size(&mut self, multiply: bool) {
         if multiply {
-            self.edit_size = (self.edit_size * 2).min(4096);
+            self.edit_size = (self.edit_size * 2.0).min(64.0);
         } else {
-            self.edit_size = (self.edit_size / 2).max(1);
+            self.edit_size = (self.edit_size * 0.5).max(MIN_VOXEL_SIZE);
         }
         self.update_ui();
     }
@@ -1735,20 +1817,16 @@ impl State {
         let dir = self.camera.forward();
         let hit = self.chunk_manager.raycast(self.camera.position, dir, 300.0);
 
-        let s = self.edit_size as i32;
+        let s = self.edit_size;
         if let Some(ref h) = hit {
-            self.last_target = Some([
-                h.voxel_pos.x.div_euclid(s) * s,
-                h.voxel_pos.y.div_euclid(s) * s,
-                h.voxel_pos.z.div_euclid(s) * s,
-            ]);
+            let p = compute_placement_pos(h, s);
+            self.last_target = Some([p.x, p.y, p.z]);
         } else {
             self.last_target = None;
         }
 
-        if self.input.action_add || self.input.action_remove || self.input.action_pick {
-            if let Some(h) = hit {
-                let hit_center = Vec3::new(h.voxel_pos.x as f32 + 0.5, h.voxel_pos.y as f32 + 0.5, h.voxel_pos.z as f32 + 0.5);
+        if !self.cursor_free && (self.input.action_add || self.input.action_remove || self.input.action_pick) {
+            if let Some(ref h) = hit {
                 if self.input.action_pick {
                     let mat = h.material;
                     let pal = self.palette.read().unwrap();
@@ -1758,19 +1836,30 @@ impl State {
                         self.update_ui();
                     }
                 } else if self.input.action_remove { 
-                    self.chunk_manager.modify_cube(hit_center, 0, self.edit_size, &self.device, &self.queue); 
+                    let p_inside = h.hit_pos - h.normal * (MIN_VOXEL_SIZE * 0.5);
+                    let remove_pos = Vec3::new(
+                        (p_inside.x / s).floor() * s,
+                        (p_inside.y / s).floor() * s,
+                        (p_inside.z / s).floor() * s,
+                    );
+                    self.chunk_manager.modify_cube(remove_pos, 0, s, &self.device, &self.queue); 
                 } else if self.input.action_add { 
-                    let place_pos = hit_center + h.normal.as_vec3() * (self.edit_size as f32);
+                    let place_pos = compute_placement_pos(h, s);
                     if self.play_mode == PlayMode::Flying || !self.player_collides_at(self.camera.position) {
                         let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
-                        self.chunk_manager.modify_cube(place_pos, mat_id, self.edit_size, &self.device, &self.queue); 
+                        self.chunk_manager.modify_cube(place_pos, mat_id, s, &self.device, &self.queue); 
                     }
                 }
             } else if self.input.action_add {
-                let spawn_dist = (self.edit_size as f32 * 1.5).clamp(8.0, 64.0);
-                let place_pos = self.camera.position + dir * spawn_dist;
+                let spawn_dist = (s * 2.0).clamp(8.0, 64.0);
+                let p = self.camera.position + dir * spawn_dist;
+                let place_pos = Vec3::new(
+                    (p.x / s).floor() * s,
+                    (p.y / s).floor() * s,
+                    (p.z / s).floor() * s,
+                );
                 let mat_id = self.get_or_create_material(self.hotbar_colors[self.selected_slot]);
-                self.chunk_manager.modify_cube(place_pos, mat_id, self.edit_size, &self.device, &self.queue);
+                self.chunk_manager.modify_cube(place_pos, mat_id, s, &self.device, &self.queue);
             }
 
             self.input.action_add = false; 
@@ -1984,7 +2073,9 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::Digit8) => { state.selected_slot = 7; state.update_ui(); },
                             PhysicalKey::Code(KeyCode::Digit9) => { state.selected_slot = 8; state.update_ui(); },
                             PhysicalKey::Code(KeyCode::Digit0) => { state.selected_slot = 9; state.update_ui(); },
-                            PhysicalKey::Code(KeyCode::KeyC) if state.active_menu == ActiveMenu::None => state.input.action_pick = true,
+                            PhysicalKey::Code(KeyCode::KeyC) if state.active_menu == ActiveMenu::None && !state.cursor_free => {
+                                state.input.action_pick = true;
+                            },
                             _ => {}
                         }
                     }
@@ -2174,7 +2265,7 @@ impl ApplicationHandler for App {
                         }
 
                         ActiveMenu::None => {
-                            if element_state == ElementState::Pressed {
+                            if element_state == ElementState::Pressed && !state.cursor_free {
                                 match button {
                                     MouseButton::Left => state.input.action_add = true,
                                     MouseButton::Right => state.input.action_remove = true,
@@ -2210,6 +2301,7 @@ impl ApplicationHandler for App {
             }
         }
     }
+
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) { 
         if let Some(state) = self.state.as_mut() { 
             state.window.request_redraw(); 
