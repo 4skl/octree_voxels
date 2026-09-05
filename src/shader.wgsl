@@ -31,13 +31,22 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let light_dir = normalize(vec3<f32>(0.5, 0.9, 0.3));
+    let light_dir = normalize(vec3<f32>(0.4, 0.9, 0.3));
     let ndotl = max(dot(in.normal, light_dir), 0.0);
-    let lighting = ndotl * 0.65 + 0.35;
+
+    // Discrete 3-tone lighting quantization (Cel-Shading)
+    var lighting: f32 = 0.42;
+    if (ndotl > 0.65) {
+        lighting = 1.00;
+    } else if (ndotl > 0.20) {
+        lighting = 0.72;
+    }
 
     var col = in.color * lighting;
+
+    // Edge definition
+    let edge = min(min(in.uv.x, 1.0 - in.uv.x), min(in.uv.y, 1.0 - in.uv.y));
     if (camera.show_borders > 0.5) {
-        let edge = min(min(in.uv.x, 1.0 - in.uv.x), min(in.uv.y, 1.0 - in.uv.y));
         if (edge < 0.045) {
             let lum = dot(col, vec3<f32>(0.299, 0.587, 0.114));
             if (lum < 0.2) {
@@ -46,6 +55,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 col = col * 0.25;
             }
         }
+    } else {
+        // Subtle pixel-edge creasing
+        if (edge < 0.02) {
+            col = col * 0.85;
+        }
     }
+
     return vec4<f32>(col, 1.0);
 }
