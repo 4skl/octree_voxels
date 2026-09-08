@@ -82,11 +82,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    var dir_mask = 0u;
-    if (ray_dir.x < 0.0) { dir_mask = dir_mask | 1u; }
-    if (ray_dir.y < 0.0) { dir_mask = dir_mask | 2u; }
-    if (ray_dir.z < 0.0) { dir_mask = dir_mask | 4u; }
-
     var stack: array<StackNode, 24>;
     var stack_len: i32 = 1;
     stack[0] = StackNode(0u, root_min, camera.world_size, max(r_enter, 0.0));
@@ -97,7 +92,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var steps = 0;
     let total_nodes = arrayLength(&svo_nodes);
 
-    while (stack_len > 0 && steps < 160) {
+    while (stack_len > 0 && steps < 90) {
         steps = steps + 1;
         stack_len = stack_len - 1;
         let curr = stack[stack_len];
@@ -123,6 +118,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 else if (abs(p_hit.y - c_max.y) < eps) { hit_normal = vec3<f32>(0.0, 1.0, 0.0); }
                 else if (abs(p_hit.z - c_min.z) < eps) { hit_normal = vec3<f32>(0.0, 0.0, -1.0); }
                 else { hit_normal = vec3<f32>(0.0, 0.0, 1.0); }
+                // Distance-sorted order guarantees closest leaf is found first
                 break;
             }
             continue;
@@ -130,13 +126,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         let half_s = curr.size * 0.5;
 
-        for (var i: i32 = 7; i >= 0; i = i - 1) {
-            let octant = u32(i) ^ dir_mask;
-            if ((node.child_mask & (1u << octant)) != 0u) {
+        // Filter and collect intersected children
+        var count = 0u;
+        var cand_idx: array<u32, 8>;
+        var cand_min: array<vec3<f32>, 8>;
+        var cand_t: array<f32, 8>;
+
+        for (var i = 0u; i < 8u; i = i + 1u) {
+            if ((node.child_mask & (1u << i)) != 0u) {
                 let offset = vec3<f32>(
-                    select(0.0, half_s, (octant & 1u) != 0u),
-                    select(0.0, half_s, (octant & 2u) != 0u),
-                    select(0.0, half_s, (octant & 4u) != 0u)
+                    select(0.0, half_s, (i & 1u) != 0u),
+                    select(0.0, half_s, (i & 2u) != 0u),
+                    select(0.0, half_s, (i & 4u) != 0u)
                 );
                 let child_min = curr.b_min + offset;
                 let child_max = child_min + vec3<f32>(half_s);
@@ -149,11 +150,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let ct_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
 
                 if (ct_exit >= max(ct_enter, 0.0) && ct_enter < hit_t) {
-                    if (stack_len < 23) {
-                        stack[stack_len] = StackNode(node.child_pointer + octant, child_min, half_s, max(ct_enter, 0.0));
-                        stack_len = stack_len + 1;
+                    cand_idx[count] = node.child_pointer + i;
+                    cand_min[count] = child_min;
+                    cand_t[count] = max(ct_enter, 0.0);
+                    count = count + 1u;
+                }
+            }
+        }
+
+        // Sort candidates descending by t_enter so closest is pushed last and popped first
+        if (count > 1u) {
+            for (var a = 0u; a < count - 1u; a = a + 1u) {
+                for (var b = 0u; b < count - 1u - a; b = b + 1u) {
+                    if (cand_t[b] < cand_t[b + 1u]) {
+                        let tmp_t = cand_t[b]; cand_t[b] = cand_t[b + 1u]; cand_t[b + 1u] = tmp_t;
+                        let tmp_idx = cand_idx[b]; cand_idx[b] = cand_idx[b + 1u]; cand_idx[b + 1u] = tmp_idx;
+                        let tmp_min = cand_min[b]; cand_min[b] = cand_min[b + 1u]; cand_min[b + 1u] = tmp_min;
                     }
                 }
+            }
+        }
+
+        for (var k = 0u; k < count; k = k + 1u) {
+            if (stack_len < 23) {
+                stack[stack_len] = StackNode(cand_idx[k], cand_min[k], half_s, cand_t[k]);
+                stack_len = stack_len + 1;
             }
         }
     }

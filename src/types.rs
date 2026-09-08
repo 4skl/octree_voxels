@@ -87,7 +87,10 @@ impl Default for GlbImportSettings {
 impl GlbImportSettings {
     pub fn estimate_cost(&self) -> (u64, f32) {
         let grid_h = (self.target_height / self.voxel_size.max(0.01)).round() as u64;
-        let est_voxels = (grid_h * grid_h * 6).min(100_000_000);
+        // Surface (~10 * H^2) + solid interior after octree collapse (~0.05 * H^3)
+        let est_surface = grid_h * grid_h * 10;
+        let est_interior_collapsed = (grid_h * grid_h * grid_h) / 20;
+        let est_voxels = (est_surface + est_interior_collapsed).min(100_000_000);
         let est_mb = (est_voxels as f32 * 16.0) / (1024.0 * 1024.0);
         (est_voxels, est_mb)
     }

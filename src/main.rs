@@ -20,7 +20,7 @@ use winit::platform::x11::WindowAttributesExtX11;
 use wgpu::util::DeviceExt;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::path::PathBuf;
 use glam::{Vec3, Vec4, Mat4};
@@ -166,15 +166,12 @@ fn run_background_voxelization(
     all_samples.par_sort_unstable_by_key(|&(k, _)| k);
     all_samples.dedup_by(|a, b| a.0 == b.0);
 
-    if all_samples.len() > max_nodes_allowed {
-        let _ = tx.send(VoxelizeMsg::Done(Err(format!(
-            "Model too dense: {} voxels (Hardware limit: {}). Increase voxel size or decrease height.",
-            all_samples.len(), max_nodes_allowed
-        ))));
+    if all_samples.is_empty() {
+        let _ = tx.send(VoxelizeMsg::Done(Err("Surface voxelization produced 0 voxels".into())));
         return;
     }
 
-    let _ = tx.send(VoxelizeMsg::Progress { percent: 0.80, stage: format!("RESOLVING PALETTE ({} VOXELS)...", all_samples.len()) });
+    let _ = tx.send(VoxelizeMsg::Progress { percent: 0.60, stage: format!("PALETTE MAPPING ({} VOXELS)...", all_samples.len()) });
 
     let mut pal = palette_arc.write().unwrap();
     let mut color_cache: HashMap<[u8; 3], u16> = HashMap::new();
@@ -182,10 +179,11 @@ fn run_background_voxelization(
         color_cache.insert([(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8], (i + 1) as u16);
     }
 
-    let grid_size = ((voxel_size / WORLD_SIZE) * GRID_RES as f32).round().max(1.0) as u32;
-    let depth = MAX_DEPTH - grid_size.trailing_zeros().min(MAX_DEPTH as u32) as u8;
+    let mut sample_mats: Vec<(i32, i32, i32, u16)> = Vec::with_capacity(all_samples.len());
+    let mut min_gx = i32::MAX; let mut max_gx = i32::MIN;
+    let mut min_gy = i32::MAX; let mut max_gy = i32::MIN;
+    let mut min_gz = i32::MAX; let mut max_gz = i32::MIN;
 
-    let mut voxel_nodes = Vec::with_capacity(all_samples.len());
     for (k, color) in all_samples {
         let key = [(color[0] * 255.0).round() as u8, (color[1] * 255.0).round() as u8, (color[2] * 255.0).round() as u8];
         let mat_id = if let Some(&id) = color_cache.get(&key) { id } else {
@@ -196,15 +194,130 @@ fn run_background_voxelization(
                 new_id
             } else { 1 }
         };
-
         let (gx, gy, gz) = unpack_coords(k);
-        let wx = gx as f32 * voxel_size;
-        let wy = gy as f32 * voxel_size;
-        let wz = gz as f32 * voxel_size;
-        let ux = (((wx - WORLD_MIN.x) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
-        let uy = (((wy - WORLD_MIN.y) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
-        let uz = (((wz - WORLD_MIN.z) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
-        voxel_nodes.push((ux, uy, uz, depth, mat_id));
+        min_gx = min_gx.min(gx); max_gx = max_gx.max(gx);
+        min_gy = min_gy.min(gy); max_gy = max_gy.max(gy);
+        min_gz = min_gz.min(gz); max_gz = max_gz.max(gz);
+        sample_mats.push((gx, gy, gz, mat_id));
+    }
+    drop(pal);
+
+    let _ = tx.send(VoxelizeMsg::Progress { percent: 0.75, stage: "SOLID FLOOD-FILL INTERIOR...".into() });
+
+    let size_x = (max_gx - min_gx + 1).max(1) as usize;
+    let size_y = (max_gy - min_gy + 1).max(1) as usize;
+    let size_z = (max_gz - min_gz + 1).max(1) as usize;
+
+    let dim_x = size_x + 2;
+    let dim_y = size_y + 2;
+    let dim_z = size_z + 2;
+    let total_cells = dim_x.saturating_mul(dim_y).saturating_mul(dim_z);
+
+    let grid_size = ((voxel_size / WORLD_SIZE) * GRID_RES as f32).round().max(1.0) as u32;
+    let depth = MAX_DEPTH - grid_size.trailing_zeros().min(MAX_DEPTH as u32) as u8;
+    let mut voxel_nodes = Vec::new();
+
+    // Solid Flood-Fill Pass (capped to 24M cells for memory safety)
+    if total_cells > 0 && total_cells <= 24_000_000 {
+        const AIR: u16 = 65535;
+        let mut grid: Vec<u16> = vec![0; total_cells];
+        let stride_y = dim_x;
+        let stride_z = dim_x * dim_y;
+
+        let mut color_queue: VecDeque<(usize, usize, usize, u16)> = VecDeque::new();
+        for &(gx, gy, gz, mat) in &sample_mats {
+            let lx = (gx - min_gx + 1) as usize;
+            let ly = (gy - min_gy + 1) as usize;
+            let lz = (gz - min_gz + 1) as usize;
+            let idx = lx + ly * stride_y + lz * stride_z;
+            grid[idx] = mat;
+            color_queue.push_back((lx, ly, lz, mat));
+        }
+
+        // BFS outside boundary to find all open air
+        let mut ext_queue: VecDeque<(usize, usize, usize)> = VecDeque::new();
+        grid[0] = AIR;
+        ext_queue.push_back((0usize, 0usize, 0usize));
+
+        while let Some((cx, cy, cz)) = ext_queue.pop_front() {
+            let mut neighbors = [(0usize, 0usize, 0usize); 6];
+            let mut count = 0;
+            if cx > 0 { neighbors[count] = (cx - 1, cy, cz); count += 1; }
+            if cx + 1 < dim_x { neighbors[count] = (cx + 1, cy, cz); count += 1; }
+            if cy > 0 { neighbors[count] = (cx, cy - 1, cz); count += 1; }
+            if cy + 1 < dim_y { neighbors[count] = (cx, cy + 1, cz); count += 1; }
+            if cz > 0 { neighbors[count] = (cx, cy, cz - 1); count += 1; }
+            if cz + 1 < dim_z { neighbors[count] = (cx, cy, cz + 1); count += 1; }
+
+            for i in 0..count {
+                let (nx, ny, nz) = neighbors[i];
+                let n_idx = nx + ny * stride_y + nz * stride_z;
+                if grid[n_idx] == 0 {
+                    grid[n_idx] = AIR;
+                    ext_queue.push_back((nx, ny, nz));
+                }
+            }
+        }
+
+        // Voronoi propagation of surface material into closed hollow interiors
+        while let Some((cx, cy, cz, mat_id)) = color_queue.pop_front() {
+            let mut neighbors = [(0usize, 0usize, 0usize); 6];
+            let mut count = 0;
+            if cx > 0 { neighbors[count] = (cx - 1, cy, cz); count += 1; }
+            if cx + 1 < dim_x { neighbors[count] = (cx + 1, cy, cz); count += 1; }
+            if cy > 0 { neighbors[count] = (cx, cy - 1, cz); count += 1; }
+            if cy + 1 < dim_y { neighbors[count] = (cx, cy + 1, cz); count += 1; }
+            if cz > 0 { neighbors[count] = (cx, cy, cz - 1); count += 1; }
+            if cz + 1 < dim_z { neighbors[count] = (cx, cy, cz + 1); count += 1; }
+
+            for i in 0..count {
+                let (nx, ny, nz) = neighbors[i];
+                let n_idx = nx + ny * stride_y + nz * stride_z;
+                if grid[n_idx] == 0 {
+                    grid[n_idx] = mat_id;
+                    color_queue.push_back((nx, ny, nz, mat_id));
+                }
+            }
+        }
+
+        for lz in 1..=size_z {
+            for ly in 1..=size_y {
+                for lx in 1..=size_x {
+                    let idx = lx + ly * stride_y + lz * stride_z;
+                    let mat = grid[idx];
+                    if mat != 0 && mat != AIR {
+                        let gx = (lx as i32 - 1) + min_gx;
+                        let gy = (ly as i32 - 1) + min_gy;
+                        let gz = (lz as i32 - 1) + min_gz;
+                        let wx = gx as f32 * voxel_size;
+                        let wy = gy as f32 * voxel_size;
+                        let wz = gz as f32 * voxel_size;
+                        let ux = (((wx - WORLD_MIN.x) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
+                        let uy = (((wy - WORLD_MIN.y) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
+                        let uz = (((wz - WORLD_MIN.z) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
+                        voxel_nodes.push((ux, uy, uz, depth, mat));
+                    }
+                }
+            }
+        }
+    } else {
+        for (gx, gy, gz, mat) in sample_mats {
+            let wx = gx as f32 * voxel_size;
+            let wy = gy as f32 * voxel_size;
+            let wz = gz as f32 * voxel_size;
+            let ux = (((wx - WORLD_MIN.x) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
+            let uy = (((wy - WORLD_MIN.y) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
+            let uz = (((wz - WORLD_MIN.z) / WORLD_SIZE) * GRID_RES as f32).floor() as u32;
+            voxel_nodes.push((ux, uy, uz, depth, mat));
+        }
+    }
+
+    if voxel_nodes.len() > max_nodes_allowed {
+        let _ = tx.send(VoxelizeMsg::Done(Err(format!(
+            "Model exceeded limits: {} raw voxels (HW Limit: {}). Increase voxel resolution.",
+            voxel_nodes.len(), max_nodes_allowed
+        ))));
+        return;
     }
 
     let _ = tx.send(VoxelizeMsg::Progress { percent: 0.99, stage: "INSERTING INTO SVO...".into() });
@@ -298,7 +411,7 @@ fn build_ui_vertices(
     selected_slot: usize, active_menu: ActiveMenu, hotbar_colors: &[[f32; 3]; 10], play_mode: PlayMode, is_ortho: bool, world_type: WorldType,
     edit_size: f32, target_pos: Option<[f32; 3]>, aspect: f32, camera_forward: Vec3, camera_right: Vec3, camera_up: Vec3,
     cursor_free: bool, glb_settings: &GlbImportSettings, progress_val: f32, progress_stage: &str, view_proj: Mat4, total_voxels: usize,
-    error_banner: Option<&str>
+    error_banner: Option<&str>, fps: f32
 ) -> Vec<UIVertex> {
     let mut verts = Vec::new();
     let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let g_rad = GIZMO_RADIUS; let disc_rx = (g_rad + 0.018) / aspect; let disc_ry = g_rad + 0.018;
@@ -356,10 +469,13 @@ fn build_ui_vertices(
         draw_text_centered(&mut verts, err, 0.0, 0.74, 0.95, aspect, [1.0, 1.0, 1.0, 1.0]);
     }
 
+    let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+    let fps_str = format!("{:.0} FPS ({:.1}MS)", fps, frame_ms);
+
     match active_menu {
         ActiveMenu::None => {
             add_quad(&mut verts, -0.012, -0.002, 0.012, 0.002, [1.0, 1.0, 1.0, 0.95]); add_quad(&mut verts, -0.002, -0.020, 0.002, 0.020, [1.0, 1.0, 1.0, 0.95]);
-            draw_text(&mut verts, &format!("MODE: {} | PROJ: {} | WORLD: {} | VOXELS: {} | {}", if play_mode == PlayMode::Flying { "FLY" } else { "REAL" }, if is_ortho { "ORTHO" } else { "PERSP" }, world_type.name(), format_voxel_count(total_voxels), size_str), -0.96, 0.92, 1.25, aspect, [1.0, 1.0, 1.0, 0.95]);
+            draw_text(&mut verts, &format!("{} | MODE: {} | PROJ: {} | WORLD: {} | VOXELS: {} | {}", fps_str, if play_mode == PlayMode::Flying { "FLY" } else { "REAL" }, if is_ortho { "ORTHO" } else { "PERSP" }, world_type.name(), format_voxel_count(total_voxels), size_str), -0.96, 0.92, 1.25, aspect, [1.0, 1.0, 1.0, 0.95]);
             if cursor_free { draw_text(&mut verts, "CURSOR FREE  |  DRAG & DROP .GLB OR OPEN ESC MENU", -0.96, 0.86, 1.0, aspect, [0.95, 0.45, 0.2, 0.95]); } else if let Some(tpos) = target_pos { draw_text(&mut verts, &format!("AIM: [{:.2}, {:.2}, {:.2}]", tpos[0], tpos[1], tpos[2]), -0.96, 0.86, 1.0, aspect, [0.3, 0.9, 0.9, 0.9]); } else { draw_text(&mut verts, "AIM: [UNBOUNDED VOID]", -0.96, 0.86, 1.0, aspect, [0.6, 0.7, 0.8, 0.8]); }
             draw_text(&mut verts, "[E] PALETTE  [TAB] FREE  [P] ORTHO  [M] PLAYMODE  [.] FOCUS  [ESC] MENU  [F1] UI", -0.96, 0.80, 0.95, aspect, [0.9, 0.85, 0.4, 0.85]);
         }
@@ -445,7 +561,7 @@ fn build_ui_vertices(
 
             let btn_col = if glb_settings.selected_file.is_some() && is_safe { [0.20, 0.60, 0.30, 1.0] } else { [0.35, 0.20, 0.20, 0.8] };
             add_quad(&mut verts, -0.38, -0.54, 0.38, -0.44, btn_col);
-            draw_text_centered(&mut verts, if is_safe { "VOXELIZE & INSERT" } else { "TOO DENSE (REDUCE SETTINGS)" }, 0.0, -0.49, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, if is_safe { "VOXELIZE & INSERT (SOLID)" } else { "TOO DENSE (REDUCE SETTINGS)" }, 0.0, -0.49, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, -0.38, -0.66, 0.38, -0.56, [0.45, 0.22, 0.22, 1.0]); draw_text_centered(&mut verts, "CANCEL (ESC)", 0.0, -0.61, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
         ActiveMenu::Voxelizing => {
@@ -453,7 +569,7 @@ fn build_ui_vertices(
             draw_text_centered(&mut verts, "VOXELIZING 3D MODEL", 0.0, 0.18, 1.25, aspect, [0.3, 0.9, 1.0, 1.0]); draw_text_centered(&mut verts, progress_stage, 0.0, 0.09, 0.95, aspect, [0.85, 0.85, 0.9, 1.0]);
             add_quad(&mut verts, -0.384, -0.054, 0.384, 0.044, [0.20, 0.25, 0.35, 1.0]); add_quad(&mut verts, -0.38, -0.05, 0.38, 0.04, [0.04, 0.05, 0.07, 1.0]);
             let fill_w = 0.76 * progress_val.clamp(0.0, 1.0); if fill_w > 0.001 { add_quad(&mut verts, -0.38, -0.05, -0.38 + fill_w, 0.04, [0.20, 0.75, 0.90, 1.0]); }
-            draw_text_centered(&mut verts, &format!("{:.0}%", (progress_val * 100.0).clamp(0.0, 100.0)), 0.0, -0.10, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); draw_text_centered(&mut verts, "SVO GENERATOR RUNNING", 0.0, -0.18, 0.85, aspect, [0.5, 0.8, 0.6, 0.9]);
+            draw_text_centered(&mut verts, &format!("{:.0}%", (progress_val * 100.0).clamp(0.0, 100.0)), 0.0, -0.10, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); draw_text_centered(&mut verts, "SOLID SVO GENERATOR ACTIVE", 0.0, -0.18, 0.85, aspect, [0.5, 0.8, 0.6, 0.9]);
         }
     }
     verts
@@ -468,6 +584,7 @@ struct State {
     cursor_pos: [f32; 2], active_slider: Option<usize>, edit_size: f32, last_target: Option<[f32; 3]>, cursor_free: bool, gimbal_dragging: bool, gimbal_drag_moved: bool, prev_cursor_pos: [f32; 2],
     glb_settings: GlbImportSettings, voxelize_rx: Option<mpsc::Receiver<VoxelizeMsg>>, voxelize_progress: f32, voxelize_stage: String, collider: PlayerCollider,
     hide_ui: bool, bg_color: [f32; 3], world_type: WorldType, seed: u32, cube_edits: Vec<CubeEdit>, error_banner: Option<(String, Instant)>,
+    fps: f32, fps_frame_counter: u32, fps_timer: Instant,
 }
 
 impl State {
@@ -614,6 +731,7 @@ impl State {
             last_target: None, cursor_free: false, gimbal_dragging: false, gimbal_drag_moved: false, prev_cursor_pos: [0.0, 0.0],
             glb_settings, voxelize_rx: None, voxelize_progress: 0.0, voxelize_stage: String::new(), collider: PlayerCollider::default(),
             hide_ui: false, bg_color: [0.12, 0.14, 0.18], world_type, seed, cube_edits, error_banner: None,
+            fps: 60.0, fps_frame_counter: 0, fps_timer: Instant::now(),
         };
         app_state.sync_palette_buffer();
         app_state.update_ui();
@@ -846,6 +964,7 @@ impl State {
             self.selected_slot, self.active_menu, &self.hotbar_colors, self.play_mode, self.camera.is_ortho, self.world_type,
             self.edit_size, self.last_target, aspect, self.camera.forward(), self.camera.right(), self.camera.up(), self.cursor_free,
             &self.glb_settings, self.voxelize_progress, &self.voxelize_stage, self.camera.view_proj(aspect), total_voxels, error_msg,
+            self.fps,
         );
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
@@ -869,6 +988,14 @@ impl State {
     }
 
     fn update(&mut self, dt: f32) {
+        self.fps_frame_counter += 1;
+        let elapsed = self.fps_timer.elapsed().as_secs_f32();
+        if elapsed >= 0.25 {
+            self.fps = self.fps_frame_counter as f32 / elapsed;
+            self.fps_frame_counter = 0;
+            self.fps_timer = Instant::now();
+        }
+
         if let Some((_, time)) = self.error_banner {
             if time.elapsed().as_secs() > 7 {
                 self.error_banner = None;
@@ -1097,12 +1224,12 @@ impl ApplicationHandler for App {
                     state.set_menu(ActiveMenu::ImportParams);
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    let ndc_x = (position.x as f32 / state.size.width as f32) * 2.0 - 1.0;
-                    let ndc_y = 1.0 - (position.y as f32 / state.size.height as f32) * 2.0;
-                    state.cursor_pos = [ndc_x, ndc_y];
+                    let mx = (position.x as f32 / state.size.width as f32) * 2.0 - 1.0;
+                    let my = 1.0 - (position.y as f32 / state.size.height as f32) * 2.0;
+                    state.cursor_pos = [mx, my];
                     if state.gimbal_dragging {
-                        let dx = ndc_x - state.prev_cursor_pos[0];
-                        let dy = ndc_y - state.prev_cursor_pos[1];
+                        let dx = mx - state.prev_cursor_pos[0];
+                        let dy = my - state.prev_cursor_pos[1];
                         if dx.abs() > 0.0005 || dy.abs() > 0.0005 {
                             state.gimbal_drag_moved = true;
                             state.camera.yaw += dx * 3.8;
@@ -1112,11 +1239,11 @@ impl ApplicationHandler for App {
                         }
                     } else if state.active_menu == ActiveMenu::Edit {
                         if let Some(channel) = state.active_slider {
-                            state.hotbar_colors[state.selected_slot][channel] = ((ndc_x - -0.32) / (0.18 - -0.32)).clamp(0.0, 1.0);
+                            state.hotbar_colors[state.selected_slot][channel] = ((mx - -0.32) / (0.18 - -0.32)).clamp(0.0, 1.0);
                             state.update_ui();
                         }
                     }
-                    state.prev_cursor_pos = [ndc_x, ndc_y];
+                    state.prev_cursor_pos = [mx, my];
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
                     let step = match delta {
