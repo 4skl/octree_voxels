@@ -78,108 +78,120 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let r_enter = max(max(rtmin3.x, rtmin3.y), rtmin3.z);
     let r_exit = min(min(rtmax3.x, rtmax3.y), rtmax3.z);
 
-    if (r_exit < max(r_enter, 0.0)) {
-        discard;
-    }
-
-    var stack: array<StackNode, 24>;
-    var stack_len: i32 = 1;
-    stack[0] = StackNode(0u, root_min, camera.world_size, max(r_enter, 0.0));
-
     var hit_mat = 0u;
     var hit_normal = vec3<f32>(0.0);
     var hit_t = 1e9;
-    var steps = 0;
-    let total_nodes = arrayLength(&svo_nodes);
 
-    while (stack_len > 0 && steps < 90) {
-        steps = steps + 1;
-        stack_len = stack_len - 1;
-        let curr = stack[stack_len];
+    let root_node = svo_nodes[0];
+    let has_voxels = (root_node.child_mask != 0u || root_node.material_id != 0u);
 
-        if (curr.t_enter >= hit_t || curr.idx >= total_nodes) { continue; }
+    if (has_voxels && r_exit >= max(r_enter, 0.0)) {
+        var stack: array<StackNode, 22>;
+        var stack_len: i32 = 1;
+        stack[0] = StackNode(0u, root_min, camera.world_size, max(r_enter, 0.0));
 
-        let node = svo_nodes[curr.idx];
-        let dist = max(curr.t_enter, 0.001);
-        let proj_pixel_size = (curr.size / dist) * (camera.screen_size.y * 0.5);
-        let is_lod_leaf = (proj_pixel_size <= 1.0);
+        var steps = 0;
+        let total_nodes = arrayLength(&svo_nodes);
 
-        if (node.child_pointer == 0u || is_lod_leaf) {
-            if (node.material_id != 0u) {
-                hit_mat = node.material_id;
-                hit_t = curr.t_enter;
-                let p_hit = ray_orig + ray_dir * curr.t_enter;
-                let c_min = curr.b_min;
-                let c_max = curr.b_min + vec3<f32>(curr.size);
-                let eps = 0.002 * curr.size;
-                if (abs(p_hit.x - c_min.x) < eps) { hit_normal = vec3<f32>(-1.0, 0.0, 0.0); }
-                else if (abs(p_hit.x - c_max.x) < eps) { hit_normal = vec3<f32>(1.0, 0.0, 0.0); }
-                else if (abs(p_hit.y - c_min.y) < eps) { hit_normal = vec3<f32>(0.0, -1.0, 0.0); }
-                else if (abs(p_hit.y - c_max.y) < eps) { hit_normal = vec3<f32>(0.0, 1.0, 0.0); }
-                else if (abs(p_hit.z - c_min.z) < eps) { hit_normal = vec3<f32>(0.0, 0.0, -1.0); }
-                else { hit_normal = vec3<f32>(0.0, 0.0, 1.0); }
-                // Distance-sorted order guarantees closest leaf is found first
-                break;
-            }
-            continue;
-        }
+        while (stack_len > 0 && steps < 128) {
+            steps = steps + 1;
+            stack_len = stack_len - 1;
+            let curr = stack[stack_len];
 
-        let half_s = curr.size * 0.5;
+            if (curr.t_enter >= hit_t || curr.idx >= total_nodes) { continue; }
 
-        // Filter and collect intersected children
-        var count = 0u;
-        var cand_idx: array<u32, 8>;
-        var cand_min: array<vec3<f32>, 8>;
-        var cand_t: array<f32, 8>;
+            let node = svo_nodes[curr.idx];
 
-        for (var i = 0u; i < 8u; i = i + 1u) {
-            if ((node.child_mask & (1u << i)) != 0u) {
-                let offset = vec3<f32>(
-                    select(0.0, half_s, (i & 1u) != 0u),
-                    select(0.0, half_s, (i & 2u) != 0u),
-                    select(0.0, half_s, (i & 4u) != 0u)
-                );
-                let child_min = curr.b_min + offset;
-                let child_max = child_min + vec3<f32>(half_s);
-
-                let t0 = (child_min - ray_orig) * inv_dir;
-                let t1 = (child_max - ray_orig) * inv_dir;
-                let tmin3 = min(t0, t1);
-                let tmax3 = max(t0, t1);
-                let ct_enter = max(max(tmin3.x, tmin3.y), tmin3.z);
-                let ct_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
-
-                if (ct_exit >= max(ct_enter, 0.0) && ct_enter < hit_t) {
-                    cand_idx[count] = node.child_pointer + i;
-                    cand_min[count] = child_min;
-                    cand_t[count] = max(ct_enter, 0.0);
-                    count = count + 1u;
+            if (node.child_pointer == 0u) {
+                if (node.material_id != 0u) {
+                    hit_mat = node.material_id;
+                    hit_t = curr.t_enter;
+                    let p_hit = ray_orig + ray_dir * curr.t_enter;
+                    let c_min = curr.b_min;
+                    let c_max = curr.b_min + vec3<f32>(curr.size);
+                    let eps = 0.002 * curr.size;
+                    if (abs(p_hit.x - c_min.x) < eps) { hit_normal = vec3<f32>(-1.0, 0.0, 0.0); }
+                    else if (abs(p_hit.x - c_max.x) < eps) { hit_normal = vec3<f32>(1.0, 0.0, 0.0); }
+                    else if (abs(p_hit.y - c_min.y) < eps) { hit_normal = vec3<f32>(0.0, -1.0, 0.0); }
+                    else if (abs(p_hit.y - c_max.y) < eps) { hit_normal = vec3<f32>(0.0, 1.0, 0.0); }
+                    else if (abs(p_hit.z - c_min.z) < eps) { hit_normal = vec3<f32>(0.0, 0.0, -1.0); }
+                    else { hit_normal = vec3<f32>(0.0, 0.0, 1.0); }
+                    break;
                 }
+                continue;
             }
-        }
 
-        // Sort candidates descending by t_enter so closest is pushed last and popped first
-        if (count > 1u) {
-            for (var a = 0u; a < count - 1u; a = a + 1u) {
-                for (var b = 0u; b < count - 1u - a; b = b + 1u) {
-                    if (cand_t[b] < cand_t[b + 1u]) {
-                        let tmp_t = cand_t[b]; cand_t[b] = cand_t[b + 1u]; cand_t[b + 1u] = tmp_t;
-                        let tmp_idx = cand_idx[b]; cand_idx[b] = cand_idx[b + 1u]; cand_idx[b + 1u] = tmp_idx;
-                        let tmp_min = cand_min[b]; cand_min[b] = cand_min[b + 1u]; cand_min[b + 1u] = tmp_min;
+            let half_s = curr.size * 0.5;
+
+            var count = 0u;
+            var cand_idx: array<u32, 8>;
+            var cand_min: array<vec3<f32>, 8>;
+            var cand_t: array<f32, 8>;
+
+            for (var i = 0u; i < 8u; i = i + 1u) {
+                if ((node.child_mask & (1u << i)) != 0u) {
+                    let offset = vec3<f32>(
+                        select(0.0, half_s, (i & 1u) != 0u),
+                        select(0.0, half_s, (i & 2u) != 0u),
+                        select(0.0, half_s, (i & 4u) != 0u)
+                    );
+                    let child_min = curr.b_min + offset;
+                    let child_max = child_min + vec3<f32>(half_s);
+
+                    let t0 = (child_min - ray_orig) * inv_dir;
+                    let t1 = (child_max - ray_orig) * inv_dir;
+                    let tmin3 = min(t0, t1);
+                    let tmax3 = max(t0, t1);
+                    let ct_enter = max(max(tmin3.x, tmin3.y), tmin3.z);
+                    let ct_exit  = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+                    if (ct_exit >= max(ct_enter, 0.0) && ct_enter < hit_t) {
+                        cand_idx[count] = node.child_pointer + i;
+                        cand_min[count] = child_min;
+                        cand_t[count] = max(ct_enter, 0.0);
+                        count = count + 1u;
                     }
                 }
             }
-        }
 
-        for (var k = 0u; k < count; k = k + 1u) {
-            if (stack_len < 23) {
-                stack[stack_len] = StackNode(cand_idx[k], cand_min[k], half_s, cand_t[k]);
-                stack_len = stack_len + 1;
+            // Descending insertion sort: keeps closest child on top of LIFO stack without register thrashing
+            for (var a = 1u; a < count; a = a + 1u) {
+                let cur_t = cand_t[a];
+                let cur_idx = cand_idx[a];
+                let cur_min = cand_min[a];
+                var j = a;
+                while (j > 0u && cand_t[j - 1u] < cur_t) {
+                    cand_t[j] = cand_t[j - 1u];
+                    cand_idx[j] = cand_idx[j - 1u];
+                    cand_min[j] = cand_min[j - 1u];
+                    j = j - 1u;
+                }
+                cand_t[j] = cur_t;
+                cand_idx[j] = cur_idx;
+                cand_min[j] = cur_min;
+            }
+
+            for (var k = 0u; k < count; k = k + 1u) {
+                if (stack_len < 21) {
+                    stack[stack_len] = StackNode(cand_idx[k], cand_min[k], half_s, cand_t[k]);
+                    stack_len = stack_len + 1;
+                }
             }
         }
     }
 
     if (hit_mat == 0u) {
+        if (abs(ray_dir.y) > 1e-5) {
+            let t_ground = (-ray_orig.y) / ray_dir.y;
+            if (t_ground > 0.0 && t_ground < 15000.0) {
+                let p_world = ray_orig + ray_dir * t_ground;
+                let grid_coord = abs(fract(p_world.xz * 0.5) - 0.5);
+                let line = smoothstep(0.0, 0.04, min(grid_coord.x, grid_coord.y));
+                let grid_col = mix(vec3<f32>(0.26, 0.30, 0.36), vec3<f32>(0.10, 0.12, 0.15), line);
+                let fog = clamp(t_ground / 15000.0, 0.0, 1.0);
+                return vec4<f32>(mix(grid_col, vec3<f32>(0.12, 0.14, 0.18), fog), 1.0);
+            }
+        }
         discard;
     }
 
