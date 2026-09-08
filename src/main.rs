@@ -642,7 +642,7 @@ impl Vertex {
 }
 
 #[repr(C)] #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct UIVertex { position: [f32; 2], color: [f32; 4] }
+pub struct UIVertex { position: [f32; 2], color: [f32; 4] }
 impl UIVertex {
     const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
     fn desc() -> wgpu::VertexBufferLayout<'static> { wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UIVertex>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex, attributes: &Self::ATTRIBS } }
@@ -928,7 +928,10 @@ impl State {
         let mut size = window.inner_size(); if size.width == 0 || size.height == 0 { size = winit::dpi::PhysicalSize::new(1280, 720); }
         let instance = wgpu::Instance::default(); let surface = instance.create_surface(Arc::clone(&window)).unwrap();
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::default(), compatible_surface: Some(&surface), force_fallback_adapter: false, apply_limit_buckets: Default::default() }).await.unwrap();
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.unwrap();
+        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }).await.unwrap();
         let mut config = surface.get_default_config(&adapter, size.width, size.height).unwrap(); config.present_mode = wgpu::PresentMode::AutoVsync; surface.configure(&device, &config);
 
         let camera = Camera { position: Vec3::new(16.0, 12.0, 26.0), yaw: -std::f32::consts::FRAC_PI_2, pitch: -0.3, is_ortho: false, ortho_size: 36.0 };
@@ -1310,4 +1313,4 @@ pub fn main() {
     env_logger::init();
     let event_loop = EventLoop::new().unwrap(); event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App { state: None, last_frame: Instant::now() }; event_loop.run_app(&mut app).unwrap();
-}
+}   
