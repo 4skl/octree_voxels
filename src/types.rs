@@ -1,15 +1,14 @@
-// types.rs
 use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-pub const CHUNK_SIZE: f32 = 32.0;
+pub const WORLD_SIZE: f32 = 1024.0;
+pub const WORLD_MIN: Vec3 = Vec3::new(-512.0, -512.0, -512.0);
 pub const MAX_DEPTH: u8 = 16;
 pub const GRID_RES: u32 = 1 << MAX_DEPTH;
-pub const MIN_VOXEL_SIZE: f32 = CHUNK_SIZE / (GRID_RES as f32);
+pub const MIN_VOXEL_SIZE: f32 = WORLD_SIZE / (GRID_RES as f32);
+pub const VERTICAL_FOV_DEGREES: f32 = 60.0;
 
-pub type ChunkPos = (i32, i32, i32);
 pub type Palette = Vec<[f32; 3]>;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -64,13 +63,38 @@ pub struct SaveData {
 
 #[derive(Clone)]
 pub struct GlbImportSettings {
-    pub selected_file: Option<PathBuf>, pub target_height: f32,
-    pub voxel_size: f32, pub place_at_aim: bool, pub palette_size: usize,
+    pub selected_file: Option<PathBuf>,
+    pub target_height: f32,
+    pub voxel_size: f32,
+    pub place_at_aim: bool,
+    pub palette_size: usize,
+    pub max_gpu_nodes: usize,
 }
 
 impl Default for GlbImportSettings {
     fn default() -> Self {
-        Self { selected_file: None, target_height: 16.0, voxel_size: 0.25, place_at_aim: true, palette_size: 256 }
+        Self {
+            selected_file: None,
+            target_height: 24.0,
+            voxel_size: 0.25,
+            place_at_aim: true,
+            palette_size: 256,
+            max_gpu_nodes: 30_000_000,
+        }
+    }
+}
+
+impl GlbImportSettings {
+    pub fn estimate_cost(&self) -> (u64, f32) {
+        let grid_h = (self.target_height / self.voxel_size.max(0.01)).round() as u64;
+        let est_voxels = (grid_h * grid_h * 6).min(100_000_000);
+        let est_mb = (est_voxels as f32 * 16.0) / (1024.0 * 1024.0);
+        (est_voxels, est_mb)
+    }
+
+    pub fn is_safe(&self) -> bool {
+        let (est_voxels, _) = self.estimate_cost();
+        (est_voxels as usize) <= self.max_gpu_nodes
     }
 }
 
@@ -84,7 +108,7 @@ impl Camera {
             let half_h = self.ortho_size * 0.5; let half_w = half_h * aspect;
             glam::camera::rh::proj::directx::orthographic(-half_w, half_w, -half_h, half_h, -100000.0, 100000.0)
         } else {
-            glam::camera::rh::proj::directx::perspective((60.0_f32).to_radians(), aspect, 0.05, 100000.0)
+            glam::camera::rh::proj::directx::perspective(VERTICAL_FOV_DEGREES.to_radians(), aspect, 0.05, 100000.0)
         };
         proj * view
     }
@@ -94,18 +118,27 @@ impl Camera {
 }
 
 #[repr(C)] #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct CameraUniform { pub view_proj: [[f32; 4]; 4], pub show_borders: f32, pub _pad: [f32; 3] }
-
-#[repr(C)] #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Vertex { pub position: [f32; 3], pub normal: [f32; 3], pub color: [f32; 3], pub uv: [f32; 2] }
-impl Vertex {
-    pub const ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2];
-    pub fn desc() -> wgpu::VertexBufferLayout<'static> { wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex, attributes: &Self::ATTRIBS } }
+pub struct CameraUniform {
+    pub view_proj: [[f32; 4]; 4],
+    pub inv_view_proj: [[f32; 4]; 4],
+    pub camera_pos: [f32; 3],
+    pub show_borders: f32,
+    pub world_min: [f32; 3],
+    pub world_size: f32,
+    pub is_ortho: f32,
+    pub ortho_size: f32,
+    pub screen_size: [f32; 2],
 }
 
 #[repr(C)] #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct UIVertex { pub position: [f32; 2], pub color: [f32; 4] }
 impl UIVertex {
     pub const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
-    pub fn desc() -> wgpu::VertexBufferLayout<'static> { wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<UIVertex>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex, attributes: &Self::ATTRIBS } }
+    pub fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<UIVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
 }
