@@ -619,28 +619,32 @@ pub struct RaycastHit {
 }
 
 pub fn ray_aabb_intersect(ray_origin: Vec3, ray_dir_inv: Vec3, min: Vec3, max: Vec3) -> Option<(f32, Vec3)> {
-    let mut t_near = f32::NEG_INFINITY;
-    let mut t_far = f32::INFINITY;
-    let mut normal = Vec3::ZERO;
-    for i in 0..3 {
-        let mut t0 = (min[i] - ray_origin[i]) * ray_dir_inv[i];
-        let mut t1 = (max[i] - ray_origin[i]) * ray_dir_inv[i];
-        let mut n0 = Vec3::ZERO; n0[i] = -1.0;
-        let mut n1 = Vec3::ZERO; n1[i] = 1.0;
-        if t0 > t1 { std::mem::swap(&mut t0, &mut t1); std::mem::swap(&mut n0, &mut n1); }
-        if t0 > t_near { t_near = t0; normal = n0; }
-        t_far = t_far.min(t1);
-        if t_near > t_far { return None; }
+    let t0 = (min - ray_origin) * ray_dir_inv;
+    let t1 = (max - ray_origin) * ray_dir_inv;
+    let tmin = t0.min(t1);
+    let tmax = t0.max(t1);
+    
+    let t_near = tmin.max_element();
+    let t_far = tmax.min_element();
+
+    if t_near > t_far || t_far < 0.0 {
+        return None;
     }
-    if t_far >= 0.0 { Some((t_near.max(0.0), normal)) } else { None }
+
+    let mut normal = Vec3::ZERO;
+    if t_near == tmin.x { normal.x = if ray_dir_inv.x < 0.0 { 1.0 } else { -1.0 }; }
+    else if t_near == tmin.y { normal.y = if ray_dir_inv.y < 0.0 { 1.0 } else { -1.0 }; }
+    else { normal.z = if ray_dir_inv.z < 0.0 { 1.0 } else { -1.0 }; }
+
+    Some((t_near.max(0.0), normal))
 }
 
 pub fn raycast_octree(octree: &Octree, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RaycastHit> {
     let dir = dir.normalize();
     let inv_dir = Vec3::new(
-        if dir.x.abs() > 1e-8 { 1.0 / dir.x } else { 1e8 * dir.x.signum() },
-        if dir.y.abs() > 1e-8 { 1.0 / dir.y } else { 1e8 * dir.y.signum() },
-        if dir.z.abs() > 1e-8 { 1.0 / dir.z } else { 1e8 * dir.z.signum() },
+        if dir.x.abs() > 1e-8 { 1.0 / dir.x } else { 1e8 * if dir.x >= 0.0 { 1.0 } else { -1.0 } },
+        if dir.y.abs() > 1e-8 { 1.0 / dir.y } else { 1e8 * if dir.y >= 0.0 { 1.0 } else { -1.0 } },
+        if dir.z.abs() > 1e-8 { 1.0 / dir.z } else { 1e8 * if dir.z >= 0.0 { 1.0 } else { -1.0 } },
     );
 
     let mut closest_dist = max_dist;

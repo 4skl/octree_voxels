@@ -312,7 +312,6 @@ fn run_background_voxelization(
 
     let _ = tx.send(VoxelizeMsg::Progress { percent: 0.95, stage: "SORTING MORTON SPATIAL CURVE...".into() });
 
-    // Morton curve sorting preserves cache locality during hierarchical tree insertion
     voxel_nodes.par_sort_unstable_by_key(|(pos, s, _)| {
         let gx = (pos.x / s).round() as i32;
         let gy = (pos.y / s).round() as i32;
@@ -456,11 +455,14 @@ fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspec
     }
 }
 
+const HOTBAR_LABELS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+
 fn build_ui_vertices(
     selected_slot: usize, active_menu: ActiveMenu, hotbar_colors: &[[f32; 3]; 10], play_mode: PlayMode, is_ortho: bool, world_type: WorldType,
     edit_size: f32, target_pos: Option<[f32; 3]>, aspect: f32, camera_forward: Vec3, camera_right: Vec3, camera_up: Vec3,
-    _cursor_free: bool, glb_settings: &GlbImportSettings, progress_val: f32, progress_stage: &str, view_proj: Mat4, total_voxels: usize,
-    error_banner: Option<&str>, fps: f32, tool_state: &ToolState, undo_depth: usize, redo_depth: usize
+    _cursor_free: bool, glb_settings: &GlbImportSettings, progress_val: f32, progress_stage: &str, view_proj: Mat4, 
+    error_banner: Option<&str>, tool_state: &ToolState,
+    hud_status: &str, hud_tools: &str, size_str: &str, glb_cost_str: &str
 ) -> Vec<UIVertex> {
     let mut verts = Vec::new();
     let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let g_rad = GIZMO_RADIUS; let disc_rx = (g_rad + 0.018) / aspect; let disc_ry = g_rad + 0.018;
@@ -493,11 +495,8 @@ fn build_ui_vertices(
         let x0 = start_x + i as f32 * (slot_w + slot_gap); let x1 = x0 + slot_w;
         if selected_slot == i { add_quad(&mut verts, x0 - 0.006, y_bottom - 0.006, x1 + 0.006, y_top + 0.006, [1.0, 0.9, 0.1, 1.0]); } else { add_quad(&mut verts, x0 - 0.003, y_bottom - 0.003, x1 + 0.003, y_top + 0.003, [0.15, 0.16, 0.20, 0.9]); }
         add_quad(&mut verts, x0, y_bottom, x1, y_top, [rgb[0], rgb[1], rgb[2], 1.0]);
-        let num_str = if i == 9 { "0".to_string() } else { format!("{}", i + 1) };
-        draw_text_centered(&mut verts, &num_str, (x0 + x1) / 2.0, y_top + 0.02, 1.0, aspect, [0.9, 0.9, 0.9, 0.9]);
+        draw_text_centered(&mut verts, HOTBAR_LABELS[i], (x0 + x1) / 2.0, y_top + 0.02, 1.0, aspect, [0.9, 0.9, 0.9, 0.9]);
     }
-
-    let size_str = if edit_size < 0.001 { format!("RES: {:.1e}", edit_size) } else if edit_size < 1.0 { format!("RES: 1/{} ({:.4})", (1.0 / edit_size).round() as u32, edit_size) } else { format!("RES: {:.0}X{:.0}", edit_size, edit_size) };
 
     if active_menu == ActiveMenu::None {
         if let Some(pos) = target_pos {
@@ -545,14 +544,10 @@ fn build_ui_vertices(
         draw_text_centered(&mut verts, err, 0.0, 0.74, 0.95, aspect, [1.0, 1.0, 1.0, 1.0]);
     }
 
-    let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
-    let fps_str = format!("{:.0} FPS ({:.1}MS)", fps, frame_ms);
-
     match active_menu {
         ActiveMenu::None => {
-            draw_text(&mut verts, &format!("{} | MODE: {} | PROJ: {} | WORLD: {} | VOXELS: {} | {}", fps_str, if play_mode == PlayMode::Flying { "FLY" } else { "REAL" }, if is_ortho { "ORTHO" } else { "PERSP" }, world_type.name(), format_voxel_count(total_voxels), size_str), -0.96, 0.92, 1.25, aspect, [1.0, 1.0, 1.0, 0.95]);
-            let tool_str = format!("TOOL: {} | RAD: {:.1} | UNDO: {} | REDO: {}", tool_state.active_tool.name(), tool_state.brush_radius, undo_depth, redo_depth);
-            draw_text(&mut verts, &tool_str, -0.96, 0.86, 1.0, aspect, [0.3, 0.9, 1.0, 0.95]);
+            draw_text(&mut verts, hud_status, -0.96, 0.92, 1.25, aspect, [1.0, 1.0, 1.0, 0.95]);
+            draw_text(&mut verts, hud_tools, -0.96, 0.86, 1.0, aspect, [0.3, 0.9, 1.0, 0.95]);
             draw_text(&mut verts, "[MMB] ORBIT  [SHIFT+MMB] PAN  [CTRL+MMB/WHEEL] ZOOM  [NUM 1/3/7/9/2/4/6/8] BLENDER NAV  [C] PICK  [CTRL+Z/Y] UNDO/REDO", -0.96, 0.80, 0.95, aspect, [0.9, 0.85, 0.4, 0.85]);
         }
         ActiveMenu::Edit => {
@@ -563,7 +558,7 @@ fn build_ui_vertices(
                 let sx0 = s_start_x + i as f32 * (sw_w + sw_gap); let sx1 = sx0 + sw_w;
                 if selected_slot == i { add_quad(&mut verts, sx0 - 0.008, 0.422, sx1 + 0.008, 0.528, [1.0, 0.9, 0.1, 1.0]); } else { add_quad(&mut verts, sx0 - 0.004, 0.426, sx1 + 0.004, 0.524, [0.22, 0.24, 0.30, 1.0]); }
                 add_quad(&mut verts, sx0, 0.43, sx1, 0.52, [rgb[0], rgb[1], rgb[2], 1.0]);
-                let num_str = if i == 9 { "0".to_string() } else { format!("{}", i + 1) }; draw_text_centered(&mut verts, &num_str, (sx0 + sx1) / 2.0, 0.542, 1.0, aspect, [0.8, 0.8, 0.8, 0.9]);
+                draw_text_centered(&mut verts, HOTBAR_LABELS[i], (sx0 + sx1) / 2.0, 0.542, 1.0, aspect, [0.8, 0.8, 0.8, 0.9]);
             }
             let [cur_r, cur_g, cur_b] = hotbar_colors[selected_slot]; add_quad(&mut verts, 0.24, 0.18, 0.46, 0.37, [0.25, 0.28, 0.35, 1.0]); add_quad(&mut verts, 0.248, 0.188, 0.452, 0.362, [cur_r, cur_g, cur_b, 1.0]); draw_text_centered(&mut verts, "ACTIVE COLOR", 0.35, 0.39, 1.0, aspect, [0.85, 0.85, 0.85, 0.9]);
             for (lbl, val, y0, y1, bar_col) in [("R", cur_r, 0.32, 0.36, [0.90, 0.25, 0.25, 1.0]), ("G", cur_g, 0.25, 0.29, [0.25, 0.85, 0.30, 1.0]), ("B", cur_b, 0.18, 0.22, [0.25, 0.50, 0.95, 1.0])] {
@@ -572,7 +567,9 @@ fn build_ui_vertices(
             draw_text_centered(&mut verts, "QUICK PALETTE CHIPS", 0.0, 0.135, 1.0, aspect, [0.75, 0.75, 0.8, 0.9]);
             let pw_w = 0.076; let pw_gap = 0.012; let pw_tot = 10.0 * pw_w + 9.0 * pw_gap; let pw_start_x = -pw_tot / 2.0;
             for (i, &rgb) in PRESET_SWATCHES.iter().enumerate() { let px0 = pw_start_x + i as f32 * (pw_w + pw_gap); add_quad(&mut verts, px0 - 0.003, 0.047, px0 + pw_w + 0.003, 0.113, [0.3, 0.3, 0.35, 1.0]); add_quad(&mut verts, px0, 0.05, px0 + pw_w, 0.11, [rgb[0], rgb[1], rgb[2], 1.0]); }
-            add_quad(&mut verts, -0.40, -0.10, -0.22, -0.02, [0.35, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "/ 2 (F)", -0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); draw_text_centered(&mut verts, &format!("CURRENT: {}", size_str), 0.0, -0.06, 1.25, aspect, [1.0, 0.85, 0.2, 1.0]); add_quad(&mut verts, 0.22, -0.10, 0.40, -0.02, [0.35, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "* 2 (R)", 0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); add_quad(&mut verts, -0.22, -0.25, 0.22, -0.17, [0.20, 0.50, 0.30, 1.0]); draw_text_centered(&mut verts, "DONE (PRESS E)", 0.0, -0.21, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.40, -0.10, -0.22, -0.02, [0.35, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "/ 2 (F)", -0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); 
+            draw_text_centered(&mut verts, &format!("CURRENT: {}", size_str), 0.0, -0.06, 1.25, aspect, [1.0, 0.85, 0.2, 1.0]); 
+            add_quad(&mut verts, 0.22, -0.10, 0.40, -0.02, [0.35, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "* 2 (R)", 0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); add_quad(&mut verts, -0.22, -0.25, 0.22, -0.17, [0.20, 0.50, 0.30, 1.0]); draw_text_centered(&mut verts, "DONE (PRESS E)", 0.0, -0.21, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
         ActiveMenu::Pause => {
             add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.80]); add_quad(&mut verts, -0.426, -0.726, 0.426, 0.726, [0.45, 0.45, 0.50, 1.0]); add_quad(&mut verts, -0.42, -0.72, 0.42, 0.72, [0.12, 0.13, 0.17, 0.98]);
@@ -627,16 +624,12 @@ fn build_ui_vertices(
             draw_text(&mut verts, "PLACEMENT ANCHOR:", -0.38, -0.29, 1.0, aspect, [0.8, 0.8, 0.8, 1.0]);
             add_quad(&mut verts, -0.38, -0.39, 0.38, -0.31, [0.18, 0.24, 0.34, 1.0]); draw_text_centered(&mut verts, if glb_settings.place_at_aim { "CROSSHAIR / RAYCAST AIM" } else { "AT PLAYER POSITION" }, 0.0, -0.35, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
 
-            let (est_count, est_mb) = glb_settings.estimate_cost();
-            let is_safe = glb_settings.is_safe();
-            let max_nodes = glb_settings.max_gpu_nodes;
-            let cost_str = format!("EST: ~{} VOXELS ({:.0} MB SVO) | HW LIMIT: {}", format_voxel_count(est_count as usize), est_mb, format_voxel_count(max_nodes));
-            let cost_col = if is_safe { [0.3, 0.9, 0.4, 1.0] } else { [0.95, 0.25, 0.2, 1.0] };
-            draw_text_centered(&mut verts, &cost_str, 0.0, -0.42, 0.85, aspect, cost_col);
+            let cost_col = if glb_settings.is_safe() { [0.3, 0.9, 0.4, 1.0] } else { [0.95, 0.25, 0.2, 1.0] };
+            draw_text_centered(&mut verts, glb_cost_str, 0.0, -0.42, 0.85, aspect, cost_col);
 
-            let btn_col = if glb_settings.selected_file.is_some() && is_safe { [0.20, 0.60, 0.30, 1.0] } else { [0.35, 0.20, 0.20, 0.8] };
+            let btn_col = if glb_settings.selected_file.is_some() && glb_settings.is_safe() { [0.20, 0.60, 0.30, 1.0] } else { [0.35, 0.20, 0.20, 0.8] };
             add_quad(&mut verts, -0.38, -0.54, 0.38, -0.44, btn_col);
-            draw_text_centered(&mut verts, if is_safe { "VOXELIZE & INSERT (SOLID)" } else { "TOO DENSE (REDUCE SETTINGS)" }, 0.0, -0.49, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
+            draw_text_centered(&mut verts, if glb_settings.is_safe() { "VOXELIZE & INSERT (SOLID)" } else { "TOO DENSE (REDUCE SETTINGS)" }, 0.0, -0.49, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, -0.38, -0.66, 0.38, -0.56, [0.45, 0.22, 0.22, 1.0]); draw_text_centered(&mut verts, "CANCEL (ESC)", 0.0, -0.61, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
         ActiveMenu::Voxelizing => {
@@ -981,7 +974,7 @@ impl State {
         self.world_type = data.world_type;
         self.seed = data.seed;
         
-        self.octree = data.octree; // Charge l'arbre exact
+        self.octree = data.octree;
         self.history = HistoryManager::new(64);
         
         self.sync_svo_buffer_full();
@@ -1043,11 +1036,19 @@ impl State {
         let total_voxels = self.octree.total_voxels;
         let error_msg = self.error_banner.as_ref().map(|(msg, _)| msg.as_str());
 
+        let size_str = if self.edit_size < 0.001 { format!("RES: {:.1e}", self.edit_size) } else if self.edit_size < 1.0 { format!("RES: 1/{} ({:.4})", (1.0 / self.edit_size).round() as u32, self.edit_size) } else { format!("RES: {:.0}X{:.0}", self.edit_size, self.edit_size) };
+        let frame_ms = if self.fps > 0.0 { 1000.0 / self.fps } else { 0.0 };
+        let hud_status = format!("{:.0} FPS ({:.1}MS) | MODE: {} | PROJ: {} | WORLD: {} | VOXELS: {} | {}", self.fps, frame_ms, if self.play_mode == PlayMode::Flying { "FLY" } else { "REAL" }, if self.camera.is_ortho { "ORTHO" } else { "PERSP" }, self.world_type.name(), format_voxel_count(total_voxels), size_str);
+        let hud_tools = format!("TOOL: {} | RAD: {:.1} | UNDO: {} | REDO: {}", self.tool_state.active_tool.name(), self.tool_state.brush_radius, self.history.undo_stack.len(), self.history.redo_stack.len());
+        
+        let (est_count, est_mb) = self.glb_settings.estimate_cost();
+        let glb_cost_str = format!("EST: ~{} VOXELS ({:.0} MB SVO) | HW LIMIT: {}", format_voxel_count(est_count as usize), est_mb, format_voxel_count(self.glb_settings.max_gpu_nodes));
+
         let verts = build_ui_vertices(
             self.selected_slot, self.active_menu, &self.hotbar_colors, self.play_mode, self.camera.is_ortho, self.world_type,
             self.edit_size, self.last_target, aspect, self.camera.forward(), self.camera.right(), self.camera.up(), self.cursor_free,
-            &self.glb_settings, self.voxelize_progress, &self.voxelize_stage, self.camera.view_proj(aspect), total_voxels, error_msg,
-            self.fps, &self.tool_state, self.history.undo_stack.len(), self.history.redo_stack.len()
+            &self.glb_settings, self.voxelize_progress, &self.voxelize_stage, self.camera.view_proj(aspect), error_msg,
+            &self.tool_state, &hud_status, &hud_tools, &size_str, &glb_cost_str
         );
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
@@ -1071,7 +1072,6 @@ impl State {
         let mat = if is_removal { 0 } else { self.get_or_create_material(self.hotbar_colors[self.selected_slot]) };
         let s = self.edit_size;
 
-        // Calcul de l'AABB pour l'action de l'outil
         let (aabb_min, aabb_max) = match self.tool_state.active_tool {
             ToolType::Sphere => (target_vec - Vec3::splat(self.tool_state.brush_radius), target_vec + Vec3::splat(self.tool_state.brush_radius)),
             ToolType::Box | ToolType::Line => {
@@ -1081,7 +1081,6 @@ impl State {
             _ => (target_vec, target_vec + Vec3::splat(s)),
         };
 
-        // Capture de l'état précédent
         let mut removed = Vec::new();
         self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut removed);
 
@@ -1126,11 +1125,9 @@ impl State {
             }
         }
 
-        // Capture du nouvel état après l'action de l'outil
         let mut added = Vec::new();
         self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut added);
 
-        // Enregistrement dans l'historique et synchronisation
         self.history.record(HistoryAction { removed, added });
         self.sync_svo_buffer();
     }
@@ -1151,27 +1148,33 @@ impl State {
             }
         }
 
+        let mut ui_needs_update = false;
         let mut messages = Vec::new();
-        if let Some(ref rx) = self.voxelize_rx { while let Ok(msg) = rx.try_recv() { messages.push(msg); } }
+        if let Some(ref rx) = self.voxelize_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    VoxelizeMsg::Progress { percent, stage } => {
+                        self.voxelize_progress = percent;
+                        self.voxelize_stage = stage;
+                        ui_needs_update = true;
+                    }
+                    VoxelizeMsg::Done(res) => {
+                        messages.push(VoxelizeMsg::Done(res));
+                    }
+                }
+            }
+        }
+        if ui_needs_update {
+            self.update_ui();
+        }
+
         for msg in messages {
             match msg {
-                VoxelizeMsg::Progress { percent, stage } => {
-                    self.voxelize_progress = percent;
-                    self.voxelize_stage = stage;
-                    self.update_ui();
-                }
                 VoxelizeMsg::Done(Ok(voxels)) => {
-                    let mut deltas = Vec::with_capacity(voxels.len());
                     for (pos, size, mat) in voxels {
                         self.octree.ensure_bounds(pos, size);
                         let old_mat = self.octree.query_point(pos);
                         if old_mat != mat {
-                            deltas.push(VoxelDelta {
-                                pos: pos.to_array(),
-                                size,
-                                old_material: old_mat,
-                                new_material: mat,
-                            });
                             self.octree.insert_cube_world(pos, size, mat, false);
                         }
                     }
@@ -1191,6 +1194,7 @@ impl State {
                     self.set_menu(ActiveMenu::ImportParams);
                     return;
                 }
+                _ => {}
             }
         }
 
@@ -1446,22 +1450,20 @@ impl ApplicationHandler for App {
 
                         if is_z {
                             if state.input.shift_pressed {
-                                // REDO
-                                if let Some(action) = state.history.redo_stack.pop() {
+                                if let Some(action) = state.history.redo_stack.pop_back() {
                                     for &(p, sz, _) in &action.removed { state.octree.insert_cube_world(p, sz, 0, false); }
                                     for &(p, sz, m) in &action.added { state.octree.insert_cube_world(p, sz, m, false); }
                                     state.octree.collapse(state.octree.root_index as usize);
-                                    state.history.undo_stack.push(action);
+                                    state.history.undo_stack.push_back(action);
                                     state.sync_svo_buffer_full();
                                     state.update_ui();
                                     state.window.request_redraw();
                                 }
-                            } else if let Some(action) = state.history.undo_stack.pop() {
-                                // UNDO
+                            } else if let Some(action) = state.history.undo_stack.pop_back() {
                                 for &(p, sz, _) in &action.added { state.octree.insert_cube_world(p, sz, 0, false); }
                                 for &(p, sz, m) in &action.removed { state.octree.insert_cube_world(p, sz, m, false); }
                                 state.octree.collapse(state.octree.root_index as usize);
-                                state.history.redo_stack.push(action);
+                                state.history.redo_stack.push_back(action);
                                 state.sync_svo_buffer_full();
                                 state.update_ui();
                                 state.window.request_redraw();
@@ -1470,11 +1472,11 @@ impl ApplicationHandler for App {
                         }
 
                         if is_y {
-                            if let Some(action) = state.history.redo_stack.pop() {
+                            if let Some(action) = state.history.redo_stack.pop_back() {
                                 for &(p, sz, _) in &action.removed { state.octree.insert_cube_world(p, sz, 0, false); }
                                 for &(p, sz, m) in &action.added { state.octree.insert_cube_world(p, sz, m, false); }
                                 state.octree.collapse(state.octree.root_index as usize);
-                                state.history.undo_stack.push(action);
+                                state.history.undo_stack.push_back(action);
                                 state.sync_svo_buffer_full();
                                 state.update_ui();
                                 state.window.request_redraw();
@@ -1520,7 +1522,6 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::Numpad1) => {
                                 state.camera.yaw = if state.input.ctrl_pressed { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
                                 state.camera.pitch = 0.0;
-                                state.camera.is_ortho = true;
                                 state.update_orbit_position();
                                 state.window.request_redraw();
                                 return;
@@ -1528,7 +1529,6 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::Numpad3) => {
                                 state.camera.yaw = if state.input.ctrl_pressed { 0.0 } else { std::f32::consts::PI };
                                 state.camera.pitch = 0.0;
-                                state.camera.is_ortho = true;
                                 state.update_orbit_position();
                                 state.window.request_redraw();
                                 return;
@@ -1536,7 +1536,6 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::Numpad7) => {
                                 state.camera.yaw = -std::f32::consts::FRAC_PI_2;
                                 state.camera.pitch = if state.input.ctrl_pressed { 1.56 } else { -1.56 };
-                                state.camera.is_ortho = true;
                                 state.update_orbit_position();
                                 state.window.request_redraw();
                                 return;
@@ -1808,7 +1807,6 @@ impl ApplicationHandler for App {
                     state.update(dt);
                     state.render();
 
-                    // Keep render loop continuous only while active async background work or drag interactions occur
                     if state.voxelize_rx.is_some() || state.mmb_dragging || state.gimbal_dragging || state.error_banner.is_some() {
                         state.window.request_redraw();
                     }

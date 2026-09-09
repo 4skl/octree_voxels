@@ -1,6 +1,7 @@
 use glam::{Mat4, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::collections::VecDeque;
 
 pub const MAX_DEPTH: u8 = 16;
 pub const VERTICAL_FOV_DEGREES: f32 = 60.0;
@@ -95,20 +96,20 @@ pub struct HistoryAction {
 }
 
 pub struct HistoryManager {
-    pub undo_stack: Vec<HistoryAction>,
-    pub redo_stack: Vec<HistoryAction>,
+    pub undo_stack: VecDeque<HistoryAction>,
+    pub redo_stack: VecDeque<HistoryAction>,
     pub max_history: usize,
 }
 
 impl HistoryManager {
     pub fn new(max_history: usize) -> Self {
-        Self { undo_stack: Vec::with_capacity(max_history), redo_stack: Vec::new(), max_history }
+        Self { undo_stack: VecDeque::with_capacity(max_history), redo_stack: VecDeque::new(), max_history }
     }
 
     pub fn record(&mut self, action: HistoryAction) {
         if action.removed.is_empty() && action.added.is_empty() { return; }
-        if self.undo_stack.len() >= self.max_history { self.undo_stack.remove(0); }
-        self.undo_stack.push(action);
+        if self.undo_stack.len() >= self.max_history { self.undo_stack.pop_front(); }
+        self.undo_stack.push_back(action);
         self.redo_stack.clear();
     }
 }
@@ -260,7 +261,6 @@ impl Camera {
         if self.is_ortho {
             let p_near = inv_vp * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
             let dir = self.forward();
-            // Match shader push-back
             let orig = p_near.truncate() / p_near.w - dir * 2000.0; 
             (orig, dir)
         } else {

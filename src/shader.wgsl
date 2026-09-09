@@ -56,7 +56,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let ro = p_near.xyz / p_near.w;
         ray_dir = normalize((p_far.xyz / p_far.w) - ro);
         
-        // Push the ray origin back to prevent near-plane clipping precision issues
         ray_orig = ro - ray_dir * 2000.0;
     } else {
         let p_far = camera.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
@@ -66,9 +65,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let inv_dir = vec3<f32>(
-        select(1.0 / ray_dir.x, 1e7 * sign(ray_dir.x), abs(ray_dir.x) < 1e-6),
-        select(1.0 / ray_dir.y, 1e7 * sign(ray_dir.y), abs(ray_dir.y) < 1e-6),
-        select(1.0 / ray_dir.z, 1e7 * sign(ray_dir.z), abs(ray_dir.z) < 1e-6),
+        select(1.0 / ray_dir.x, select(-1e7, 1e7, ray_dir.x >= 0.0), abs(ray_dir.x) < 1e-8),
+        select(1.0 / ray_dir.y, select(-1e7, 1e7, ray_dir.y >= 0.0), abs(ray_dir.y) < 1e-8),
+        select(1.0 / ray_dir.z, select(-1e7, 1e7, ray_dir.z >= 0.0), abs(ray_dir.z) < 1e-8),
     );
 
     let root_min = camera.world_min;
@@ -84,8 +83,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit_mat = 0u;
     var hit_normal = vec3<f32>(0.0);
     var hit_t = 1e9;
-    var hit_b_min = vec3<f32>(0.0); // Save bounding box min
-    var hit_size = 0.0;             // Save voxel size
+    var hit_b_min = vec3<f32>(0.0);
+    var hit_size = 0.0;
 
     let root_node = svo_nodes[0];
     let has_voxels = (root_node.child_mask != 0u || root_node.material_id != 0u);
@@ -111,7 +110,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 if (node.material_id != 0u) {
                     let p_hit = ray_orig + ray_dir * curr.t_enter;
                     
-                    // Skip the face to allow the ray to pass through
                     if (camera.show_borders > 0.5) {
                         let local_p = saturate((p_hit - curr.b_min) / curr.size);
                         let dist_x = min(local_p.x, 1.0 - local_p.x);
@@ -175,7 +173,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 }
             }
 
-            // Descending insertion sort: keeps closest child on top of LIFO stack without register thrashing
             for (var a = 1u; a < count; a = a + 1u) {
                 let cur_t = cand_t[a];
                 let cur_idx = cand_idx[a];
