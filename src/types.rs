@@ -259,8 +259,9 @@ impl Camera {
         let inv_vp = self.view_proj(aspect).inverse();
         if self.is_ortho {
             let p_near = inv_vp * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
-            let orig = p_near.truncate() / p_near.w;
             let dir = self.forward();
+            // Match shader push-back
+            let orig = p_near.truncate() / p_near.w - dir * 2000.0; 
             (orig, dir)
         } else {
             let p_near = inv_vp * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);

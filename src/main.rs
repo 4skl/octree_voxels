@@ -331,6 +331,7 @@ struct InputState {
     action_pick: bool,
     ctrl_pressed: bool,
     shift_pressed: bool,
+    wireframe_mode: bool,
 }
 
 fn add_quad(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 4]) {
@@ -595,7 +596,7 @@ fn build_ui_vertices(
             draw_text_centered(&mut verts, "NUMPAD 2 / 4 / 6 / 8 = ORBIT DOWN / LEFT / RIGHT / UP (15 DEG)", 0.0, 0.32, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
             draw_text_centered(&mut verts, "NUMPAD 9 = OPPOSITE VIEW  |  NUMPAD 1/3/7 = FRONT/RIGHT/TOP", 0.0, 0.22, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
             draw_text_centered(&mut verts, "CTRL + Z = UNDO  |  CTRL + SHIFT + Z / CTRL + Y = REDO", 0.0, 0.12, 0.95, aspect, [1.0, 0.85, 0.3, 1.0]);
-            draw_text_centered(&mut verts, "V = PENCIL  |  O = SPHERE  |  B = BOX  |  L = LINE  |  K = PAINT", 0.0, 0.02, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
+            draw_text_centered(&mut verts, "V = PENCIL  |  O = SPHERE  |  B = BOX  |  L = LINE  |  K = PAINT  |  X = WIREFRAME", 0.0, 0.02, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
             draw_text_centered(&mut verts, "LMB = APPLY TOOL  |  RMB = ERASE TOOL  |  C = PICK COLOR AT CURSOR", 0.0, -0.08, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
             draw_text_centered(&mut verts, "NUMPAD . / [.] = FOCUS ON SCENE  |  NUMPAD 5 = ORTHO / PERSP", 0.0, -0.18, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
             add_quad(&mut verts, -0.30, -0.66, 0.30, -0.56, [0.45, 0.22, 0.22, 1.0]); draw_text_centered(&mut verts, "BACK (ESC)", 0.0, -0.61, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
@@ -937,7 +938,7 @@ impl State {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             camera_pos: self.camera.position.to_array(),
-            show_borders: if self.cursor_free || self.active_menu == ActiveMenu::Edit { 1.0 } else { 0.0 },
+            show_borders: if self.input.wireframe_mode { 1.0 } else { 0.0 },
             world_min: self.octree.world_min.to_array(),
             world_size: self.octree.world_size,
             is_ortho: if self.camera.is_ortho { 1.0 } else { 0.0 },
@@ -1563,6 +1564,13 @@ impl ApplicationHandler for App {
 
                         match key_event.physical_key {
                             PhysicalKey::Code(KeyCode::KeyV) => { state.tool_state.active_tool = ToolType::Pencil; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyX) => { 
+                                state.input.wireframe_mode = !state.input.wireframe_mode; 
+                                state.update_camera_buffer(); 
+                                state.update_ui(); 
+                                state.window.request_redraw(); 
+                                return; 
+                            }
                             PhysicalKey::Code(KeyCode::KeyO) => { state.tool_state.active_tool = ToolType::Sphere; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyB) => { state.tool_state.active_tool = ToolType::Box; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyL) => { state.tool_state.active_tool = ToolType::Line; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }

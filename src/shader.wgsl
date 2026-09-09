@@ -53,8 +53,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (camera.is_ortho > 0.5) {
         let p_near = camera.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
         let p_far  = camera.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
-        ray_orig = p_near.xyz / p_near.w;
-        ray_dir = normalize((p_far.xyz / p_far.w) - ray_orig);
+        let ro = p_near.xyz / p_near.w;
+        ray_dir = normalize((p_far.xyz / p_far.w) - ro);
+        
+        // Push the ray origin back to prevent near-plane clipping precision issues
+        ray_orig = ro - ray_dir * 2000.0;
     } else {
         let p_far = camera.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
         let p_world = p_far.xyz / p_far.w;
@@ -81,6 +84,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit_mat = 0u;
     var hit_normal = vec3<f32>(0.0);
     var hit_t = 1e9;
+    var hit_b_min = vec3<f32>(0.0); // Save bounding box min
+    var hit_size = 0.0;             // Save voxel size
 
     let root_node = svo_nodes[0];
     let has_voxels = (root_node.child_mask != 0u || root_node.material_id != 0u);
@@ -104,9 +109,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
             if (node.child_pointer == 0u) {
                 if (node.material_id != 0u) {
+                    let p_hit = ray_orig + ray_dir * curr.t_enter;
+                    
+                    // Skip the face to allow the ray to pass through
+                    if (camera.show_borders > 0.5) {
+                        let local_p = saturate((p_hit - curr.b_min) / curr.size);
+                        let dist_x = min(local_p.x, 1.0 - local_p.x);
+                        let dist_y = min(local_p.y, 1.0 - local_p.y);
+                        let dist_z = min(local_p.z, 1.0 - local_p.z);
+                        let edge_thresh = 0.03; 
+                        
+                        if (!((dist_x < edge_thresh && dist_y < edge_thresh) ||
+                              (dist_y < edge_thresh && dist_z < edge_thresh) ||
+                              (dist_z < edge_thresh && dist_x < edge_thresh))) {
+                            continue; 
+                        }
+                    }
+
                     hit_mat = node.material_id;
                     hit_t = curr.t_enter;
-                    let p_hit = ray_orig + ray_dir * curr.t_enter;
                     let c_min = curr.b_min;
                     let c_max = curr.b_min + vec3<f32>(curr.size);
                     let eps = 0.002 * curr.size;
