@@ -308,11 +308,15 @@ pub struct CameraUniform {
     pub show_borders: f32,
     pub world_min: [f32; 3],
     pub world_size: f32,
+    pub tight_min: [f32; 3],
+    pub has_voxels: f32,
+    pub tight_max: [f32; 3],
+    pub _pad0: f32,
     pub is_ortho: f32,
     pub ortho_size: f32,
     pub screen_size: [f32; 2],
     pub bg_color: [f32; 3],
-    pub _pad: f32,
+    pub _pad1: f32,
 }
 
 #[repr(C)]

@@ -21,6 +21,10 @@ pub struct Octree {
     pub total_voxels: usize,
     pub world_min: Vec3,
     pub world_size: f32,
+    #[serde(default)]
+    pub tight_min: Vec3,
+    #[serde(default)]
+    pub tight_max: Vec3,
 }
 
 impl Octree {
@@ -37,6 +41,8 @@ impl Octree {
             total_voxels: 0,
             world_min: Vec3::new(-256.0, -256.0, -256.0),
             world_size: 512.0,
+            tight_min: Vec3::ZERO,
+            tight_max: Vec3::ZERO,
         }
     }
 
@@ -53,6 +59,19 @@ impl Octree {
         let total_pages = (self.nodes.len() + SVO_PAGE_SIZE - 1) / SVO_PAGE_SIZE;
         for p in 0..total_pages {
             self.dirty_pages.insert(p);
+        }
+    }
+
+    pub fn update_bounds(&mut self) {
+        let mut min_bound = Vec3::splat(f32::MAX);
+        let mut max_bound = Vec3::splat(f32::MIN);
+        let has = self.compute_voxel_bounds(self.root_index as usize, self.world_min, self.world_size, &mut min_bound, &mut max_bound);
+        if has {
+            self.tight_min = min_bound;
+            self.tight_max = max_bound;
+        } else {
+            self.tight_min = Vec3::ZERO;
+            self.tight_max = Vec3::ZERO;
         }
     }
 
@@ -334,6 +353,7 @@ impl Octree {
 
     pub fn recalculate_voxel_count(&mut self) {
         self.total_voxels = self.count_occupied_voxels(self.root_index as usize);
+        self.update_bounds();
     }
 
     pub fn count_occupied_voxels(&self, node_idx: usize) -> usize {
@@ -721,12 +741,20 @@ pub fn ray_aabb_intersect(ray_origin: Vec3, ray_dir_inv: Vec3, min: Vec3, max: V
 }
 
 pub fn raycast_octree(octree: &Octree, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RaycastHit> {
+    if octree.total_voxels == 0 {
+        return None;
+    }
+
     let dir = dir.normalize();
     let inv_dir = Vec3::new(
         if dir.x.abs() > 1e-8 { 1.0 / dir.x } else { 1e8 * if dir.x >= 0.0 { 1.0 } else { -1.0 } },
         if dir.y.abs() > 1e-8 { 1.0 / dir.y } else { 1e8 * if dir.y >= 0.0 { 1.0 } else { -1.0 } },
         if dir.z.abs() > 1e-8 { 1.0 / dir.z } else { 1e8 * if dir.z >= 0.0 { 1.0 } else { -1.0 } },
     );
+
+    if ray_aabb_intersect(origin, inv_dir, octree.tight_min, octree.tight_max).is_none() {
+        return None;
+    }
 
     let mut closest_dist = max_dist;
     raycast_node(octree, octree.root_index as usize, origin, dir, inv_dir, octree.world_min, octree.world_size, &mut closest_dist)

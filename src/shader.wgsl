@@ -5,11 +5,15 @@ struct CameraUniform {
     show_borders: f32,
     world_min: vec3<f32>,
     world_size: f32,
+    tight_min: vec3<f32>,
+    has_voxels: f32,
+    tight_max: vec3<f32>,
+    _pad0: f32,
     is_ortho: f32,
     ortho_size: f32,
     screen_size: vec2<f32>,
     bg_color: vec3<f32>,
-    _pad: f32,
+    _pad1: f32,
 };
 
 struct SvoNode {
@@ -40,13 +44,29 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
 
 struct DDAStackEntry {
     idx: u32,
-    b_min: vec3<f32>,
-    size: f32,
+    b_min_x: f32,
+    b_min_y: f32,
+    b_min_z: f32,
     t_exit_x: f32,
     t_exit_y: f32,
     t_exit_z: f32,
     octant: u32,
 };
+
+fn render_background(ray_orig: vec3<f32>, ray_dir: vec3<f32>) -> vec4<f32> {
+    if (abs(ray_dir.y) > 1e-5) {
+        let t_ground = (-ray_orig.y) / ray_dir.y;
+        if (t_ground > 0.0 && t_ground < 15000.0) {
+            let p_world = ray_orig + ray_dir * t_ground;
+            let grid_coord = abs(fract(p_world.xz * 0.5) - 0.5);
+            let line = smoothstep(0.0, 0.04, min(grid_coord.x, grid_coord.y));
+            let grid_col = mix(camera.bg_color * 1.5, camera.bg_color * 0.7, line);
+            let fog = clamp(t_ground / 15000.0, 0.0, 1.0);
+            return vec4<f32>(mix(grid_col, camera.bg_color, fog), 1.0);
+        }
+    }
+    return vec4<f32>(camera.bg_color, 1.0);
+}
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -76,6 +96,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     );
     let inv_dir = 1.0 / rd;
 
+    if (camera.has_voxels < 0.5) {
+        return render_background(ray_orig, ray_dir);
+    }
+
+    let tb0 = (camera.tight_min - ray_orig) * inv_dir;
+    let tb1 = (camera.tight_max - ray_orig) * inv_dir;
+    let tbmin3 = min(tb0, tb1);
+    let tbmax3 = max(tb0, tb1);
+    let tb_enter = max(max(tbmin3.x, tbmin3.y), tbmin3.z);
+    let tb_exit = min(min(tbmax3.x, tbmax3.y), tbmax3.z);
+
+    if (tb_exit < max(tb_enter, 0.0)) {
+        return render_background(ray_orig, ray_dir);
+    }
+
     let root_min = camera.world_min;
     let root_max = camera.world_min + vec3<f32>(camera.world_size);
 
@@ -94,19 +129,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let has_voxels = (root_node.child_mask != 0u || root_node.material_id != 0u);
 
     if (has_voxels && r_exit >= max(r_enter, 0.0)) {
-        var t_curr = max(r_enter, 0.0);
+        var t_curr = max(r_enter, max(tb_enter - 1e-4, 0.0));
         let second_half = vec3<u32>(
             select(0u, 1u, rd.x > 0.0),
             select(0u, 1u, rd.y > 0.0),
             select(0u, 1u, rd.z > 0.0)
         );
 
-        var stack: array<DDAStackEntry, 24>;
+        var stack: array<DDAStackEntry, 18>;
         var level: i32 = 0;
 
         stack[0].idx = 0u;
-        stack[0].b_min = root_min;
-        stack[0].size = camera.world_size;
+        stack[0].b_min_x = root_min.x;
+        stack[0].b_min_y = root_min.y;
+        stack[0].b_min_z = root_min.z;
         stack[0].t_exit_x = rtmax3.x;
         stack[0].t_exit_y = rtmax3.y;
         stack[0].t_exit_z = rtmax3.z;
@@ -138,13 +174,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
 
             let node = svo_nodes[curr.idx];
+            let curr_size = camera.world_size / f32(1u << u32(level));
+            let curr_b_min = vec3<f32>(curr.b_min_x, curr.b_min_y, curr.b_min_z);
 
             if (node.child_pointer == 0u) {
                 if (node.material_id != 0u) {
                     let p_hit = ray_orig + rd * t_curr;
 
                     if (camera.show_borders > 0.5) {
-                        let local_p = saturate((p_hit - curr.b_min) / curr.size);
+                        let local_p = saturate((p_hit - curr_b_min) / curr_size);
                         let dist_x = min(local_p.x, 1.0 - local_p.x);
                         let dist_y = min(local_p.y, 1.0 - local_p.y);
                         let dist_z = min(local_p.z, 1.0 - local_p.z);
@@ -159,8 +197,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                         }
                     }
 
-                    let half_node = curr.size * 0.5;
-                    let center = curr.b_min + vec3<f32>(half_node);
+                    let half_node = curr_size * 0.5;
+                    let center = curr_b_min + vec3<f32>(half_node);
                     let p_rel = (p_hit - center) / half_node;
                     let abs_p = abs(p_rel);
                     let max_c = max(max(abs_p.x, abs_p.y), abs_p.z);
@@ -183,8 +221,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 continue;
             }
 
-            let half_s = curr.size * 0.5;
-            let mid = curr.b_min + vec3<f32>(half_s);
+            let half_s = curr_size * 0.5;
+            let mid = curr_b_min + vec3<f32>(half_s);
             let t_mid = (mid - ray_orig) * inv_dir;
 
             let oct = stack[level].octant;
@@ -205,9 +243,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 if (c_exit == c_exit_z) { stack[level].octant ^= 4u; }
             }
 
-            if (has_child && level < 23) {
+            if (has_child && level < 17) {
                 let child_idx = node.child_pointer + oct;
-                let child_min = curr.b_min + vec3<f32>(
+                let child_min = curr_b_min + vec3<f32>(
                     select(0.0, half_s, bx != 0u),
                     select(0.0, half_s, by != 0u),
                     select(0.0, half_s, bz != 0u)
@@ -222,8 +260,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
                 level = level + 1;
                 stack[level].idx = child_idx;
-                stack[level].b_min = child_min;
-                stack[level].size = half_s;
+                stack[level].b_min_x = child_min.x;
+                stack[level].b_min_y = child_min.y;
+                stack[level].b_min_z = child_min.z;
                 stack[level].t_exit_x = c_exit_x;
                 stack[level].t_exit_y = c_exit_y;
                 stack[level].t_exit_z = c_exit_z;
@@ -238,18 +277,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if (hit_mat == 0u) {
-        if (abs(ray_dir.y) > 1e-5) {
-            let t_ground = (-ray_orig.y) / ray_dir.y;
-            if (t_ground > 0.0 && t_ground < 15000.0) {
-                let p_world = ray_orig + ray_dir * t_ground;
-                let grid_coord = abs(fract(p_world.xz * 0.5) - 0.5);
-                let line = smoothstep(0.0, 0.04, min(grid_coord.x, grid_coord.y));
-                let grid_col = mix(camera.bg_color * 1.5, camera.bg_color * 0.7, line);
-                let fog = clamp(t_ground / 15000.0, 0.0, 1.0);
-                return vec4<f32>(mix(grid_col, camera.bg_color, fog), 1.0);
-            }
-        }
-        return vec4<f32>(camera.bg_color, 1.0);
+        return render_background(ray_orig, ray_dir);
     }
 
     let light_dir = normalize(vec3<f32>(0.4, 0.9, 0.3));

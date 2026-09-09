@@ -453,7 +453,7 @@ fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspec
         (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
         (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, min_p.z)),
         (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
-        (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
+        (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(min_p.x, min_p.y, max_p.z)),
         (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
     ];
     for (p0, p1) in edges {
@@ -774,6 +774,7 @@ struct State {
     fps: f32, fps_frame_counter: u32, fps_timer: Instant,
     tool_state: ToolState, history: HistoryManager,
     orbit_pivot: Vec3, mmb_dragging: bool,
+    ui_dirty: bool,
 }
 
 impl State {
@@ -811,11 +812,15 @@ impl State {
             show_borders: 0.0,
             world_min: octree.world_min.to_array(),
             world_size: octree.world_size,
+            tight_min: octree.tight_min.to_array(),
+            has_voxels: if octree.total_voxels > 0 { 1.0 } else { 0.0 },
+            tight_max: octree.tight_max.to_array(),
+            _pad0: 0.0,
             is_ortho: if camera.is_ortho { 1.0 } else { 0.0 },
             ortho_size: camera.ortho_size,
             screen_size: [config.width as f32, config.height as f32],
             bg_color,
-            _pad: 0.0,
+            _pad1: 0.0,
         };
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -916,7 +921,7 @@ impl State {
             hide_ui: false, bg_color, world_type, seed, cube_edits, error_banner: None,
             fps: 60.0, fps_frame_counter: 0, fps_timer: Instant::now(),
             tool_state: ToolState::default(), history: HistoryManager::new(64),
-            orbit_pivot: Vec3::ZERO, mmb_dragging: false,
+            orbit_pivot: Vec3::ZERO, mmb_dragging: false, ui_dirty: true,
         };
         app_state.sync_palette_buffer();
         app_state.update_ui();
@@ -1005,13 +1010,13 @@ impl State {
         let cur_dist = (self.camera.position - self.orbit_pivot).length().max(1.0);
         self.camera.position = self.orbit_pivot - self.camera.forward() * cur_dist;
         self.update_camera_buffer();
-        self.update_ui();
+        self.ui_dirty = true;
     }
 
     pub fn focus_on_scene(&mut self) {
-        let mut min_bound = Vec3::splat(f32::MAX);
-        let mut max_bound = Vec3::splat(f32::MIN);
-        let has_voxels = self.octree.compute_voxel_bounds(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, &mut min_bound, &mut max_bound);
+        let has_voxels = self.octree.total_voxels > 0;
+        let min_bound = self.octree.tight_min;
+        let max_bound = self.octree.tight_max;
 
         let (center, radius, half_extents) = if has_voxels {
             let c = (min_bound + max_bound) * 0.5;
@@ -1035,14 +1040,14 @@ impl State {
         self.camera.position = center - self.camera.forward() * required_dist.clamp(8.0, 50000.0);
         self.camera.ortho_size = (half_extents.y.max(half_extents.x / aspect) * 2.2).clamp(16.0, 50000.0);
         self.update_camera_buffer();
-        self.update_ui();
+        self.ui_dirty = true;
         self.window.request_redraw();
     }
 
     pub fn toggle_projection(&mut self) {
         self.camera.is_ortho = !self.camera.is_ortho;
         self.update_camera_buffer();
-        self.update_ui();
+        self.ui_dirty = true;
         self.window.request_redraw();
     }
 
@@ -1056,11 +1061,15 @@ impl State {
             show_borders: if self.input.wireframe_mode { 1.0 } else { 0.0 },
             world_min: self.octree.world_min.to_array(),
             world_size: self.octree.world_size,
+            tight_min: self.octree.tight_min.to_array(),
+            has_voxels: if self.octree.total_voxels > 0 { 1.0 } else { 0.0 },
+            tight_max: self.octree.tight_max.to_array(),
+            _pad0: 0.0,
             is_ortho: if self.camera.is_ortho { 1.0 } else { 0.0 },
             ortho_size: self.camera.ortho_size,
             screen_size: [self.config.width as f32, self.config.height as f32],
             bg_color: self.bg_color,
-            _pad: 0.0,
+            _pad1: 0.0,
         };
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
     }
@@ -1071,7 +1080,7 @@ impl State {
         self.gimbal_dragging = false;
         self.mmb_dragging = false;
         self.update_camera_buffer();
-        self.update_ui();
+        self.ui_dirty = true;
         self.window.request_redraw();
     }
 
@@ -1101,12 +1110,13 @@ impl State {
         self.bg_color = data.bg_color;
         
         self.octree = data.octree;
+        self.octree.recalculate_voxel_count();
         self.history = HistoryManager::new(64);
         
         self.sync_svo_buffer_full();
         self.sync_palette_buffer();
         self.update_camera_buffer();
-        self.update_ui();
+        self.ui_dirty = true;
         self.window.request_redraw();
         Ok(())
     }
@@ -1114,9 +1124,11 @@ impl State {
     pub fn clear_all_blocks(&mut self) {
         self.cube_edits.clear();
         self.octree = Octree::new();
+        self.octree.update_bounds();
         self.history = HistoryManager::new(64);
         self.sync_svo_buffer_full();
-        self.update_ui();
+        self.update_camera_buffer();
+        self.ui_dirty = true;
         self.window.request_redraw();
     }
 
@@ -1126,20 +1138,21 @@ impl State {
         self.octree = generate_world_terrain(self.world_type, self.seed, &self.cube_edits);
         self.history = HistoryManager::new(64);
         self.sync_svo_buffer_full();
-        self.update_ui();
+        self.update_camera_buffer();
+        self.ui_dirty = true;
         self.window.request_redraw();
     }
 
     pub fn scale_voxel_size(&mut self, multiply: bool) {
         if multiply { self.edit_size = (self.edit_size * 2.0).min(64.0); }
         else { self.edit_size = (self.edit_size * 0.5).max(MIN_VOXEL_SIZE); }
-        self.update_ui();
+        self.ui_dirty = true;
         self.window.request_redraw();
     }
 
     pub fn toggle_play_mode(&mut self) {
         self.play_mode = if self.play_mode == PlayMode::Real { PlayMode::Flying } else { PlayMode::Real };
-        self.update_ui();
+        self.ui_dirty = true;
         self.window.request_redraw();
     }
 
@@ -1178,6 +1191,7 @@ impl State {
         );
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+        self.ui_dirty = false;
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -1187,7 +1201,7 @@ impl State {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.update_camera_buffer();
-            self.update_ui();
+            self.ui_dirty = true;
         }
     }
 
@@ -1201,7 +1215,7 @@ impl State {
             && self.tool_state.pending_anchor.is_none()
         {
             self.tool_state.pending_anchor = Some(target_vec);
-            self.update_ui();
+            self.ui_dirty = true;
             return;
         }
 
@@ -1275,25 +1289,27 @@ impl State {
 
         self.history.record(HistoryAction { removed, added });
         self.sync_svo_buffer();
+        self.update_camera_buffer();
+        self.ui_dirty = true;
     }
 
     fn update(&mut self, _dt: f32) {
         self.fps_frame_counter += 1;
         let elapsed = self.fps_timer.elapsed().as_secs_f32();
-        if elapsed >= 0.25 {
+        if elapsed >= 0.5 {
             self.fps = self.fps_frame_counter as f32 / elapsed;
             self.fps_frame_counter = 0;
             self.fps_timer = Instant::now();
+            self.ui_dirty = true;
         }
 
         if let Some((_, time)) = self.error_banner {
             if time.elapsed().as_secs() > 7 {
                 self.error_banner = None;
-                self.update_ui();
+                self.ui_dirty = true;
             }
         }
 
-        let mut ui_needs_update = false;
         let mut messages = Vec::new();
         if let Some(ref rx) = self.voxelize_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -1301,16 +1317,13 @@ impl State {
                     VoxelizeMsg::Progress { percent, stage } => {
                         self.voxelize_progress = percent;
                         self.voxelize_stage = stage;
-                        ui_needs_update = true;
+                        self.ui_dirty = true;
                     }
                     VoxelizeMsg::Done(res) => {
                         messages.push(VoxelizeMsg::Done(res));
                     }
                 }
             }
-        }
-        if ui_needs_update {
-            self.update_ui();
         }
 
         for msg in messages {
@@ -1355,7 +1368,12 @@ impl State {
             }
         }
 
-        if self.active_menu != ActiveMenu::None { return; }
+        if self.active_menu != ActiveMenu::None {
+            if self.ui_dirty {
+                self.update_ui();
+            }
+            return;
+        }
 
         let aspect = if self.config.height > 0 { self.config.width as f32 / self.config.height as f32 } else { 1.0 };
         let (ray_orig, ray_dir) = self.camera.ray_from_ndc(self.cursor_pos[0], self.cursor_pos[1], aspect);
@@ -1363,6 +1381,7 @@ impl State {
         let hit = raycast_octree(&self.octree, ray_orig, ray_dir, 3000.0);
         let s = self.edit_size;
 
+        let prev_target = self.last_target;
         if let Some(ref h) = hit {
             let p = if self.input.action_remove || matches!(self.tool_state.active_tool, ToolType::Paint | ToolType::Replace) {
                 h.hit_pos - h.normal * (s * 0.5)
@@ -1370,20 +1389,17 @@ impl State {
                 h.hit_pos + h.normal * (s * 0.5)
             };
             self.last_target = Some([(p.x / s).floor() * s, (p.y / s).floor() * s, (p.z / s).floor() * s]);
+        } else if ray_dir.y.abs() > 1e-5 && (-ray_orig.y / ray_dir.y) > 0.0 && (-ray_orig.y / ray_dir.y) < 15000.0 {
+            let t = -ray_orig.y / ray_dir.y;
+            let p = ray_orig + ray_dir * t;
+            self.last_target = Some([(p.x / s).floor() * s, 0.0, (p.z / s).floor() * s]);
         } else {
-            if ray_dir.y.abs() > 1e-5 {
-                let t = -ray_orig.y / ray_dir.y;
-                if t > 0.0 && t < 15000.0 {
-                    let p = ray_orig + ray_dir * t;
-                    self.last_target = Some([(p.x / s).floor() * s, 0.0, (p.z / s).floor() * s]);
-                } else {
-                    let p = self.orbit_pivot;
-                    self.last_target = Some([(p.x / s).floor() * s, (p.y / s).floor() * s, (p.z / s).floor() * s]);
-                }
-            } else {
-                let p = self.orbit_pivot;
-                self.last_target = Some([(p.x / s).floor() * s, (p.y / s).floor() * s, (p.z / s).floor() * s]);
-            }
+            let p = self.orbit_pivot;
+            self.last_target = Some([(p.x / s).floor() * s, (p.y / s).floor() * s, (p.z / s).floor() * s]);
+        }
+
+        if prev_target != self.last_target {
+            self.ui_dirty = true;
         }
 
         if self.input.action_pick {
@@ -1392,7 +1408,7 @@ impl State {
                 if let Some(&color) = pal.get((h.material - 1) as usize) {
                     self.hotbar_colors[self.selected_slot] = color;
                     drop(pal);
-                    self.update_ui();
+                    self.ui_dirty = true;
                 }
             }
             self.input.action_pick = false;
@@ -1404,8 +1420,9 @@ impl State {
             self.input.action_remove = false;
         }
 
-        self.update_camera_buffer();
-        self.update_ui();
+        if self.ui_dirty {
+            self.update_ui();
+        }
     }
 
     fn render(&mut self) {
@@ -1543,7 +1560,7 @@ impl ApplicationHandler for App {
                                 state.update_orbit_position();
                             }
                             state.update_camera_buffer();
-                            state.update_ui();
+                            state.ui_dirty = true;
                             state.window.request_redraw();
                         }
                     } else if state.gimbal_dragging {
@@ -1554,13 +1571,13 @@ impl ApplicationHandler for App {
                             state.camera.yaw -= dx * 3.8;
                             state.camera.pitch = (state.camera.pitch - dy * 3.8).clamp(-1.56, 1.56);
                             state.update_orbit_position();
-                            state.update_ui();
+                            state.ui_dirty = true;
                             state.window.request_redraw();
                         }
                     } else if state.active_menu == ActiveMenu::Edit {
                         if let Some(channel) = state.active_slider {
                             state.hotbar_colors[state.selected_slot][channel] = ((mx - -0.32) / (0.18 - -0.32)).clamp(0.0, 1.0);
-                            state.update_ui();
+                            state.ui_dirty = true;
                             state.window.request_redraw();
                         }
                     } else if state.active_menu == ActiveMenu::None {
@@ -1582,7 +1599,7 @@ impl ApplicationHandler for App {
                             state.camera.position = state.orbit_pivot - state.camera.forward() * new_dist;
                         }
                         state.update_camera_buffer();
-                        state.update_ui();
+                        state.ui_dirty = true;
                         state.window.request_redraw();
                     }
                 }
@@ -1615,7 +1632,7 @@ impl ApplicationHandler for App {
                                     state.octree.recalculate_voxel_count();
                                     state.history.undo_stack.push_back(action);
                                     state.sync_svo_buffer_full();
-                                    state.update_ui();
+                                    state.ui_dirty = true;
                                     state.window.request_redraw();
                                 }
                             } else if let Some(action) = state.history.undo_stack.pop_back() {
@@ -1625,7 +1642,7 @@ impl ApplicationHandler for App {
                                 state.octree.recalculate_voxel_count();
                                 state.history.redo_stack.push_back(action);
                                 state.sync_svo_buffer_full();
-                                state.update_ui();
+                                state.ui_dirty = true;
                                 state.window.request_redraw();
                             }
                             return;
@@ -1639,7 +1656,7 @@ impl ApplicationHandler for App {
                                 state.octree.recalculate_voxel_count();
                                 state.history.undo_stack.push_back(action);
                                 state.sync_svo_buffer_full();
-                                state.update_ui();
+                                state.ui_dirty = true;
                                 state.window.request_redraw();
                             }
                             return;
@@ -1718,7 +1735,7 @@ impl ApplicationHandler for App {
                                     state.camera.position = state.orbit_pivot - state.camera.forward() * new_dist;
                                 }
                                 state.update_camera_buffer();
-                                state.update_ui();
+                                state.ui_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -1731,7 +1748,7 @@ impl ApplicationHandler for App {
                                     state.camera.position = state.orbit_pivot - state.camera.forward() * new_dist;
                                 }
                                 state.update_camera_buffer();
-                                state.update_ui();
+                                state.ui_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -1739,19 +1756,19 @@ impl ApplicationHandler for App {
                         }
 
                         match key_event.physical_key {
-                            PhysicalKey::Code(KeyCode::KeyV) => { state.tool_state.active_tool = ToolType::Pencil; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyO) => { state.tool_state.active_tool = ToolType::Sphere; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyY) => { state.tool_state.active_tool = ToolType::Cylinder; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyU) => { state.tool_state.active_tool = ToolType::Disc; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyB) => { state.tool_state.active_tool = ToolType::Box; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyL) => { state.tool_state.active_tool = ToolType::Line; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyK) => { state.tool_state.active_tool = ToolType::Paint; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyG) => { state.tool_state.active_tool = ToolType::Replace; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyH) => { state.tool_state.hollow = !state.tool_state.hollow; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyV) => { state.tool_state.active_tool = ToolType::Pencil; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyO) => { state.tool_state.active_tool = ToolType::Sphere; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyY) => { state.tool_state.active_tool = ToolType::Cylinder; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyU) => { state.tool_state.active_tool = ToolType::Disc; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyB) => { state.tool_state.active_tool = ToolType::Box; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyL) => { state.tool_state.active_tool = ToolType::Line; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyK) => { state.tool_state.active_tool = ToolType::Paint; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyG) => { state.tool_state.active_tool = ToolType::Replace; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyH) => { state.tool_state.hollow = !state.tool_state.hollow; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyX) => { 
                                 state.input.wireframe_mode = !state.input.wireframe_mode; 
                                 state.update_camera_buffer(); 
-                                state.update_ui(); 
+                                state.ui_dirty = true; 
                                 state.window.request_redraw(); 
                                 return; 
                             }
@@ -1764,7 +1781,7 @@ impl ApplicationHandler for App {
                                 state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
                                 state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
                                 state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0);
-                                state.update_ui();
+                                state.ui_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -1772,7 +1789,7 @@ impl ApplicationHandler for App {
                                 state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
                                 state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(32.0);
                                 state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0);
-                                state.update_ui();
+                                state.ui_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -1792,14 +1809,14 @@ impl ApplicationHandler for App {
                         }
                         if key_event.physical_key == PhysicalKey::Code(KeyCode::F1) {
                             state.hide_ui = !state.hide_ui;
-                            state.update_ui();
+                            state.ui_dirty = true;
                             state.window.request_redraw();
                             return;
                         }
                         if key_event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
                             if state.tool_state.pending_anchor.is_some() {
                                 state.tool_state.pending_anchor = None;
-                                state.update_ui();
+                                state.ui_dirty = true;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -1816,16 +1833,16 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::F9) => { let _ = state.load_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::KeyF) => state.scale_voxel_size(false),
                             PhysicalKey::Code(KeyCode::KeyR) => state.scale_voxel_size(true),
-                            PhysicalKey::Code(KeyCode::Digit1) => { state.selected_slot = 0; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit2) => { state.selected_slot = 1; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit3) => { state.selected_slot = 2; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit4) => { state.selected_slot = 3; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit5) => { state.selected_slot = 4; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit6) => { state.selected_slot = 5; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit7) => { state.selected_slot = 6; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit8) => { state.selected_slot = 7; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit9) => { state.selected_slot = 8; state.update_ui(); state.window.request_redraw(); },
-                            PhysicalKey::Code(KeyCode::Digit0) => { state.selected_slot = 9; state.update_ui(); state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit1) => { state.selected_slot = 0; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit2) => { state.selected_slot = 1; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit3) => { state.selected_slot = 2; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit4) => { state.selected_slot = 3; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit5) => { state.selected_slot = 4; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit6) => { state.selected_slot = 5; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit7) => { state.selected_slot = 6; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit8) => { state.selected_slot = 7; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit9) => { state.selected_slot = 8; state.ui_dirty = true; state.window.request_redraw(); },
+                            PhysicalKey::Code(KeyCode::Digit0) => { state.selected_slot = 9; state.ui_dirty = true; state.window.request_redraw(); },
                             _ => {}
                         }
                     }
@@ -1859,7 +1876,7 @@ impl ApplicationHandler for App {
                                     let x1 = x0 + slot_w;
                                     if mx >= x0 && mx <= x1 {
                                         state.selected_slot = i;
-                                        state.update_ui();
+                                        state.ui_dirty = true;
                                         state.window.request_redraw();
                                         return;
                                     }
@@ -1879,7 +1896,7 @@ impl ApplicationHandler for App {
                                     if mx >= x0 && mx <= x1 {
                                         state.tool_state.active_tool = tool;
                                         state.tool_state.pending_anchor = None;
-                                        state.update_ui();
+                                        state.ui_dirty = true;
                                         state.window.request_redraw();
                                         return;
                                     }
@@ -1892,7 +1909,7 @@ impl ApplicationHandler for App {
                                     state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
                                     state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
                                     state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0);
-                                    state.update_ui();
+                                    state.ui_dirty = true;
                                     state.window.request_redraw();
                                     return;
                                 }
@@ -1905,7 +1922,7 @@ impl ApplicationHandler for App {
                                     state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
                                     state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(32.0);
                                     state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0);
-                                    state.update_ui();
+                                    state.ui_dirty = true;
                                     state.window.request_redraw();
                                     return;
                                 }
@@ -1914,7 +1931,7 @@ impl ApplicationHandler for App {
                                 let mode_x1 = mode_x0 + 0.065;
                                 if mx >= mode_x0 && mx <= mode_x1 {
                                     state.tool_state.hollow = !state.tool_state.hollow;
-                                    state.update_ui();
+                                    state.ui_dirty = true;
                                     state.window.request_redraw();
                                     return;
                                 }
@@ -1945,13 +1962,13 @@ impl ApplicationHandler for App {
                         ActiveMenu::Edit => {
                             if button == MouseButton::Left && element_state == ElementState::Pressed {
                                 let sw_w = 0.082; let sw_gap = 0.015; let sw_tot = 10.0 * sw_w + 9.0 * sw_gap; let s_start_x = -sw_tot / 2.0;
-                                for i in 0..10 { if mx >= s_start_x + i as f32 * (sw_w + sw_gap) && mx <= s_start_x + i as f32 * (sw_w + sw_gap) + sw_w && my >= 0.43 && my <= 0.52 { state.selected_slot = i; state.update_ui(); state.window.request_redraw(); return; } }
+                                for i in 0..10 { if mx >= s_start_x + i as f32 * (sw_w + sw_gap) && mx <= s_start_x + i as f32 * (sw_w + sw_gap) + sw_w && my >= 0.43 && my <= 0.52 { state.selected_slot = i; state.ui_dirty = true; state.window.request_redraw(); return; } }
                                 if mx >= -0.34 && mx <= 0.20 {
                                     state.active_slider = if my >= 0.30 && my <= 0.38 { Some(0) } else if my >= 0.23 && my <= 0.31 { Some(1) } else if my >= 0.16 && my <= 0.24 { Some(2) } else { None };
-                                    if let Some(channel) = state.active_slider { state.hotbar_colors[state.selected_slot][channel] = ((mx - -0.32) / (0.18 - -0.32)).clamp(0.0, 1.0); state.update_ui(); state.window.request_redraw(); return; }
+                                    if let Some(channel) = state.active_slider { state.hotbar_colors[state.selected_slot][channel] = ((mx - -0.32) / (0.18 - -0.32)).clamp(0.0, 1.0); state.ui_dirty = true; state.window.request_redraw(); return; }
                                 }
                                 let pw_w = 0.076; let pw_gap = 0.012; let pw_tot = 10.0 * pw_w + 9.0 * pw_gap; let pw_start_x = -pw_tot / 2.0;
-                                for (i, &preset_col) in PRESET_SWATCHES.iter().enumerate() { if mx >= pw_start_x + i as f32 * (pw_w + pw_gap) && mx <= pw_start_x + i as f32 * (pw_w + pw_gap) + pw_w && my >= 0.05 && my <= 0.11 { state.hotbar_colors[state.selected_slot] = preset_col; state.update_ui(); state.window.request_redraw(); return; } }
+                                for (i, &preset_col) in PRESET_SWATCHES.iter().enumerate() { if mx >= pw_start_x + i as f32 * (pw_w + pw_gap) && mx <= pw_start_x + i as f32 * (pw_w + pw_gap) + pw_w && my >= 0.05 && my <= 0.11 { state.hotbar_colors[state.selected_slot] = preset_col; state.ui_dirty = true; state.window.request_redraw(); return; } }
                                 if mx >= -0.40 && mx <= -0.22 && my >= -0.10 && my <= -0.02 { state.scale_voxel_size(false); return; }
                                 if mx >= 0.22 && mx <= 0.40 && my >= -0.10 && my <= -0.02 { state.scale_voxel_size(true); return; }
                                 if mx >= -0.22 && mx <= 0.22 && my >= -0.25 && my <= -0.17 { state.set_menu(ActiveMenu::None); return; }
@@ -1976,7 +1993,7 @@ impl ApplicationHandler for App {
                                         if mx >= x0 && mx <= x1 {
                                             state.bg_color = col;
                                             state.update_camera_buffer();
-                                            state.update_ui();
+                                            state.ui_dirty = true;
                                             state.window.request_redraw();
                                             return;
                                         }
@@ -1998,19 +2015,19 @@ impl ApplicationHandler for App {
                                 let wx0 = -0.42; let wx1 = 0.42;
                                 if mx >= wx1 - 0.20 && mx <= wx1 - 0.04 && my >= 0.38 && my <= 0.46 { state.prompt_native_file_dialog(); return; }
                                 if my >= 0.19 && my <= 0.27 {
-                                    if mx >= wx0 + 0.04 && mx <= wx0 + 0.14 { state.glb_settings.target_height = (state.glb_settings.target_height - 4.0).max(4.0); state.update_ui(); state.window.request_redraw(); return; }
-                                    if mx >= wx1 - 0.14 && mx <= wx1 - 0.04 { state.glb_settings.target_height = (state.glb_settings.target_height + 4.0).min(128.0); state.update_ui(); state.window.request_redraw(); return; }
+                                    if mx >= wx0 + 0.04 && mx <= wx0 + 0.14 { state.glb_settings.target_height = (state.glb_settings.target_height - 4.0).max(4.0); state.ui_dirty = true; state.window.request_redraw(); return; }
+                                    if mx >= wx1 - 0.14 && mx <= wx1 - 0.04 { state.glb_settings.target_height = (state.glb_settings.target_height + 4.0).min(128.0); state.ui_dirty = true; state.window.request_redraw(); return; }
                                 }
                                 if my >= -0.01 && my <= 0.07 {
-                                    if mx >= wx0 + 0.04 && mx <= wx0 + 0.14 { state.glb_settings.voxel_size = (state.glb_settings.voxel_size * 0.5).max(MIN_VOXEL_SIZE); state.update_ui(); state.window.request_redraw(); return; }
-                                    if mx >= wx1 - 0.14 && mx <= wx1 - 0.04 { state.glb_settings.voxel_size *= 2.0; state.update_ui(); state.window.request_redraw(); return; }
+                                    if mx >= wx0 + 0.04 && mx <= wx0 + 0.14 { state.glb_settings.voxel_size = (state.glb_settings.voxel_size * 0.5).max(MIN_VOXEL_SIZE); state.ui_dirty = true; state.window.request_redraw(); return; }
+                                    if mx >= wx1 - 0.14 && mx <= wx1 - 0.04 { state.glb_settings.voxel_size *= 2.0; state.ui_dirty = true; state.window.request_redraw(); return; }
                                 }
                                 if my >= -0.21 && my <= -0.13 {
-                                    if mx >= wx0 + 0.04 && mx <= wx0 + 0.14 { state.glb_settings.palette_size = (state.glb_settings.palette_size / 2).max(2); state.update_ui(); state.window.request_redraw(); return; }
-                                    if mx >= wx1 - 0.14 && mx <= wx1 - 0.04 { state.glb_settings.palette_size = (state.glb_settings.palette_size * 2).min(8192); state.update_ui(); state.window.request_redraw(); return; }
+                                    if mx >= wx0 + 0.04 && mx <= wx0 + 0.14 { state.glb_settings.palette_size = (state.glb_settings.palette_size / 2).max(2); state.ui_dirty = true; state.window.request_redraw(); return; }
+                                    if mx >= wx1 - 0.14 && mx <= wx1 - 0.04 { state.glb_settings.palette_size = (state.glb_settings.palette_size * 2).min(8192); state.ui_dirty = true; state.window.request_redraw(); return; }
                                 }
                                 if mx >= wx0 + 0.04 && mx <= wx1 - 0.04 && my >= -0.39 && my <= -0.31 {
-                                    state.glb_settings.place_at_aim = !state.glb_settings.place_at_aim; state.update_ui(); state.window.request_redraw(); return; }
+                                    state.glb_settings.place_at_aim = !state.glb_settings.place_at_aim; state.ui_dirty = true; state.window.request_redraw(); return; }
                                 if mx >= wx0 + 0.04 && mx <= wx1 - 0.04 && my >= -0.54 && my <= -0.44 {
                                     if state.glb_settings.is_safe() { state.start_nonblocking_voxelization(); }
                                     return;
