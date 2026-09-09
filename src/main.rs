@@ -399,6 +399,18 @@ const PRESET_SWATCHES: [[f32; 3]; 10] = [
     [0.95, 0.85, 0.15], [0.20, 0.75, 0.25], [0.15, 0.80, 0.85], [0.20, 0.45, 0.90],
     [0.65, 0.25, 0.85], [0.55, 0.35, 0.20],
 ];
+
+const PRESET_BG_COLORS: [[f32; 3]; 8] = [
+    [0.12, 0.14, 0.18],
+    [0.24, 0.26, 0.30],
+    [0.08, 0.18, 0.32],
+    [0.55, 0.68, 0.82],
+    [0.50, 0.28, 0.28],
+    [0.16, 0.24, 0.18],
+    [0.85, 0.82, 0.76],
+    [0.02, 0.02, 0.03],
+];
+
 const GIZMO_CENTER_X: f32 = 0.86;
 const GIZMO_CENTER_Y: f32 = 0.76;
 const GIZMO_RADIUS: f32 = 0.11;
@@ -441,8 +453,8 @@ fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspec
         (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
         (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, min_p.z)),
         (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
-        (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
         (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
+        (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
     ];
     for (p0, p1) in edges {
         let v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
@@ -455,14 +467,34 @@ fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspec
     }
 }
 
+fn draw_circle_wireframe(verts: &mut Vec<UIVertex>, center: Vec3, radius: f32, axis_u: Vec3, axis_v: Vec3, segments: usize, aspect: f32, view_proj: Mat4, color: [f32; 4]) {
+    for i in 0..segments {
+        let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
+        let p0 = center + axis_u * (a0.cos() * radius) + axis_v * (a0.sin() * radius);
+        let p1 = center + axis_u * (a1.cos() * radius) + axis_v * (a1.sin() * radius);
+        let v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
+        let v1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
+        if v0.w > 0.05 && v1.w > 0.05 {
+            let ndc0 = v0.truncate() / v0.w;
+            let ndc1 = v1.truncate() / v1.w;
+            add_line(verts, ndc0.x, ndc0.y, ndc1.x, ndc1.y, 0.003, aspect, color);
+        }
+    }
+}
+
 const HOTBAR_LABELS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+const ALL_TOOLS: [ToolType; 8] = [
+    ToolType::Pencil, ToolType::Sphere, ToolType::Cylinder, ToolType::Box,
+    ToolType::Line, ToolType::Disc, ToolType::Paint, ToolType::Replace
+];
 
 fn build_ui_vertices(
     selected_slot: usize, active_menu: ActiveMenu, hotbar_colors: &[[f32; 3]; 10], play_mode: PlayMode, is_ortho: bool, world_type: WorldType,
     edit_size: f32, target_pos: Option<[f32; 3]>, aspect: f32, camera_forward: Vec3, camera_right: Vec3, camera_up: Vec3,
     _cursor_free: bool, glb_settings: &GlbImportSettings, progress_val: f32, progress_stage: &str, view_proj: Mat4, 
     error_banner: Option<&str>, tool_state: &ToolState,
-    hud_status: &str, hud_tools: &str, size_str: &str, glb_cost_str: &str
+    hud_status: &str, hud_tools: &str, size_str: &str, glb_cost_str: &str, bg_color: [f32; 3]
 ) -> Vec<UIVertex> {
     let mut verts = Vec::new();
     let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let g_rad = GIZMO_RADIUS; let disc_rx = (g_rad + 0.018) / aspect; let disc_ry = g_rad + 0.018;
@@ -499,15 +531,81 @@ fn build_ui_vertices(
     }
 
     if active_menu == ActiveMenu::None {
+        let bar_y0 = -0.83;
+        let bar_y1 = -0.77;
+        let tb_w = 0.050;
+        let tb_gap = 0.006;
+        let total_tb_w = 8.0 * tb_w + 7.0 * tb_gap;
+        let tb_start_x = -total_tb_w / 2.0 - 0.10;
+
+        for (i, &tool) in ALL_TOOLS.iter().enumerate() {
+            let x0 = tb_start_x + i as f32 * (tb_w + tb_gap);
+            let x1 = x0 + tb_w;
+            let is_cur = tool_state.active_tool == tool;
+            let bg = if is_cur { [0.20, 0.60, 0.85, 0.95] } else { [0.10, 0.12, 0.16, 0.85] };
+            let border = if is_cur { [1.0, 0.9, 0.2, 1.0] } else { [0.25, 0.30, 0.38, 0.8] };
+            add_quad(&mut verts, x0 - 0.002, bar_y0 - 0.002, x1 + 0.002, bar_y1 + 0.002, border);
+            add_quad(&mut verts, x0, bar_y0, x1, bar_y1, bg);
+            draw_text_centered(&mut verts, tool.short_name(), (x0 + x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 0.9, aspect, [1.0, 1.0, 1.0, 1.0]);
+        }
+
+        let ctrl_x0 = tb_start_x + total_tb_w + 0.015;
+        let rad_minus_x0 = ctrl_x0;
+        let rad_minus_x1 = rad_minus_x0 + 0.028;
+        add_quad(&mut verts, rad_minus_x0, bar_y0, rad_minus_x1, bar_y1, [0.20, 0.25, 0.35, 0.9]);
+        draw_text_centered(&mut verts, "-", (rad_minus_x0 + rad_minus_x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+
+        let rad_lbl_x0 = rad_minus_x1 + 0.004;
+        let rad_lbl_x1 = rad_lbl_x0 + 0.070;
+        add_quad(&mut verts, rad_lbl_x0, bar_y0, rad_lbl_x1, bar_y1, [0.08, 0.10, 0.14, 0.9]);
+        draw_text_centered(&mut verts, &format!("R:{:.1}", tool_state.brush_radius), (rad_lbl_x0 + rad_lbl_x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 0.9, aspect, [0.3, 0.9, 1.0, 1.0]);
+
+        let rad_plus_x0 = rad_lbl_x1 + 0.004;
+        let rad_plus_x1 = rad_plus_x0 + 0.028;
+        add_quad(&mut verts, rad_plus_x0, bar_y0, rad_plus_x1, bar_y1, [0.20, 0.25, 0.35, 0.9]);
+        draw_text_centered(&mut verts, "+", (rad_plus_x0 + rad_plus_x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+
+        let mode_x0 = rad_plus_x1 + 0.008;
+        let mode_x1 = mode_x0 + 0.065;
+        let mode_bg = if tool_state.hollow { [0.70, 0.35, 0.15, 0.9] } else { [0.20, 0.45, 0.30, 0.9] };
+        add_quad(&mut verts, mode_x0, bar_y0, mode_x1, bar_y1, mode_bg);
+        draw_text_centered(&mut verts, if tool_state.hollow { "HOLLOW" } else { "SOLID" }, (mode_x0 + mode_x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 0.85, aspect, [1.0, 1.0, 1.0, 1.0]);
+
         if let Some(pos) = target_pos {
             let p_target = Vec3::from(pos);
+            let p_center = p_target + Vec3::splat(edit_size * 0.5);
             match tool_state.active_tool {
                 ToolType::Pencil | ToolType::Paint => {
                     draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, [0.3, 0.9, 1.0, 0.7]);
                 }
                 ToolType::Sphere => {
                     let r = tool_state.brush_radius;
-                    draw_box_wireframe(&mut verts, p_target - Vec3::splat(r), p_target + Vec3::splat(r), aspect, view_proj, [0.9, 0.5, 0.2, 0.8]);
+                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.95, 0.55, 0.20, 0.9]);
+                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Y, 24, aspect, view_proj, [0.95, 0.55, 0.20, 0.9]);
+                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::Z, Vec3::Y, 24, aspect, view_proj, [0.95, 0.55, 0.20, 0.9]);
+                    draw_box_wireframe(&mut verts, p_center - Vec3::splat(r), p_center + Vec3::splat(r), aspect, view_proj, [0.95, 0.55, 0.20, 0.35]);
+                }
+                ToolType::Cylinder => {
+                    let r = tool_state.brush_radius;
+                    let h = tool_state.cylinder_height;
+                    let bot_c = Vec3::new(p_target.x, p_target.y, p_target.z);
+                    let top_c = bot_c + Vec3::new(0.0, h, 0.0);
+                    draw_circle_wireframe(&mut verts, bot_c, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.3, 0.9, 0.5, 0.9]);
+                    draw_circle_wireframe(&mut verts, top_c, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.3, 0.9, 0.5, 0.9]);
+                    let struts = [Vec3::new(r, 0.0, 0.0), Vec3::new(-r, 0.0, 0.0), Vec3::new(0.0, 0.0, r), Vec3::new(0.0, 0.0, -r)];
+                    for off in struts {
+                        let v0 = view_proj * Vec4::new(bot_c.x + off.x, bot_c.y, bot_c.z + off.z, 1.0);
+                        let v1 = view_proj * Vec4::new(top_c.x + off.x, top_c.y, top_c.z + off.z, 1.0);
+                        if v0.w > 0.05 && v1.w > 0.05 {
+                            let n0 = v0.truncate() / v0.w;
+                            let n1 = v1.truncate() / v1.w;
+                            add_line(&mut verts, n0.x, n0.y, n1.x, n1.y, 0.003, aspect, [0.3, 0.9, 0.5, 0.8]);
+                        }
+                    }
+                }
+                ToolType::Disc => {
+                    let r = tool_state.brush_radius;
+                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.2, 0.8, 1.0, 0.95]);
                 }
                 ToolType::Box => {
                     if let Some(anchor) = tool_state.pending_anchor {
@@ -535,6 +633,11 @@ fn build_ui_vertices(
                         draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, [1.0, 0.8, 0.2, 0.6]);
                     }
                 }
+                ToolType::Replace => {
+                    let r = tool_state.brush_radius;
+                    draw_box_wireframe(&mut verts, p_center - Vec3::splat(r), p_center + Vec3::splat(r), aspect, view_proj, [0.9, 0.2, 0.9, 0.9]);
+                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.9, 0.2, 0.9, 0.8]);
+                }
             }
         }
     }
@@ -548,7 +651,7 @@ fn build_ui_vertices(
         ActiveMenu::None => {
             draw_text(&mut verts, hud_status, -0.96, 0.92, 1.25, aspect, [1.0, 1.0, 1.0, 0.95]);
             draw_text(&mut verts, hud_tools, -0.96, 0.86, 1.0, aspect, [0.3, 0.9, 1.0, 0.95]);
-            draw_text(&mut verts, "[MMB] ORBIT  [SHIFT+MMB] PAN  [CTRL+MMB/WHEEL] ZOOM  [NUM 1/3/7/9/2/4/6/8] BLENDER NAV  [C] PICK  [CTRL+Z/Y] UNDO/REDO", -0.96, 0.80, 0.95, aspect, [0.9, 0.85, 0.4, 0.85]);
+            draw_text(&mut verts, "[MMB] ORBIT  [SHIFT+MMB] PAN  [CTRL+MMB/WHEEL] ZOOM  [NUM 1/3/7/9/2/4/6/8] NAV  [H] HOLLOW  [C] PICK  [CTRL+Z/Y] UNDO", -0.96, 0.80, 0.90, aspect, [0.9, 0.85, 0.4, 0.85]);
         }
         ActiveMenu::Edit => {
             add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.75]); add_quad(&mut verts, -0.566, -0.586, 0.566, 0.656, [0.25, 0.35, 0.50, 1.0]); add_quad(&mut verts, -0.56, -0.58, 0.56, 0.65, [0.10, 0.12, 0.16, 0.98]);
@@ -572,28 +675,44 @@ fn build_ui_vertices(
             add_quad(&mut verts, 0.22, -0.10, 0.40, -0.02, [0.35, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "* 2 (R)", 0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); add_quad(&mut verts, -0.22, -0.25, 0.22, -0.17, [0.20, 0.50, 0.30, 1.0]); draw_text_centered(&mut verts, "DONE (PRESS E)", 0.0, -0.21, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
         ActiveMenu::Pause => {
-            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.80]); add_quad(&mut verts, -0.426, -0.726, 0.426, 0.726, [0.45, 0.45, 0.50, 1.0]); add_quad(&mut verts, -0.42, -0.72, 0.42, 0.72, [0.12, 0.13, 0.17, 0.98]);
-            draw_text_centered(&mut verts, "PAUSE / SYSTEM MENU", 0.0, 0.60, 1.3, aspect, [0.95, 0.95, 0.95, 1.0]);
-            add_quad(&mut verts, -0.30, 0.46, 0.30, 0.54, [0.20, 0.55, 0.75, 1.0]); draw_text_centered(&mut verts, ">> IMPORT 3D MODEL (GLB) <<", 0.0, 0.50, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.36, 0.30, 0.44, [0.25, 0.35, 0.55, 1.0]); draw_text_centered(&mut verts, if play_mode == PlayMode::Flying { "PLAY MODE: FLYING (M)" } else { "PLAY MODE: REAL (M)" }, 0.0, 0.40, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.26, 0.30, 0.34, [0.22, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, if is_ortho { "VIEW: ORTHOGRAPHIC (P)" } else { "VIEW: PERSPECTIVE (P)" }, 0.0, 0.30, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.16, 0.30, 0.24, [0.35, 0.25, 0.50, 1.0]); draw_text_centered(&mut verts, &format!("WORLD: {} (F2)", world_type.name()), 0.0, 0.20, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.06, 0.30, 0.14, [0.60, 0.30, 0.20, 1.0]); draw_text_centered(&mut verts, "CLEAR SCENE", 0.0, 0.10, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, -0.06, -0.02, 0.02, [0.25, 0.45, 0.35, 1.0]); draw_text_centered(&mut verts, "SAVE (F5)", -0.16, -0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, 0.02, -0.06, 0.30, 0.02, [0.35, 0.45, 0.25, 1.0]); draw_text_centered(&mut verts, "LOAD (F9)", 0.16, -0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, -0.16, 0.30, -0.08, [0.4, 0.35, 0.45, 1.0]); draw_text_centered(&mut verts, "CYCLE BACKGROUND COLOR", 0.0, -0.12, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, -0.28, 0.30, -0.20, [0.25, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "CONTROLS", 0.0, -0.24, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, -0.42, 0.30, -0.34, [0.20, 0.55, 0.30, 1.0]); draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.38, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, -0.54, 0.30, -0.46, [0.55, 0.20, 0.20, 1.0]); draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.50, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.80]); add_quad(&mut verts, -0.426, -0.766, 0.426, 0.726, [0.45, 0.45, 0.50, 1.0]); add_quad(&mut verts, -0.42, -0.76, 0.42, 0.72, [0.12, 0.13, 0.17, 0.98]);
+            draw_text_centered(&mut verts, "PAUSE / SYSTEM MENU", 0.0, 0.62, 1.3, aspect, [0.95, 0.95, 0.95, 1.0]);
+            
+            add_quad(&mut verts, -0.30, 0.48, 0.30, 0.56, [0.20, 0.55, 0.75, 1.0]); draw_text_centered(&mut verts, ">> IMPORT 3D MODEL (GLB) <<", 0.0, 0.52, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, 0.38, 0.30, 0.46, [0.25, 0.35, 0.55, 1.0]); draw_text_centered(&mut verts, if play_mode == PlayMode::Flying { "PLAY MODE: FLYING (M)" } else { "PLAY MODE: REAL (M)" }, 0.0, 0.42, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, 0.28, 0.30, 0.36, [0.22, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, if is_ortho { "VIEW: ORTHOGRAPHIC (P)" } else { "VIEW: PERSPECTIVE (P)" }, 0.0, 0.32, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, 0.18, 0.30, 0.26, [0.35, 0.25, 0.50, 1.0]); draw_text_centered(&mut verts, &format!("WORLD: {} (F2)", world_type.name()), 0.0, 0.22, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, 0.08, 0.30, 0.16, [0.60, 0.30, 0.20, 1.0]); draw_text_centered(&mut verts, "CLEAR SCENE", 0.0, 0.12, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, -0.02, -0.02, 0.06, [0.25, 0.45, 0.35, 1.0]); draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, 0.02, -0.02, 0.30, 0.06, [0.35, 0.45, 0.25, 1.0]); draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
+            
+            draw_text_centered(&mut verts, "CHOOSE BACKGROUND COLOR", 0.0, -0.09, 0.95, aspect, [0.85, 0.85, 0.9, 0.95]);
+            let bg_w = 0.068; let bg_gap = 0.008; let bg_tot = 8.0 * bg_w + 7.0 * bg_gap; let bg_start_x = -bg_tot / 2.0;
+            let bg_y0 = -0.19; let bg_y1 = -0.13;
+            for (i, &col) in PRESET_BG_COLORS.iter().enumerate() {
+                let x0 = bg_start_x + i as f32 * (bg_w + bg_gap);
+                let x1 = x0 + bg_w;
+                let is_sel = (col[0] - bg_color[0]).abs() < 0.01 && (col[1] - bg_color[1]).abs() < 0.01 && (col[2] - bg_color[2]).abs() < 0.01;
+                if is_sel {
+                    add_quad(&mut verts, x0 - 0.003, bg_y0 - 0.003, x1 + 0.003, bg_y1 + 0.003, [1.0, 0.9, 0.2, 1.0]);
+                } else {
+                    add_quad(&mut verts, x0 - 0.002, bg_y0 - 0.002, x1 + 0.002, bg_y1 + 0.002, [0.3, 0.35, 0.45, 0.8]);
+                }
+                add_quad(&mut verts, x0, bg_y0, x1, bg_y1, [col[0], col[1], col[2], 1.0]);
+            }
+
+            add_quad(&mut verts, -0.30, -0.31, 0.30, -0.23, [0.25, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "CONTROLS", 0.0, -0.27, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, -0.45, 0.30, -0.37, [0.20, 0.55, 0.30, 1.0]); draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.41, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, -0.57, 0.30, -0.49, [0.55, 0.20, 0.20, 1.0]); draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.53, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
         ActiveMenu::Controls => {
             add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.95]);
             draw_text_centered(&mut verts, "BLENDER-COMPLIANT CONTROLS", 0.0, 0.60, 1.4, aspect, [1.0, 1.0, 1.0, 1.0]);
             draw_text_centered(&mut verts, "MMB = ORBIT  |  SHIFT + MMB = PAN  |  CTRL + MMB / WHEEL = ZOOM", 0.0, 0.42, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
-            draw_text_centered(&mut verts, "NUMPAD 2 / 4 / 6 / 8 = ORBIT DOWN / LEFT / RIGHT / UP (15 DEG)", 0.0, 0.32, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
-            draw_text_centered(&mut verts, "NUMPAD 9 = OPPOSITE VIEW  |  NUMPAD 1/3/7 = FRONT/RIGHT/TOP", 0.0, 0.22, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
-            draw_text_centered(&mut verts, "CTRL + Z = UNDO  |  CTRL + SHIFT + Z / CTRL + Y = REDO", 0.0, 0.12, 0.95, aspect, [1.0, 0.85, 0.3, 1.0]);
-            draw_text_centered(&mut verts, "V = PENCIL  |  O = SPHERE  |  B = BOX  |  L = LINE  |  K = PAINT  |  X = WIREFRAME", 0.0, 0.02, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
+            draw_text_centered(&mut verts, "NUMPAD 2 / 4 / 6 / 8 = ORBIT (15 DEG)  |  NUMPAD 1/3/7/9 = VIEWS", 0.0, 0.32, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
+            draw_text_centered(&mut verts, "CTRL + Z = UNDO  |  CTRL + SHIFT + Z / CTRL + Y = REDO", 0.0, 0.22, 0.95, aspect, [1.0, 0.85, 0.3, 1.0]);
+            draw_text_centered(&mut verts, "V: PENCIL | O: SPHERE | Y: CYLINDER | B: BOX | L: LINE | U: DISC | K: PAINT | G: REPLACE", 0.0, 0.12, 0.85, aspect, [0.9, 0.9, 0.9, 1.0]);
+            draw_text_centered(&mut verts, "H = TOGGLE HOLLOW / SOLID  |  [ / ] = DECREASE / INCREASE RADIUS", 0.0, 0.02, 0.95, aspect, [0.3, 1.0, 0.5, 1.0]);
             draw_text_centered(&mut verts, "LMB = APPLY TOOL  |  RMB = ERASE TOOL  |  C = PICK COLOR AT CURSOR", 0.0, -0.08, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
             draw_text_centered(&mut verts, "NUMPAD . / [.] = FOCUS ON SCENE  |  NUMPAD 5 = ORTHO / PERSP", 0.0, -0.18, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
             add_quad(&mut verts, -0.30, -0.66, 0.30, -0.56, [0.45, 0.22, 0.22, 1.0]); draw_text_centered(&mut verts, "BACK (ESC)", 0.0, -0.61, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
@@ -683,6 +802,7 @@ impl State {
         let seed = 42;
         let cube_edits = Vec::new();
         let octree = generate_world_terrain(world_type, seed, &cube_edits);
+        let bg_color = [0.12, 0.14, 0.18];
 
         let camera_uniform = CameraUniform {
             view_proj: vp.to_cols_array_2d(),
@@ -694,6 +814,8 @@ impl State {
             is_ortho: if camera.is_ortho { 1.0 } else { 0.0 },
             ortho_size: camera.ortho_size,
             screen_size: [config.width as f32, config.height as f32],
+            bg_color,
+            _pad: 0.0,
         };
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -791,7 +913,7 @@ impl State {
             hotbar_colors, palette, active_menu: ActiveMenu::None, cursor_pos: [0.0, 0.0], active_slider: None, edit_size: 1.0,
             last_target: None, cursor_free: true, gimbal_dragging: false, gimbal_drag_moved: false, prev_cursor_pos: [0.0, 0.0],
             glb_settings, voxelize_rx: None, voxelize_progress: 0.0, voxelize_stage: String::new(), collider: PlayerCollider::default(),
-            hide_ui: false, bg_color: [0.12, 0.14, 0.18], world_type, seed, cube_edits, error_banner: None,
+            hide_ui: false, bg_color, world_type, seed, cube_edits, error_banner: None,
             fps: 60.0, fps_frame_counter: 0, fps_timer: Instant::now(),
             tool_state: ToolState::default(), history: HistoryManager::new(64),
             orbit_pivot: Vec3::ZERO, mmb_dragging: false,
@@ -914,12 +1036,14 @@ impl State {
         self.camera.ortho_size = (half_extents.y.max(half_extents.x / aspect) * 2.2).clamp(16.0, 50000.0);
         self.update_camera_buffer();
         self.update_ui();
+        self.window.request_redraw();
     }
 
     pub fn toggle_projection(&mut self) {
         self.camera.is_ortho = !self.camera.is_ortho;
         self.update_camera_buffer();
         self.update_ui();
+        self.window.request_redraw();
     }
 
     pub fn update_camera_buffer(&self) {
@@ -935,6 +1059,8 @@ impl State {
             is_ortho: if self.camera.is_ortho { 1.0 } else { 0.0 },
             ortho_size: self.camera.ortho_size,
             screen_size: [self.config.width as f32, self.config.height as f32],
+            bg_color: self.bg_color,
+            _pad: 0.0,
         };
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
     }
@@ -955,6 +1081,7 @@ impl State {
             is_ortho: self.camera.is_ortho, ortho_size: self.camera.ortho_size, play_mode: self.play_mode,
             world_type: self.world_type, seed: self.seed, hotbar_colors: self.hotbar_colors,
             palette: self.palette.read().unwrap().clone(), octree: self.octree.clone(),
+            bg_color: self.bg_color,
         })?)?;
         Ok(())
     }
@@ -971,6 +1098,7 @@ impl State {
         *self.palette.write().unwrap() = data.palette;
         self.world_type = data.world_type;
         self.seed = data.seed;
+        self.bg_color = data.bg_color;
         
         self.octree = data.octree;
         self.history = HistoryManager::new(64);
@@ -1037,7 +1165,7 @@ impl State {
         let size_str = if self.edit_size < 0.001 { format!("RES: {:.1e}", self.edit_size) } else if self.edit_size < 1.0 { format!("RES: 1/{} ({:.4})", (1.0 / self.edit_size).round() as u32, self.edit_size) } else { format!("RES: {:.0}X{:.0}", self.edit_size, self.edit_size) };
         let frame_ms = if self.fps > 0.0 { 1000.0 / self.fps } else { 0.0 };
         let hud_status = format!("{:.0} FPS ({:.1}MS) | MODE: {} | PROJ: {} | WORLD: {} | VOXELS: {} | {}", self.fps, frame_ms, if self.play_mode == PlayMode::Flying { "FLY" } else { "REAL" }, if self.camera.is_ortho { "ORTHO" } else { "PERSP" }, self.world_type.name(), format_voxel_count(total_voxels), size_str);
-        let hud_tools = format!("TOOL: {} | RAD: {:.1} | UNDO: {} | REDO: {}", self.tool_state.active_tool.name(), self.tool_state.brush_radius, self.history.undo_stack.len(), self.history.redo_stack.len());
+        let hud_tools = format!("TOOL: {} | RAD: {:.1} | {} | UNDO: {} | REDO: {}", self.tool_state.active_tool.name(), self.tool_state.brush_radius, if self.tool_state.hollow { "HOLLOW" } else { "SOLID" }, self.history.undo_stack.len(), self.history.redo_stack.len());
         
         let (est_count, est_mb) = self.glb_settings.estimate_cost();
         let glb_cost_str = format!("EST: ~{} VOXELS ({:.0} MB SVO) | HW LIMIT: {}", format_voxel_count(est_count as usize), est_mb, format_voxel_count(self.glb_settings.max_gpu_nodes));
@@ -1046,7 +1174,7 @@ impl State {
             self.selected_slot, self.active_menu, &self.hotbar_colors, self.play_mode, self.camera.is_ortho, self.world_type,
             self.edit_size, self.last_target, aspect, self.camera.forward(), self.camera.right(), self.camera.up(), self.cursor_free,
             &self.glb_settings, self.voxelize_progress, &self.voxelize_stage, self.camera.view_proj(aspect), error_msg,
-            &self.tool_state, &hud_status, &hud_tools, &size_str, &glb_cost_str
+            &self.tool_state, &hud_status, &hud_tools, &size_str, &glb_cost_str, self.bg_color
         );
         self.ui_vertices_count = verts.len() as u32;
         self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
@@ -1081,7 +1209,9 @@ impl State {
         let s = self.edit_size;
 
         let (aabb_min, aabb_max) = match self.tool_state.active_tool {
-            ToolType::Sphere => (target_vec - Vec3::splat(self.tool_state.brush_radius), target_vec + Vec3::splat(self.tool_state.brush_radius)),
+            ToolType::Sphere | ToolType::Replace => (target_vec - Vec3::splat(self.tool_state.brush_radius), target_vec + Vec3::splat(self.tool_state.brush_radius)),
+            ToolType::Cylinder => (target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius), target_vec + Vec3::new(self.tool_state.brush_radius, self.tool_state.cylinder_height, self.tool_state.brush_radius)),
+            ToolType::Disc => (target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius), target_vec + Vec3::new(self.tool_state.brush_radius, s, self.tool_state.brush_radius)),
             ToolType::Box | ToolType::Line => {
                 let anchor = self.tool_state.pending_anchor.unwrap_or(target_vec);
                 (anchor.min(target_vec), anchor.max(target_vec) + Vec3::splat(s))
@@ -1101,23 +1231,27 @@ impl State {
                 }
             }
             ToolType::Sphere => {
-                let deltas = rasterize_sphere(&self.octree, target_vec + Vec3::splat(s * 0.5), self.tool_state.brush_radius, s, mat);
+                let deltas = rasterize_sphere(&self.octree, target_vec + Vec3::splat(s * 0.5), self.tool_state.brush_radius, s, mat, self.tool_state.hollow);
+                if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
+            }
+            ToolType::Cylinder => {
+                let deltas = rasterize_cylinder(&self.octree, target_vec, self.tool_state.brush_radius, self.tool_state.cylinder_height, s, mat, self.tool_state.hollow);
+                if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
+            }
+            ToolType::Disc => {
+                let deltas = rasterize_disc(&self.octree, target_vec, self.tool_state.brush_radius, s, mat, self.tool_state.hollow);
                 if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
             }
             ToolType::Box => {
                 if let Some(anchor) = self.tool_state.pending_anchor.take() {
-                    let deltas = rasterize_box(&self.octree, anchor, target_vec, s, mat);
-                    if !deltas.is_empty() {
-                        apply_deltas(&mut self.octree, &deltas, true);
-                    }
+                    let deltas = rasterize_box(&self.octree, anchor, target_vec, s, mat, self.tool_state.hollow);
+                    if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
                 }
             }
             ToolType::Line => {
                 if let Some(anchor) = self.tool_state.pending_anchor.take() {
                     let deltas = rasterize_line_pipe(&self.octree, anchor, target_vec, self.tool_state.line_radius, s, mat);
-                    if !deltas.is_empty() {
-                        apply_deltas(&mut self.octree, &deltas, true);
-                    }
+                    if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
                 }
             }
             ToolType::Paint => {
@@ -1125,6 +1259,13 @@ impl State {
                 if old_mat != 0 && old_mat != mat {
                     let deltas = vec![VoxelDelta { pos: target_vec.to_array(), size: s, old_material: old_mat, new_material: mat }];
                     apply_deltas(&mut self.octree, &deltas, true);
+                }
+            }
+            ToolType::Replace => {
+                let target_mat = self.octree.query_point(target_vec);
+                if target_mat != 0 && target_mat != mat {
+                    let deltas = rasterize_replace(&self.octree, target_vec + Vec3::splat(s * 0.5), self.tool_state.brush_radius, s, target_mat, mat);
+                    if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
                 }
             }
         }
@@ -1223,7 +1364,7 @@ impl State {
         let s = self.edit_size;
 
         if let Some(ref h) = hit {
-            let p = if self.input.action_remove || self.tool_state.active_tool == ToolType::Paint {
+            let p = if self.input.action_remove || matches!(self.tool_state.active_tool, ToolType::Paint | ToolType::Replace) {
                 h.hit_pos - h.normal * (s * 0.5)
             } else {
                 h.hit_pos + h.normal * (s * 0.5)
@@ -1562,12 +1703,10 @@ impl ApplicationHandler for App {
                             }
                             PhysicalKey::Code(KeyCode::Numpad5) | PhysicalKey::Code(KeyCode::KeyP) => {
                                 state.toggle_projection();
-                                state.window.request_redraw();
                                 return;
                             }
                             PhysicalKey::Code(KeyCode::NumpadDecimal) | PhysicalKey::Code(KeyCode::Period) => {
                                 state.focus_on_scene();
-                                state.window.request_redraw();
                                 return;
                             }
                             PhysicalKey::Code(KeyCode::NumpadAdd) | PhysicalKey::Code(KeyCode::Equal) => {
@@ -1601,6 +1740,14 @@ impl ApplicationHandler for App {
 
                         match key_event.physical_key {
                             PhysicalKey::Code(KeyCode::KeyV) => { state.tool_state.active_tool = ToolType::Pencil; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyO) => { state.tool_state.active_tool = ToolType::Sphere; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyY) => { state.tool_state.active_tool = ToolType::Cylinder; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyU) => { state.tool_state.active_tool = ToolType::Disc; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyB) => { state.tool_state.active_tool = ToolType::Box; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyL) => { state.tool_state.active_tool = ToolType::Line; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyK) => { state.tool_state.active_tool = ToolType::Paint; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyG) => { state.tool_state.active_tool = ToolType::Replace; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyH) => { state.tool_state.hollow = !state.tool_state.hollow; state.update_ui(); state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyX) => { 
                                 state.input.wireframe_mode = !state.input.wireframe_mode; 
                                 state.update_camera_buffer(); 
@@ -1608,10 +1755,6 @@ impl ApplicationHandler for App {
                                 state.window.request_redraw(); 
                                 return; 
                             }
-                            PhysicalKey::Code(KeyCode::KeyO) => { state.tool_state.active_tool = ToolType::Sphere; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyB) => { state.tool_state.active_tool = ToolType::Box; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyL) => { state.tool_state.active_tool = ToolType::Line; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyK) => { state.tool_state.active_tool = ToolType::Paint; state.tool_state.pending_anchor = None; state.update_ui(); state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyC) if state.active_menu == ActiveMenu::None => {
                                 state.input.action_pick = true;
                                 state.window.request_redraw();
@@ -1619,6 +1762,7 @@ impl ApplicationHandler for App {
                             }
                             PhysicalKey::Code(KeyCode::BracketLeft) => {
                                 state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
+                                state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
                                 state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0);
                                 state.update_ui();
                                 state.window.request_redraw();
@@ -1626,6 +1770,7 @@ impl ApplicationHandler for App {
                             }
                             PhysicalKey::Code(KeyCode::BracketRight) => {
                                 state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
+                                state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(32.0);
                                 state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0);
                                 state.update_ui();
                                 state.window.request_redraw();
@@ -1721,6 +1866,59 @@ impl ApplicationHandler for App {
                                 }
                                 return;
                             }
+
+                            if state.active_menu == ActiveMenu::None && my >= -0.83 && my <= -0.77 {
+                                let tb_w = 0.050;
+                                let tb_gap = 0.006;
+                                let total_tb_w = 8.0 * tb_w + 7.0 * tb_gap;
+                                let tb_start_x = -total_tb_w / 2.0 - 0.10;
+
+                                for (i, &tool) in ALL_TOOLS.iter().enumerate() {
+                                    let x0 = tb_start_x + i as f32 * (tb_w + tb_gap);
+                                    let x1 = x0 + tb_w;
+                                    if mx >= x0 && mx <= x1 {
+                                        state.tool_state.active_tool = tool;
+                                        state.tool_state.pending_anchor = None;
+                                        state.update_ui();
+                                        state.window.request_redraw();
+                                        return;
+                                    }
+                                }
+
+                                let ctrl_x0 = tb_start_x + total_tb_w + 0.015;
+                                let rad_minus_x0 = ctrl_x0;
+                                let rad_minus_x1 = rad_minus_x0 + 0.028;
+                                if mx >= rad_minus_x0 && mx <= rad_minus_x1 {
+                                    state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
+                                    state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
+                                    state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0);
+                                    state.update_ui();
+                                    state.window.request_redraw();
+                                    return;
+                                }
+
+                                let rad_lbl_x0 = rad_minus_x1 + 0.004;
+                                let rad_lbl_x1 = rad_lbl_x0 + 0.070;
+                                let rad_plus_x0 = rad_lbl_x1 + 0.004;
+                                let rad_plus_x1 = rad_plus_x0 + 0.028;
+                                if mx >= rad_plus_x0 && mx <= rad_plus_x1 {
+                                    state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
+                                    state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(32.0);
+                                    state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0);
+                                    state.update_ui();
+                                    state.window.request_redraw();
+                                    return;
+                                }
+
+                                let mode_x0 = rad_plus_x1 + 0.008;
+                                let mode_x1 = mode_x0 + 0.065;
+                                if mx >= mode_x0 && mx <= mode_x1 {
+                                    state.tool_state.hollow = !state.tool_state.hollow;
+                                    state.update_ui();
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                            }
                         } else if element_state == ElementState::Released && state.gimbal_dragging {
                             state.gimbal_dragging = false;
                             if !state.gimbal_drag_moved {
@@ -1761,17 +1959,33 @@ impl ApplicationHandler for App {
                         }
                         ActiveMenu::Pause => {
                             if button == MouseButton::Left && element_state == ElementState::Pressed {
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.46 && my <= 0.54 { state.prompt_native_file_dialog(); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.36 && my <= 0.44 { state.toggle_play_mode(); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.26 && my <= 0.34 { state.toggle_projection(); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.16 && my <= 0.24 { state.cycle_world_generator(); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= 0.06 && my <= 0.14 { state.clear_all_blocks(); return; }
-                                if mx >= -0.30 && mx <= -0.02 && my >= -0.06 && my <= 0.02 { let _ = state.save_game("world_save.json"); return; }
-                                if mx >= 0.02 && mx <= 0.30 && my >= -0.06 && my <= 0.02 { let _ = state.load_game("world_save.json"); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.16 && my <= -0.08 { state.bg_color = if state.bg_color[0] < 0.2 { [0.45, 0.5, 0.6] } else if state.bg_color[0] < 0.6 { [0.8, 0.85, 0.9] } else { [0.12, 0.14, 0.18] }; state.window.request_redraw(); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.28 && my <= -0.20 { state.set_menu(ActiveMenu::Controls); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.42 && my <= -0.34 { state.set_menu(ActiveMenu::None); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.54 && my <= -0.46 { event_loop.exit(); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.48 && my <= 0.56 { state.prompt_native_file_dialog(); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.38 && my <= 0.46 { state.toggle_play_mode(); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.28 && my <= 0.36 { state.toggle_projection(); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.18 && my <= 0.26 { state.cycle_world_generator(); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= 0.08 && my <= 0.16 { state.clear_all_blocks(); return; }
+                                if mx >= -0.30 && mx <= -0.02 && my >= -0.02 && my <= 0.06 { let _ = state.save_game("world_save.json"); return; }
+                                if mx >= 0.02 && mx <= 0.30 && my >= -0.02 && my <= 0.06 { let _ = state.load_game("world_save.json"); return; }
+                                
+                                let bg_w = 0.068; let bg_gap = 0.008; let bg_tot = 8.0 * bg_w + 7.0 * bg_gap; let bg_start_x = -bg_tot / 2.0;
+                                let bg_y0 = -0.19; let bg_y1 = -0.13;
+                                if my >= bg_y0 && my <= bg_y1 {
+                                    for (i, &col) in PRESET_BG_COLORS.iter().enumerate() {
+                                        let x0 = bg_start_x + i as f32 * (bg_w + bg_gap);
+                                        let x1 = x0 + bg_w;
+                                        if mx >= x0 && mx <= x1 {
+                                            state.bg_color = col;
+                                            state.update_camera_buffer();
+                                            state.update_ui();
+                                            state.window.request_redraw();
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.31 && my <= -0.23 { state.set_menu(ActiveMenu::Controls); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.45 && my <= -0.37 { state.set_menu(ActiveMenu::None); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.57 && my <= -0.49 { event_loop.exit(); return; }
                             }
                         }
                         ActiveMenu::Controls => {

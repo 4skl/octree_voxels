@@ -45,9 +45,12 @@ pub enum ActiveMenu {
 pub enum ToolType {
     Pencil,
     Sphere,
+    Cylinder,
+    Disc,
     Box,
     Line,
     Paint,
+    Replace,
 }
 
 impl ToolType {
@@ -55,9 +58,25 @@ impl ToolType {
         match self {
             ToolType::Pencil => "PENCIL [V]",
             ToolType::Sphere => "SPHERE [O]",
+            ToolType::Cylinder => "CYLINDER [Y]",
+            ToolType::Disc => "DISC [U]",
             ToolType::Box => "BOX [B]",
             ToolType::Line => "LINE/PIPE [L]",
             ToolType::Paint => "PAINT [K]",
+            ToolType::Replace => "REPLACE [G]",
+        }
+    }
+
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            ToolType::Pencil => "PEN",
+            ToolType::Sphere => "SPH",
+            ToolType::Cylinder => "CYL",
+            ToolType::Disc => "DSC",
+            ToolType::Box => "BOX",
+            ToolType::Line => "LIN",
+            ToolType::Paint => "PNT",
+            ToolType::Replace => "REP",
         }
     }
 }
@@ -66,7 +85,9 @@ impl ToolType {
 pub struct ToolState {
     pub active_tool: ToolType,
     pub brush_radius: f32,
+    pub cylinder_height: f32,
     pub line_radius: f32,
+    pub hollow: bool,
     pub pending_anchor: Option<Vec3>,
 }
 
@@ -75,7 +96,9 @@ impl Default for ToolState {
         Self {
             active_tool: ToolType::Pencil,
             brush_radius: 2.0,
+            cylinder_height: 4.0,
             line_radius: 0.0,
+            hollow: false,
             pending_anchor: None,
         }
     }
@@ -176,6 +199,7 @@ pub struct SaveData {
     pub hotbar_colors: [[f32; 3]; 10],
     pub palette: Vec<[f32; 3]>,
     pub octree: crate::engine::Octree,
+    pub bg_color: [f32; 3],
 }
 
 #[derive(Clone)]
@@ -287,6 +311,8 @@ pub struct CameraUniform {
     pub is_ortho: f32,
     pub ortho_size: f32,
     pub screen_size: [f32; 2],
+    pub bg_color: [f32; 3],
+    pub _pad: f32,
 }
 
 #[repr(C)]

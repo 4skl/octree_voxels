@@ -8,6 +8,8 @@ struct CameraUniform {
     is_ortho: f32,
     ortho_size: f32,
     screen_size: vec2<f32>,
+    bg_color: vec3<f32>,
+    _pad: f32,
 };
 
 struct SvoNode {
@@ -242,12 +244,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let p_world = ray_orig + ray_dir * t_ground;
                 let grid_coord = abs(fract(p_world.xz * 0.5) - 0.5);
                 let line = smoothstep(0.0, 0.04, min(grid_coord.x, grid_coord.y));
-                let grid_col = mix(vec3<f32>(0.26, 0.30, 0.36), vec3<f32>(0.10, 0.12, 0.15), line);
+                let grid_col = mix(camera.bg_color * 1.5, camera.bg_color * 0.7, line);
                 let fog = clamp(t_ground / 15000.0, 0.0, 1.0);
-                return vec4<f32>(mix(grid_col, vec3<f32>(0.12, 0.14, 0.18), fog), 1.0);
+                return vec4<f32>(mix(grid_col, camera.bg_color, fog), 1.0);
             }
         }
-        discard;
+        return vec4<f32>(camera.bg_color, 1.0);
     }
 
     let light_dir = normalize(vec3<f32>(0.4, 0.9, 0.3));

@@ -26,7 +26,6 @@ pub struct Octree {
 impl Octree {
     pub fn new() -> Self {
         let mut nodes = Vec::with_capacity(8192);
-        // Pad to 8 nodes so subsequent allocate_block calls remain 8-aligned
         nodes.resize(8, OctreeNode::default());
         let mut dirty_pages = HashSet::new();
         dirty_pages.insert(0);
@@ -448,16 +447,19 @@ pub fn bresenham_3d(p0: [i32; 3], p1: [i32; 3]) -> Vec<[i32; 3]> {
     points
 }
 
-pub fn rasterize_sphere(octree: &Octree, center: Vec3, radius: f32, voxel_size: f32, material: u16) -> Vec<VoxelDelta> {
+pub fn rasterize_sphere(octree: &Octree, center: Vec3, radius: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
     let mut deltas = Vec::new();
     let r_vox = (radius / voxel_size).ceil() as i32;
     let r_sq = radius * radius;
+    let inner_r = (radius - voxel_size).max(0.0);
+    let inner_r_sq = inner_r * inner_r;
 
     for dx in -r_vox..=r_vox {
         for dy in -r_vox..=r_vox {
             for dz in -r_vox..=r_vox {
                 let offset = Vec3::new(dx as f32, dy as f32, dz as f32) * voxel_size;
-                if offset.length_squared() <= r_sq {
+                let d_sq = offset.length_squared();
+                if d_sq <= r_sq && (!hollow || d_sq >= inner_r_sq) {
                     let p = center + offset;
                     let old_mat = octree.query_point(p);
                     if old_mat != material {
@@ -470,7 +472,60 @@ pub fn rasterize_sphere(octree: &Octree, center: Vec3, radius: f32, voxel_size: 
     deltas
 }
 
-pub fn rasterize_box(octree: &Octree, corner_a: Vec3, corner_b: Vec3, voxel_size: f32, material: u16) -> Vec<VoxelDelta> {
+pub fn rasterize_cylinder(octree: &Octree, base_center: Vec3, radius: f32, height: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let r_vox = (radius / voxel_size).ceil() as i32;
+    let h_vox = (height / voxel_size).ceil() as i32;
+    let r_sq = radius * radius;
+    let inner_r = (radius - voxel_size).max(0.0);
+    let inner_r_sq = inner_r * inner_r;
+
+    for dy in 0..=h_vox {
+        let is_cap = dy == 0 || dy == h_vox;
+        for dx in -r_vox..=r_vox {
+            for dz in -r_vox..=r_vox {
+                let offset_xz = Vec3::new(dx as f32, 0.0, dz as f32) * voxel_size;
+                let d_sq = offset_xz.length_squared();
+                if d_sq <= r_sq {
+                    let is_wall = d_sq >= inner_r_sq;
+                    if !hollow || is_wall || is_cap {
+                        let p = base_center + Vec3::new(offset_xz.x, dy as f32 * voxel_size, offset_xz.z);
+                        let old_mat = octree.query_point(p);
+                        if old_mat != material {
+                            deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_disc(octree: &Octree, center: Vec3, radius: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let r_vox = (radius / voxel_size).ceil() as i32;
+    let r_sq = radius * radius;
+    let inner_r = (radius - voxel_size).max(0.0);
+    let inner_r_sq = inner_r * inner_r;
+
+    for dx in -r_vox..=r_vox {
+        for dz in -r_vox..=r_vox {
+            let offset = Vec3::new(dx as f32, 0.0, dz as f32) * voxel_size;
+            let d_sq = offset.length_squared();
+            if d_sq <= r_sq && (!hollow || d_sq >= inner_r_sq) {
+                let p = center + offset;
+                let old_mat = octree.query_point(p);
+                if old_mat != material {
+                    deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                }
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_box(octree: &Octree, corner_a: Vec3, corner_b: Vec3, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
     let mut deltas = Vec::new();
     let min_p = corner_a.min(corner_b);
     let max_p = corner_a.max(corner_b);
@@ -482,10 +537,13 @@ pub fn rasterize_box(octree: &Octree, corner_a: Vec3, corner_b: Vec3, voxel_size
     for ix in 0..=sx {
         for iy in 0..=sy {
             for iz in 0..=sz {
-                let p = min_p + Vec3::new(ix as f32, iy as f32, iz as f32) * voxel_size;
-                let old_mat = octree.query_point(p);
-                if old_mat != material {
-                    deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                let is_boundary = ix == 0 || ix == sx || iy == 0 || iy == sy || iz == 0 || iz == sz;
+                if !hollow || is_boundary {
+                    let p = min_p + Vec3::new(ix as f32, iy as f32, iz as f32) * voxel_size;
+                    let old_mat = octree.query_point(p);
+                    if old_mat != material {
+                        deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                    }
                 }
             }
         }
@@ -525,6 +583,28 @@ pub fn rasterize_line_pipe(octree: &Octree, p0: Vec3, p1: Vec3, radius: f32, vox
                         if old_mat != material {
                             deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
                         }
+                    }
+                }
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_replace(octree: &Octree, center: Vec3, radius: f32, voxel_size: f32, target_material: u16, new_material: u16) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let r_vox = (radius / voxel_size).ceil() as i32;
+    let r_sq = radius * radius;
+
+    for dx in -r_vox..=r_vox {
+        for dy in -r_vox..=r_vox {
+            for dz in -r_vox..=r_vox {
+                let offset = Vec3::new(dx as f32, dy as f32, dz as f32) * voxel_size;
+                if offset.length_squared() <= r_sq {
+                    let p = center + offset;
+                    let cur_mat = octree.query_point(p);
+                    if cur_mat == target_material && cur_mat != new_material {
+                        deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: cur_mat, new_material });
                     }
                 }
             }
