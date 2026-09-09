@@ -36,11 +36,14 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     return out;
 }
 
-struct StackNode {
+struct DDAStackEntry {
     idx: u32,
     b_min: vec3<f32>,
     size: f32,
-    t_enter: f32,
+    t_exit_x: f32,
+    t_exit_y: f32,
+    t_exit_z: f32,
+    octant: u32,
 };
 
 @fragment
@@ -55,7 +58,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let p_far  = camera.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
         let ro = p_near.xyz / p_near.w;
         ray_dir = normalize((p_far.xyz / p_far.w) - ro);
-        
         ray_orig = ro - ray_dir * 2000.0;
     } else {
         let p_far = camera.inv_view_proj * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
@@ -64,11 +66,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         ray_dir = normalize(p_world - ray_orig);
     }
 
-    let inv_dir = vec3<f32>(
-        select(1.0 / ray_dir.x, select(-1e7, 1e7, ray_dir.x >= 0.0), abs(ray_dir.x) < 1e-8),
-        select(1.0 / ray_dir.y, select(-1e7, 1e7, ray_dir.y >= 0.0), abs(ray_dir.y) < 1e-8),
-        select(1.0 / ray_dir.z, select(-1e7, 1e7, ray_dir.z >= 0.0), abs(ray_dir.z) < 1e-8),
+    let eps_dir = 1e-7;
+    let rd = vec3<f32>(
+        select(ray_dir.x, select(-eps_dir, eps_dir, ray_dir.x >= 0.0), abs(ray_dir.x) < eps_dir),
+        select(ray_dir.y, select(-eps_dir, eps_dir, ray_dir.y >= 0.0), abs(ray_dir.y) < eps_dir),
+        select(ray_dir.z, select(-eps_dir, eps_dir, ray_dir.z >= 0.0), abs(ray_dir.z) < eps_dir),
     );
+    let inv_dir = 1.0 / rd;
 
     let root_min = camera.world_min;
     let root_max = camera.world_min + vec3<f32>(camera.world_size);
@@ -83,116 +87,149 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit_mat = 0u;
     var hit_normal = vec3<f32>(0.0);
     var hit_t = 1e9;
-    var hit_b_min = vec3<f32>(0.0);
-    var hit_size = 0.0;
 
     let root_node = svo_nodes[0];
     let has_voxels = (root_node.child_mask != 0u || root_node.material_id != 0u);
 
     if (has_voxels && r_exit >= max(r_enter, 0.0)) {
-        var stack: array<StackNode, 22>;
-        var stack_len: i32 = 1;
-        stack[0] = StackNode(0u, root_min, camera.world_size, max(r_enter, 0.0));
+        var t_curr = max(r_enter, 0.0);
+        let second_half = vec3<u32>(
+            select(0u, 1u, rd.x > 0.0),
+            select(0u, 1u, rd.y > 0.0),
+            select(0u, 1u, rd.z > 0.0)
+        );
+
+        var stack: array<DDAStackEntry, 24>;
+        var level: i32 = 0;
+
+        stack[0].idx = 0u;
+        stack[0].b_min = root_min;
+        stack[0].size = camera.world_size;
+        stack[0].t_exit_x = rtmax3.x;
+        stack[0].t_exit_y = rtmax3.y;
+        stack[0].t_exit_z = rtmax3.z;
+
+        let root_half = camera.world_size * 0.5;
+        let root_mid = root_min + vec3<f32>(root_half);
+        let root_t_mid = (root_mid - ray_orig) * inv_dir;
+        let r_bx = select(u32(t_curr < root_t_mid.x), u32(t_curr >= root_t_mid.x), rd.x > 0.0);
+        let r_by = select(u32(t_curr < root_t_mid.y), u32(t_curr >= root_t_mid.y), rd.y > 0.0);
+        let r_bz = select(u32(t_curr < root_t_mid.z), u32(t_curr >= root_t_mid.z), rd.z > 0.0);
+        stack[0].octant = r_bx | (r_by << 1u) | (r_bz << 2u);
 
         var steps = 0;
         let total_nodes = arrayLength(&svo_nodes);
 
-        while (stack_len > 0 && steps < 128) {
+        while (level >= 0 && steps < 384) {
             steps = steps + 1;
-            stack_len = stack_len - 1;
-            let curr = stack[stack_len];
+            let curr = stack[level];
+            let parent_exit = min(curr.t_exit_x, min(curr.t_exit_y, curr.t_exit_z));
 
-            if (curr.t_enter >= hit_t || curr.idx >= total_nodes) { continue; }
+            if (t_curr >= parent_exit - 1e-5) {
+                level = level - 1;
+                continue;
+            }
+
+            if (curr.idx >= total_nodes) {
+                level = level - 1;
+                continue;
+            }
 
             let node = svo_nodes[curr.idx];
 
             if (node.child_pointer == 0u) {
                 if (node.material_id != 0u) {
-                    let p_hit = ray_orig + ray_dir * curr.t_enter;
-                    
+                    let p_hit = ray_orig + rd * t_curr;
+
                     if (camera.show_borders > 0.5) {
                         let local_p = saturate((p_hit - curr.b_min) / curr.size);
                         let dist_x = min(local_p.x, 1.0 - local_p.x);
                         let dist_y = min(local_p.y, 1.0 - local_p.y);
                         let dist_z = min(local_p.z, 1.0 - local_p.z);
-                        let edge_thresh = 0.03; 
-                        
+                        let edge_thresh = 0.035;
+
                         if (!((dist_x < edge_thresh && dist_y < edge_thresh) ||
                               (dist_y < edge_thresh && dist_z < edge_thresh) ||
                               (dist_z < edge_thresh && dist_x < edge_thresh))) {
-                            continue; 
+                            t_curr = parent_exit;
+                            level = level - 1;
+                            continue;
                         }
                     }
 
+                    let half_node = curr.size * 0.5;
+                    let center = curr.b_min + vec3<f32>(half_node);
+                    let p_rel = (p_hit - center) / half_node;
+                    let abs_p = abs(p_rel);
+                    let max_c = max(max(abs_p.x, abs_p.y), abs_p.z);
+
+                    if (max_c == abs_p.x) {
+                        hit_normal = vec3<f32>(sign(p_rel.x), 0.0, 0.0);
+                    } else if (max_c == abs_p.y) {
+                        hit_normal = vec3<f32>(0.0, sign(p_rel.y), 0.0);
+                    } else {
+                        hit_normal = vec3<f32>(0.0, 0.0, sign(p_rel.z));
+                    }
+
                     hit_mat = node.material_id;
-                    hit_t = curr.t_enter;
-                    let c_min = curr.b_min;
-                    let c_max = curr.b_min + vec3<f32>(curr.size);
-                    let eps = 0.002 * curr.size;
-                    if (abs(p_hit.x - c_min.x) < eps) { hit_normal = vec3<f32>(-1.0, 0.0, 0.0); }
-                    else if (abs(p_hit.x - c_max.x) < eps) { hit_normal = vec3<f32>(1.0, 0.0, 0.0); }
-                    else if (abs(p_hit.y - c_min.y) < eps) { hit_normal = vec3<f32>(0.0, -1.0, 0.0); }
-                    else if (abs(p_hit.y - c_max.y) < eps) { hit_normal = vec3<f32>(0.0, 1.0, 0.0); }
-                    else if (abs(p_hit.z - c_min.z) < eps) { hit_normal = vec3<f32>(0.0, 0.0, -1.0); }
-                    else { hit_normal = vec3<f32>(0.0, 0.0, 1.0); }
+                    hit_t = t_curr;
                     break;
                 }
+
+                t_curr = parent_exit;
+                level = level - 1;
                 continue;
             }
 
             let half_s = curr.size * 0.5;
+            let mid = curr.b_min + vec3<f32>(half_s);
+            let t_mid = (mid - ray_orig) * inv_dir;
 
-            var count = 0u;
-            var cand_idx: array<u32, 8>;
-            var cand_min: array<vec3<f32>, 8>;
-            var cand_t: array<f32, 8>;
+            let oct = stack[level].octant;
+            let bx = oct & 1u;
+            let by = (oct >> 1u) & 1u;
+            let bz = (oct >> 2u) & 1u;
 
-            for (var i = 0u; i < 8u; i = i + 1u) {
-                if ((node.child_mask & (1u << i)) != 0u) {
-                    let offset = vec3<f32>(
-                        select(0.0, half_s, (i & 1u) != 0u),
-                        select(0.0, half_s, (i & 2u) != 0u),
-                        select(0.0, half_s, (i & 4u) != 0u)
-                    );
-                    let child_min = curr.b_min + offset;
-                    let child_max = child_min + vec3<f32>(half_s);
+            let c_exit_x = select(t_mid.x, curr.t_exit_x, bx == second_half.x);
+            let c_exit_y = select(t_mid.y, curr.t_exit_y, by == second_half.y);
+            let c_exit_z = select(t_mid.z, curr.t_exit_z, bz == second_half.z);
+            let c_exit = min(c_exit_x, min(c_exit_y, c_exit_z));
 
-                    let t0 = (child_min - ray_orig) * inv_dir;
-                    let t1 = (child_max - ray_orig) * inv_dir;
-                    let tmin3 = min(t0, t1);
-                    let tmax3 = max(t0, t1);
-                    let ct_enter = max(max(tmin3.x, tmin3.y), tmin3.z);
-                    let ct_exit  = min(min(tmax3.x, tmax3.y), tmax3.z);
+            let has_child = (node.child_mask & (1u << oct)) != 0u;
 
-                    if (ct_exit >= max(ct_enter, 0.0) && ct_enter < hit_t) {
-                        cand_idx[count] = node.child_pointer + i;
-                        cand_min[count] = child_min;
-                        cand_t[count] = max(ct_enter, 0.0);
-                        count = count + 1u;
-                    }
-                }
+            if (c_exit < parent_exit - 1e-5) {
+                if (c_exit == c_exit_x) { stack[level].octant ^= 1u; }
+                if (c_exit == c_exit_y) { stack[level].octant ^= 2u; }
+                if (c_exit == c_exit_z) { stack[level].octant ^= 4u; }
             }
 
-            for (var a = 1u; a < count; a = a + 1u) {
-                let cur_t = cand_t[a];
-                let cur_idx = cand_idx[a];
-                let cur_min = cand_min[a];
-                var j = a;
-                while (j > 0u && cand_t[j - 1u] < cur_t) {
-                    cand_t[j] = cand_t[j - 1u];
-                    cand_idx[j] = cand_idx[j - 1u];
-                    cand_min[j] = cand_min[j - 1u];
-                    j = j - 1u;
-                }
-                cand_t[j] = cur_t;
-                cand_idx[j] = cur_idx;
-                cand_min[j] = cur_min;
-            }
+            if (has_child && level < 23) {
+                let child_idx = node.child_pointer + oct;
+                let child_min = curr.b_min + vec3<f32>(
+                    select(0.0, half_s, bx != 0u),
+                    select(0.0, half_s, by != 0u),
+                    select(0.0, half_s, bz != 0u)
+                );
 
-            for (var k = 0u; k < count; k = k + 1u) {
-                if (stack_len < 21) {
-                    stack[stack_len] = StackNode(cand_idx[k], cand_min[k], half_s, cand_t[k]);
-                    stack_len = stack_len + 1;
+                let ch_half = half_s * 0.5;
+                let ch_mid = child_min + vec3<f32>(ch_half);
+                let ch_t_mid = (ch_mid - ray_orig) * inv_dir;
+                let cbx = select(u32(t_curr < ch_t_mid.x), u32(t_curr >= ch_t_mid.x), rd.x > 0.0);
+                let cby = select(u32(t_curr < ch_t_mid.y), u32(t_curr >= ch_t_mid.y), rd.y > 0.0);
+                let cbz = select(u32(t_curr < ch_t_mid.z), u32(t_curr >= ch_t_mid.z), rd.z > 0.0);
+
+                level = level + 1;
+                stack[level].idx = child_idx;
+                stack[level].b_min = child_min;
+                stack[level].size = half_s;
+                stack[level].t_exit_x = c_exit_x;
+                stack[level].t_exit_y = c_exit_y;
+                stack[level].t_exit_z = c_exit_z;
+                stack[level].octant = cbx | (cby << 1u) | (cbz << 2u);
+            } else {
+                t_curr = c_exit;
+                if (c_exit >= parent_exit - 1e-5) {
+                    level = level - 1;
                 }
             }
         }

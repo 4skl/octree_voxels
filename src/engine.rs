@@ -26,7 +26,8 @@ pub struct Octree {
 impl Octree {
     pub fn new() -> Self {
         let mut nodes = Vec::with_capacity(8192);
-        nodes.push(OctreeNode::default());
+        // Pad to 8 nodes so subsequent allocate_block calls remain 8-aligned
+        nodes.resize(8, OctreeNode::default());
         let mut dirty_pages = HashSet::new();
         dirty_pages.insert(0);
         Self {

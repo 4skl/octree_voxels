@@ -670,8 +670,6 @@ impl State {
             apply_limit_buckets: Default::default()
         }).await.unwrap();
 
-        println!("=== Active Graphics Adapter: {} ({:?}) ===", adapter.get_info().name, adapter.get_info().device_type);
-
         let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() }).await.unwrap();
         let mut config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
         config.present_mode = wgpu::PresentMode::AutoVsync;
@@ -1061,6 +1059,7 @@ impl State {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.update_camera_buffer();
+            self.update_ui();
         }
     }
 
@@ -1069,15 +1068,24 @@ impl State {
             Some(t) => Vec3::from(t),
             None => return,
         };
+
+        if matches!(self.tool_state.active_tool, ToolType::Box | ToolType::Line)
+            && self.tool_state.pending_anchor.is_none()
+        {
+            self.tool_state.pending_anchor = Some(target_vec);
+            self.update_ui();
+            return;
+        }
+
         let mat = if is_removal { 0 } else { self.get_or_create_material(self.hotbar_colors[self.selected_slot]) };
         let s = self.edit_size;
 
         let (aabb_min, aabb_max) = match self.tool_state.active_tool {
             ToolType::Sphere => (target_vec - Vec3::splat(self.tool_state.brush_radius), target_vec + Vec3::splat(self.tool_state.brush_radius)),
             ToolType::Box | ToolType::Line => {
-                if let Some(anchor) = self.tool_state.pending_anchor { (anchor.min(target_vec), anchor.max(target_vec) + Vec3::splat(s)) } 
-                else { (target_vec, target_vec + Vec3::splat(s)) }
-            },
+                let anchor = self.tool_state.pending_anchor.unwrap_or(target_vec);
+                (anchor.min(target_vec), anchor.max(target_vec) + Vec3::splat(s))
+            }
             _ => (target_vec, target_vec + Vec3::splat(s)),
         };
 
@@ -1102,8 +1110,6 @@ impl State {
                     if !deltas.is_empty() {
                         apply_deltas(&mut self.octree, &deltas, true);
                     }
-                } else {
-                    self.tool_state.pending_anchor = Some(target_vec);
                 }
             }
             ToolType::Line => {
@@ -1112,8 +1118,6 @@ impl State {
                     if !deltas.is_empty() {
                         apply_deltas(&mut self.octree, &deltas, true);
                     }
-                } else {
-                    self.tool_state.pending_anchor = Some(target_vec);
                 }
             }
             ToolType::Paint => {
@@ -1171,8 +1175,20 @@ impl State {
         for msg in messages {
             match msg {
                 VoxelizeMsg::Done(Ok(voxels)) => {
+                    if let Some((first_pos, first_size, _)) = voxels.first() {
+                        let mut min_bound = *first_pos;
+                        let mut max_bound = *first_pos + Vec3::splat(*first_size);
+
+                        for (pos, size, _) in &voxels {
+                            min_bound = min_bound.min(*pos);
+                            max_bound = max_bound.max(*pos + Vec3::splat(*size));
+                        }
+
+                        let total_size = (max_bound - min_bound).max_element();
+                        self.octree.ensure_bounds(min_bound, total_size);
+                    }
+
                     for (pos, size, mat) in voxels {
-                        self.octree.ensure_bounds(pos, size);
                         let old_mat = self.octree.query_point(pos);
                         if old_mat != mat {
                             self.octree.insert_cube_world(pos, size, mat, false);
@@ -1397,6 +1413,7 @@ impl ApplicationHandler for App {
                             state.camera.yaw -= dx * 3.8;
                             state.camera.pitch = (state.camera.pitch - dy * 3.8).clamp(-1.56, 1.56);
                             state.update_orbit_position();
+                            state.update_ui();
                             state.window.request_redraw();
                         }
                     } else if state.active_menu == ActiveMenu::Edit {
@@ -1454,6 +1471,7 @@ impl ApplicationHandler for App {
                                     for &(p, sz, _) in &action.removed { state.octree.insert_cube_world(p, sz, 0, false); }
                                     for &(p, sz, m) in &action.added { state.octree.insert_cube_world(p, sz, m, false); }
                                     state.octree.collapse(state.octree.root_index as usize);
+                                    state.octree.recalculate_voxel_count();
                                     state.history.undo_stack.push_back(action);
                                     state.sync_svo_buffer_full();
                                     state.update_ui();
@@ -1463,6 +1481,7 @@ impl ApplicationHandler for App {
                                 for &(p, sz, _) in &action.added { state.octree.insert_cube_world(p, sz, 0, false); }
                                 for &(p, sz, m) in &action.removed { state.octree.insert_cube_world(p, sz, m, false); }
                                 state.octree.collapse(state.octree.root_index as usize);
+                                state.octree.recalculate_voxel_count();
                                 state.history.redo_stack.push_back(action);
                                 state.sync_svo_buffer_full();
                                 state.update_ui();
@@ -1476,6 +1495,7 @@ impl ApplicationHandler for App {
                                 for &(p, sz, _) in &action.removed { state.octree.insert_cube_world(p, sz, 0, false); }
                                 for &(p, sz, m) in &action.added { state.octree.insert_cube_world(p, sz, m, false); }
                                 state.octree.collapse(state.octree.root_index as usize);
+                                state.octree.recalculate_voxel_count();
                                 state.history.undo_stack.push_back(action);
                                 state.sync_svo_buffer_full();
                                 state.update_ui();
