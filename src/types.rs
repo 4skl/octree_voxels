@@ -88,27 +88,27 @@ pub struct VoxelDelta {
     pub new_material: u16,
 }
 
+#[derive(Clone)]
+pub struct HistoryAction {
+    pub removed: Vec<(Vec3, f32, u16)>,
+    pub added: Vec<(Vec3, f32, u16)>,
+}
+
 pub struct HistoryManager {
-    pub undo_stack: Vec<Vec<VoxelDelta>>,
-    pub redo_stack: Vec<Vec<VoxelDelta>>,
+    pub undo_stack: Vec<HistoryAction>,
+    pub redo_stack: Vec<HistoryAction>,
     pub max_history: usize,
 }
 
 impl HistoryManager {
     pub fn new(max_history: usize) -> Self {
-        Self {
-            undo_stack: Vec::with_capacity(max_history),
-            redo_stack: Vec::new(),
-            max_history,
-        }
+        Self { undo_stack: Vec::with_capacity(max_history), redo_stack: Vec::new(), max_history }
     }
 
-    pub fn record(&mut self, deltas: Vec<VoxelDelta>) {
-        if deltas.is_empty() { return; }
-        if self.undo_stack.len() >= self.max_history {
-            self.undo_stack.remove(0);
-        }
-        self.undo_stack.push(deltas);
+    pub fn record(&mut self, action: HistoryAction) {
+        if action.removed.is_empty() && action.added.is_empty() { return; }
+        if self.undo_stack.len() >= self.max_history { self.undo_stack.remove(0); }
+        self.undo_stack.push(action);
         self.redo_stack.clear();
     }
 }
@@ -174,7 +174,7 @@ pub struct SaveData {
     pub seed: u32,
     pub hotbar_colors: [[f32; 3]; 10],
     pub palette: Vec<[f32; 3]>,
-    #[serde(default)] pub cube_edits: Vec<CubeEdit>,
+    pub octree: crate::engine::Octree,
 }
 
 #[derive(Clone)]

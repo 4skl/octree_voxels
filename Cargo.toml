@@ -7,7 +7,7 @@ edition = "2024"
 block-mesh = "0.2.0"
 bytemuck = {version = "1.25.2", features = ["derive"] }
 env_logger = "0.11.11"
-glam = { version = "0.33.6", features = ["bytemuck"] }
+glam = { version = "0.33.7", features = ["bytemuck", "serde", "fast-math"] }
 gltf = "1.4.1"
 log = "0.4.34"
 ndshape = "0.3.0"

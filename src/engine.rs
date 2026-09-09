@@ -4,7 +4,7 @@ use noise::{Fbm, NoiseFn, Perlin};
 use std::collections::HashSet;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable, serde::Serialize, serde::Deserialize)]
 pub struct OctreeNode {
     pub child_mask: u32,
     pub child_pointer: u32,
@@ -12,12 +12,12 @@ pub struct OctreeNode {
     pub _pad: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Octree {
     pub nodes: Vec<OctreeNode>,
     pub root_index: u32,
     pub free_list: Vec<u32>,
-    pub dirty_pages: HashSet<usize>,
+    pub dirty_pages: std::collections::HashSet<usize>,
     pub total_voxels: usize,
     pub world_min: Vec3,
     pub world_size: f32,
@@ -375,6 +375,24 @@ impl Octree {
             }
         }
         has_voxels
+    }
+
+    pub fn capture_aabb(&self, node_idx: usize, n_min: Vec3, n_size: f32, a_min: Vec3, a_max: Vec3, out: &mut Vec<(Vec3, f32, u16)>) {
+        let node = &self.nodes[node_idx];
+        if node.child_pointer == 0 {
+            if node.material_id != 0 { out.push((n_min, n_size, node.material_id as u16)); }
+            return;
+        }
+        let h = n_size * 0.5;
+        for i in 0..8 {
+            if (node.child_mask & (1 << i)) != 0 {
+                let c_min = n_min + Vec3::new(if (i & 1) != 0 { h } else { 0.0 }, if (i & 2) != 0 { h } else { 0.0 }, if (i & 4) != 0 { h } else { 0.0 });
+                let c_max = c_min + Vec3::splat(h);
+                if c_min.x < a_max.x && c_max.x > a_min.x && c_min.y < a_max.y && c_max.y > a_min.y && c_min.z < a_max.z && c_max.z > a_min.z {
+                    self.capture_aabb((node.child_pointer + i) as usize, c_min, h, a_min, a_max, out);
+                }
+            }
+        }
     }
 }
 

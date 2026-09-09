@@ -963,7 +963,7 @@ impl State {
             player_pos: self.camera.position.to_array(), camera_yaw: self.camera.yaw, camera_pitch: self.camera.pitch,
             is_ortho: self.camera.is_ortho, ortho_size: self.camera.ortho_size, play_mode: self.play_mode,
             world_type: self.world_type, seed: self.seed, hotbar_colors: self.hotbar_colors,
-            palette: self.palette.read().unwrap().clone(), cube_edits: self.cube_edits.clone(),
+            palette: self.palette.read().unwrap().clone(), octree: self.octree.clone(),
         })?)?;
         Ok(())
     }
@@ -980,9 +980,10 @@ impl State {
         *self.palette.write().unwrap() = data.palette;
         self.world_type = data.world_type;
         self.seed = data.seed;
-        self.cube_edits = data.cube_edits;
-        self.octree = generate_world_terrain(self.world_type, self.seed, &self.cube_edits);
+        
+        self.octree = data.octree; // Charge l'arbre exact
         self.history = HistoryManager::new(64);
+        
         self.sync_svo_buffer_full();
         self.sync_palette_buffer();
         self.update_camera_buffer();
@@ -1070,31 +1071,37 @@ impl State {
         let mat = if is_removal { 0 } else { self.get_or_create_material(self.hotbar_colors[self.selected_slot]) };
         let s = self.edit_size;
 
+        // Calcul de l'AABB pour l'action de l'outil
+        let (aabb_min, aabb_max) = match self.tool_state.active_tool {
+            ToolType::Sphere => (target_vec - Vec3::splat(self.tool_state.brush_radius), target_vec + Vec3::splat(self.tool_state.brush_radius)),
+            ToolType::Box | ToolType::Line => {
+                if let Some(anchor) = self.tool_state.pending_anchor { (anchor.min(target_vec), anchor.max(target_vec) + Vec3::splat(s)) } 
+                else { (target_vec, target_vec + Vec3::splat(s)) }
+            },
+            _ => (target_vec, target_vec + Vec3::splat(s)),
+        };
+
+        // Capture de l'état précédent
+        let mut removed = Vec::new();
+        self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut removed);
+
         match self.tool_state.active_tool {
             ToolType::Pencil => {
                 let old_mat = self.octree.query_point(target_vec);
                 if old_mat != mat {
                     let deltas = vec![VoxelDelta { pos: target_vec.to_array(), size: s, old_material: old_mat, new_material: mat }];
                     apply_deltas(&mut self.octree, &deltas, true);
-                    self.history.record(deltas);
-                    self.sync_svo_buffer();
                 }
             }
             ToolType::Sphere => {
                 let deltas = rasterize_sphere(&self.octree, target_vec + Vec3::splat(s * 0.5), self.tool_state.brush_radius, s, mat);
-                if !deltas.is_empty() {
-                    apply_deltas(&mut self.octree, &deltas, true);
-                    self.history.record(deltas);
-                    self.sync_svo_buffer();
-                }
+                if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
             }
             ToolType::Box => {
                 if let Some(anchor) = self.tool_state.pending_anchor.take() {
                     let deltas = rasterize_box(&self.octree, anchor, target_vec, s, mat);
                     if !deltas.is_empty() {
                         apply_deltas(&mut self.octree, &deltas, true);
-                        self.history.record(deltas);
-                        self.sync_svo_buffer();
                     }
                 } else {
                     self.tool_state.pending_anchor = Some(target_vec);
@@ -1105,8 +1112,6 @@ impl State {
                     let deltas = rasterize_line_pipe(&self.octree, anchor, target_vec, self.tool_state.line_radius, s, mat);
                     if !deltas.is_empty() {
                         apply_deltas(&mut self.octree, &deltas, true);
-                        self.history.record(deltas);
-                        self.sync_svo_buffer();
                     }
                 } else {
                     self.tool_state.pending_anchor = Some(target_vec);
@@ -1117,11 +1122,17 @@ impl State {
                 if old_mat != 0 && old_mat != mat {
                     let deltas = vec![VoxelDelta { pos: target_vec.to_array(), size: s, old_material: old_mat, new_material: mat }];
                     apply_deltas(&mut self.octree, &deltas, true);
-                    self.history.record(deltas);
-                    self.sync_svo_buffer();
                 }
             }
         }
+
+        // Capture du nouvel état après l'action de l'outil
+        let mut added = Vec::new();
+        self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut added);
+
+        // Enregistrement dans l'historique et synchronisation
+        self.history.record(HistoryAction { removed, added });
+        self.sync_svo_buffer();
     }
 
     fn update(&mut self, _dt: f32) {
@@ -1166,7 +1177,6 @@ impl State {
                     }
                     self.octree.collapse(self.octree.root_index as usize);
                     self.octree.recalculate_voxel_count();
-                    self.history.record(deltas);
                     self.sync_svo_buffer_full();
                     self.sync_palette_buffer();
                     self.voxelize_rx = None;
@@ -1436,16 +1446,22 @@ impl ApplicationHandler for App {
 
                         if is_z {
                             if state.input.shift_pressed {
-                                if let Some(deltas) = state.history.redo_stack.pop() {
-                                    apply_deltas(&mut state.octree, &deltas, true);
-                                    state.history.undo_stack.push(deltas);
+                                // REDO
+                                if let Some(action) = state.history.redo_stack.pop() {
+                                    for &(p, sz, _) in &action.removed { state.octree.insert_cube_world(p, sz, 0, false); }
+                                    for &(p, sz, m) in &action.added { state.octree.insert_cube_world(p, sz, m, false); }
+                                    state.octree.collapse(state.octree.root_index as usize);
+                                    state.history.undo_stack.push(action);
                                     state.sync_svo_buffer_full();
                                     state.update_ui();
                                     state.window.request_redraw();
                                 }
-                            } else if let Some(deltas) = state.history.undo_stack.pop() {
-                                apply_deltas(&mut state.octree, &deltas, false);
-                                state.history.redo_stack.push(deltas);
+                            } else if let Some(action) = state.history.undo_stack.pop() {
+                                // UNDO
+                                for &(p, sz, _) in &action.added { state.octree.insert_cube_world(p, sz, 0, false); }
+                                for &(p, sz, m) in &action.removed { state.octree.insert_cube_world(p, sz, m, false); }
+                                state.octree.collapse(state.octree.root_index as usize);
+                                state.history.redo_stack.push(action);
                                 state.sync_svo_buffer_full();
                                 state.update_ui();
                                 state.window.request_redraw();
@@ -1454,9 +1470,11 @@ impl ApplicationHandler for App {
                         }
 
                         if is_y {
-                            if let Some(deltas) = state.history.redo_stack.pop() {
-                                apply_deltas(&mut state.octree, &deltas, true);
-                                state.history.undo_stack.push(deltas);
+                            if let Some(action) = state.history.redo_stack.pop() {
+                                for &(p, sz, _) in &action.removed { state.octree.insert_cube_world(p, sz, 0, false); }
+                                for &(p, sz, m) in &action.added { state.octree.insert_cube_world(p, sz, m, false); }
+                                state.octree.collapse(state.octree.root_index as usize);
+                                state.history.undo_stack.push(action);
                                 state.sync_svo_buffer_full();
                                 state.update_ui();
                                 state.window.request_redraw();
