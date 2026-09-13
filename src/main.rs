@@ -1,327 +1,32 @@
-mod types;
 mod engine;
+mod types;
+mod ui;
+mod voxelize;
 
-use types::*;
 use engine::*;
+use types::*;
+use ui::*;
+use voxelize::*;
+
+use glam::Vec3;
+use std::sync::mpsc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+use wgpu::util::DeviceExt;
 
 use winit::{
     application::ApplicationHandler,
+    dpi::LogicalSize,
     event::*,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
-    dpi::LogicalSize,
 };
+
 #[cfg(target_os = "linux")]
 use winit::platform::wayland::WindowAttributesExtWayland;
 #[cfg(target_os = "linux")]
 use winit::platform::x11::WindowAttributesExtX11;
-
-use wgpu::util::DeviceExt;
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc;
-use std::path::PathBuf;
-use glam::{Vec3, Vec4, Mat4};
-use rayon::prelude::*;
-
-pub enum VoxelizeMsg {
-    Progress { percent: f32, stage: String },
-    Done(Result<Vec<(Vec3, f32, u16)>, String>),
-}
-
-#[inline(always)] fn pack_coords(gx: i32, gy: i32, gz: i32) -> u64 {
-    const OFFSET: i64 = 1 << 20;
-    let ux = ((gx as i64) + OFFSET) as u64 & 0x1F_FFFF;
-    let uy = ((gy as i64) + OFFSET) as u64 & 0x1F_FFFF;
-    let uz = ((gz as i64) + OFFSET) as u64 & 0x1F_FFFF;
-    (ux << 42) | (uy << 21) | uz
-}
-
-#[inline(always)] fn unpack_coords(k: u64) -> (i32, i32, i32) {
-    const OFFSET: i64 = 1 << 20;
-    let gx = (((k >> 42) & 0x1F_FFFF) as i64 - OFFSET) as i32;
-    let gy = (((k >> 21) & 0x1F_FFFF) as i64 - OFFSET) as i32;
-    let gz = ((k & 0x1F_FFFF) as i64 - OFFSET) as i32;
-    (gx, gy, gz)
-}
-
-fn sample_triangle(pts: [Vec3; 3], color: [f32; 3], voxel_size: f32, out: &mut Vec<(u64, [f32; 3])>) {
-    let min_p = pts[0].min(pts[1]).min(pts[2]);
-    let max_p = pts[0].max(pts[1]).max(pts[2]);
-    let min_gx = (min_p.x / voxel_size).floor() as i32;
-    let max_gx = (max_p.x / voxel_size).floor() as i32;
-    let min_gy = (min_p.y / voxel_size).floor() as i32;
-    let max_gy = (max_p.y / voxel_size).floor() as i32;
-    let min_gz = (min_p.z / voxel_size).floor() as i32;
-    let max_gz = (max_p.z / voxel_size).floor() as i32;
-    let ext = voxel_size * 0.5;
-    let box_half = Vec3::splat(ext);
-
-    for gx in min_gx..=max_gx {
-        for gy in min_gy..=max_gy {
-            for gz in min_gz..=max_gz {
-                let center = Vec3::new(gx as f32 * voxel_size + ext, gy as f32 * voxel_size + ext, gz as f32 * voxel_size + ext);
-                let v0 = pts[0] - center; let v1 = pts[1] - center; let v2 = pts[2] - center;
-                if v0.min(v1).min(v2).max_element() > ext || v0.max(v1).max(v2).min_element() < -ext { continue; }
-                let normal = (v1 - v0).cross(v2 - v0);
-                let r = box_half.x * normal.x.abs() + box_half.y * normal.y.abs() + box_half.z * normal.z.abs();
-                if normal.dot(v0).abs() > r { continue; }
-                let f0 = v1 - v0; let f1 = v2 - v1; let f2 = v0 - v2;
-                let test_axis = |axis: Vec3| -> bool {
-                    let p0 = v0.dot(axis); let p1 = v1.dot(axis); let p2 = v2.dot(axis);
-                    let rad = box_half.x * axis.x.abs() + box_half.y * axis.y.abs() + box_half.z * axis.z.abs();
-                    p0.min(p1).min(p2) > rad || p0.max(p1).max(p2) < -rad
-                };
-                if test_axis(Vec3::new(0.0, -f0.z, f0.y)) || test_axis(Vec3::new(0.0, -f1.z, f1.y)) || test_axis(Vec3::new(0.0, -f2.z, f2.y)) || test_axis(Vec3::new(f0.z, 0.0, -f0.x)) || test_axis(Vec3::new(f1.z, 0.0, -f1.x)) || test_axis(Vec3::new(f2.z, 0.0, -f2.x)) || test_axis(Vec3::new(-f0.y, f0.x, 0.0)) || test_axis(Vec3::new(-f1.y, f1.x, 0.0)) || test_axis(Vec3::new(-f2.y, f2.x, 0.0)) { continue; }
-                out.push((pack_coords(gx, gy, gz), color));
-            }
-        }
-    }
-}
-
-fn run_background_voxelization(
-    path: PathBuf, target_pos: Vec3, voxel_size: f32, target_height: f32,
-    palette_size: usize, palette_arc: Arc<RwLock<Palette>>, max_nodes_allowed: usize, tx: mpsc::Sender<VoxelizeMsg>
-) {
-    let _ = tx.send(VoxelizeMsg::Progress { percent: 0.05, stage: "READING GLB CONTAINER...".into() });
-    let (document, buffers, _) = match gltf::import(&path) {
-        Ok(res) => res,
-        Err(e) => { let _ = tx.send(VoxelizeMsg::Done(Err(format!("Import error: {}", e)))); return; }
-    };
-
-    let mut min_bound = Vec3::splat(f32::MAX);
-    let mut max_bound = Vec3::splat(f32::MIN);
-    let mut all_triangles = Vec::new();
-    let mut root_nodes: Vec<gltf::Node> = Vec::new();
-
-    if let Some(scene) = document.default_scene() { root_nodes.extend(scene.nodes()); }
-    else if let Some(scene) = document.scenes().next() { root_nodes.extend(scene.nodes()); }
-    else {
-        let mut child_indices = HashSet::new();
-        for node in document.nodes() { for child in node.children() { child_indices.insert(child.index()); } }
-        for node in document.nodes() { if !child_indices.contains(&node.index()) { root_nodes.push(node); } }
-    }
-
-    let mut stack: Vec<(gltf::Node, Mat4)> = root_nodes.into_iter().map(|node| (node, Mat4::IDENTITY)).collect();
-    while let Some((node, parent_mat)) = stack.pop() {
-        let local_mat = Mat4::from_cols_array_2d(&node.transform().matrix());
-        let world_mat = parent_mat * local_mat;
-        if let Some(mesh) = node.mesh() {
-            for primitive in mesh.primitives() {
-                let reader = primitive.reader(|b| Some(&buffers[b.index()]));
-                let positions: Vec<Vec3> = match reader.read_positions() {
-                    Some(iter) => iter.map(|p| world_mat.transform_point3(Vec3::from(p))).collect(),
-                    None => continue,
-                };
-                for p in &positions { min_bound = min_bound.min(*p); max_bound = max_bound.max(*p); }
-                let colors: Vec<[f32; 3]> = reader.read_colors(0).map(|iter| iter.into_rgb_f32().collect()).unwrap_or_else(|| vec![[1.0, 1.0, 1.0]; positions.len()]);
-                let pbr = primitive.material().pbr_metallic_roughness();
-                let base_factor = pbr.base_color_factor();
-                let indices: Vec<u32> = reader.read_indices().map(|iter| iter.into_u32().collect()).unwrap_or_else(|| (0..positions.len() as u32).collect());
-                for chunk in indices.chunks_exact(3) {
-                    let (i0, i1, i2) = (chunk[0] as usize, chunk[1] as usize, chunk[2] as usize);
-                    if i0 < positions.len() && i1 < positions.len() && i2 < positions.len() {
-                        let avg_color = [
-                            (colors[i0][0] + colors[i1][0] + colors[i2][0]) / 3.0 * base_factor[0],
-                            (colors[i0][1] + colors[i1][1] + colors[i2][1]) / 3.0 * base_factor[1],
-                            (colors[i0][2] + colors[i1][2] + colors[i2][2]) / 3.0 * base_factor[2],
-                        ];
-                        all_triangles.push(([positions[i0], positions[i1], positions[i2]], avg_color));
-                    }
-                }
-            }
-        }
-        for child in node.children() { stack.push((child, world_mat)); }
-    }
-
-    if all_triangles.is_empty() {
-        let _ = tx.send(VoxelizeMsg::Done(Err("No valid mesh geometry found in GLB".into())));
-        return;
-    }
-
-    let extent = max_bound - min_bound;
-    let max_dim = extent.x.max(extent.y).max(extent.z).max(0.001);
-    let scale = target_height / max_dim;
-    let center_x = (min_bound.x + max_bound.x) * 0.5;
-    let center_z = (min_bound.z + max_bound.z) * 0.5;
-    let min_y = min_bound.y;
-
-    let normalized_triangles: Vec<_> = all_triangles.into_iter().map(|(pts, col)| {
-        let p0 = Vec3::new((pts[0].x - center_x) * scale, (pts[0].y - min_y) * scale, (pts[0].z - center_z) * scale) + target_pos;
-        let p1 = Vec3::new((pts[1].x - center_x) * scale, (pts[1].y - min_y) * scale, (pts[1].z - center_z) * scale) + target_pos;
-        let p2 = Vec3::new((pts[2].x - center_x) * scale, (pts[2].y - min_y) * scale, (pts[2].z - center_z) * scale) + target_pos;
-        ([p0, p1, p2], col)
-    }).collect();
-
-    let sampled_batches: Vec<Vec<(u64, [f32; 3])>> = normalized_triangles.par_chunks(2048).map(|chunk| {
-        let mut local_out = Vec::with_capacity(chunk.len() * 2);
-        for &(pts, color) in chunk { sample_triangle(pts, color, voxel_size, &mut local_out); }
-        local_out.sort_unstable_by_key(|&(k, _)| k);
-        local_out.dedup_by(|a, b| a.0 == b.0);
-        local_out
-    }).collect();
-
-    let mut all_samples: Vec<(u64, [f32; 3])> = sampled_batches.into_par_iter().flatten().collect();
-    all_samples.par_sort_unstable_by_key(|&(k, _)| k);
-    all_samples.dedup_by(|a, b| a.0 == b.0);
-
-    if all_samples.is_empty() {
-        let _ = tx.send(VoxelizeMsg::Done(Err("Surface voxelization produced 0 voxels".into())));
-        return;
-    }
-
-    let _ = tx.send(VoxelizeMsg::Progress { percent: 0.60, stage: format!("PALETTE MAPPING ({} VOXELS)...", all_samples.len()) });
-
-    let mut pal = palette_arc.write().unwrap();
-    let mut color_cache: HashMap<[u8; 3], u16> = HashMap::new();
-    for (i, &c) in pal.iter().enumerate() {
-        color_cache.insert([(c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8], (i + 1) as u16);
-    }
-
-    let mut sample_mats: Vec<(i32, i32, i32, u16)> = Vec::with_capacity(all_samples.len());
-    let mut min_gx = i32::MAX; let mut max_gx = i32::MIN;
-    let mut min_gy = i32::MAX; let mut max_gy = i32::MIN;
-    let mut min_gz = i32::MAX; let mut max_gz = i32::MIN;
-
-    for (k, color) in all_samples {
-        let key = [(color[0] * 255.0).round() as u8, (color[1] * 255.0).round() as u8, (color[2] * 255.0).round() as u8];
-        let mat_id = if let Some(&id) = color_cache.get(&key) { id } else {
-            if pal.len() < palette_size {
-                pal.push(color);
-                let new_id = pal.len() as u16;
-                color_cache.insert(key, new_id);
-                new_id
-            } else { 1 }
-        };
-        let (gx, gy, gz) = unpack_coords(k);
-        min_gx = min_gx.min(gx); max_gx = max_gx.max(gx);
-        min_gy = min_gy.min(gy); max_gy = max_gy.max(gy);
-        min_gz = min_gz.min(gz); max_gz = max_gz.max(gz);
-        sample_mats.push((gx, gy, gz, mat_id));
-    }
-    drop(pal);
-
-    let _ = tx.send(VoxelizeMsg::Progress { percent: 0.75, stage: "SOLID FLOOD-FILL INTERIOR...".into() });
-
-    let size_x = (max_gx - min_gx + 1).max(1) as usize;
-    let size_y = (max_gy - min_gy + 1).max(1) as usize;
-    let size_z = (max_gz - min_gz + 1).max(1) as usize;
-
-    let dim_x = size_x + 2;
-    let dim_y = size_y + 2;
-    let dim_z = size_z + 2;
-    let total_cells = dim_x.saturating_mul(dim_y).saturating_mul(dim_z);
-
-    let mut voxel_nodes: Vec<(Vec3, f32, u16)> = Vec::new();
-
-    if total_cells > 0 && total_cells <= 24_000_000 {
-        const AIR: u16 = 65535;
-        let mut grid: Vec<u16> = vec![0; total_cells];
-        let stride_y = dim_x;
-        let stride_z = dim_x * dim_y;
-
-        let mut color_queue: VecDeque<(usize, usize, usize, u16)> = VecDeque::new();
-        for &(gx, gy, gz, mat) in &sample_mats {
-            let lx = (gx - min_gx + 1) as usize;
-            let ly = (gy - min_gy + 1) as usize;
-            let lz = (gz - min_gz + 1) as usize;
-            let idx = lx + ly * stride_y + lz * stride_z;
-            grid[idx] = mat;
-            color_queue.push_back((lx, ly, lz, mat));
-        }
-
-        let mut ext_queue: VecDeque<(usize, usize, usize)> = VecDeque::new();
-        grid[0] = AIR;
-        ext_queue.push_back((0usize, 0usize, 0usize));
-
-        while let Some((cx, cy, cz)) = ext_queue.pop_front() {
-            let mut neighbors = [(0usize, 0usize, 0usize); 6];
-            let mut count = 0;
-            if cx > 0 { neighbors[count] = (cx - 1, cy, cz); count += 1; }
-            if cx + 1 < dim_x { neighbors[count] = (cx + 1, cy, cz); count += 1; }
-            if cy > 0 { neighbors[count] = (cx, cy - 1, cz); count += 1; }
-            if cy + 1 < dim_y { neighbors[count] = (cx, cy + 1, cz); count += 1; }
-            if cz > 0 { neighbors[count] = (cx, cy, cz - 1); count += 1; }
-            if cz + 1 < dim_z { neighbors[count] = (cx, cy, cz + 1); count += 1; }
-
-            for i in 0..count {
-                let (nx, ny, nz) = neighbors[i];
-                let n_idx = nx + ny * stride_y + nz * stride_z;
-                if grid[n_idx] == 0 {
-                    grid[n_idx] = AIR;
-                    ext_queue.push_back((nx, ny, nz));
-                }
-            }
-        }
-
-        while let Some((cx, cy, cz, mat_id)) = color_queue.pop_front() {
-            let mut neighbors = [(0usize, 0usize, 0usize); 6];
-            let mut count = 0;
-            if cx > 0 { neighbors[count] = (cx - 1, cy, cz); count += 1; }
-            if cx + 1 < dim_x { neighbors[count] = (cx + 1, cy, cz); count += 1; }
-            if cy > 0 { neighbors[count] = (cx, cy - 1, cz); count += 1; }
-            if cy + 1 < dim_y { neighbors[count] = (cx, cy + 1, cz); count += 1; }
-            if cz > 0 { neighbors[count] = (cx, cy, cz - 1); count += 1; }
-            if cz + 1 < dim_z { neighbors[count] = (cx, cy, cz + 1); count += 1; }
-
-            for i in 0..count {
-                let (nx, ny, nz) = neighbors[i];
-                let n_idx = nx + ny * stride_y + nz * stride_z;
-                if grid[n_idx] == 0 {
-                    grid[n_idx] = mat_id;
-                    color_queue.push_back((nx, ny, nz, mat_id));
-                }
-            }
-        }
-
-        for lz in 1..=size_z {
-            for ly in 1..=size_y {
-                for lx in 1..=size_x {
-                    let idx = lx + ly * stride_y + lz * stride_z;
-                    let mat = grid[idx];
-                    if mat != 0 && mat != AIR {
-                        let gx = (lx as i32 - 1) + min_gx;
-                        let gy = (ly as i32 - 1) + min_gy;
-                        let gz = (lz as i32 - 1) + min_gz;
-                        let wx = gx as f32 * voxel_size;
-                        let wy = gy as f32 * voxel_size;
-                        let wz = gz as f32 * voxel_size;
-                        voxel_nodes.push((Vec3::new(wx, wy, wz), voxel_size, mat));
-                    }
-                }
-            }
-        }
-    } else {
-        for (gx, gy, gz, mat) in sample_mats {
-            let wx = gx as f32 * voxel_size;
-            let wy = gy as f32 * voxel_size;
-            let wz = gz as f32 * voxel_size;
-            voxel_nodes.push((Vec3::new(wx, wy, wz), voxel_size, mat));
-        }
-    }
-
-    if voxel_nodes.len() > max_nodes_allowed {
-        let _ = tx.send(VoxelizeMsg::Done(Err(format!(
-            "Model exceeded limits: {} raw voxels (Limit: {}). Increase voxel resolution.",
-            voxel_nodes.len(), max_nodes_allowed
-        ))));
-        return;
-    }
-
-    let _ = tx.send(VoxelizeMsg::Progress { percent: 0.95, stage: "SORTING MORTON SPATIAL CURVE...".into() });
-
-    voxel_nodes.par_sort_unstable_by_key(|(pos, s, _)| {
-        let gx = (pos.x / s).round() as i32;
-        let gy = (pos.y / s).round() as i32;
-        let gz = (pos.z / s).round() as i32;
-        morton_encode_coords(gx, gy, gz)
-    });
-
-    let _ = tx.send(VoxelizeMsg::Progress { percent: 0.99, stage: "STREAMING INTO SVO HIERARCHY...".into() });
-    let _ = tx.send(VoxelizeMsg::Done(Ok(voxel_nodes)));
-}
 
 #[derive(Default)]
 struct InputState {
@@ -333,722 +38,101 @@ struct InputState {
     wireframe_mode: bool,
 }
 
-fn add_quad(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 4]) {
-    verts.extend_from_slice(&[
-        UIVertex { position: [x0, y0], color }, UIVertex { position: [x1, y0], color }, UIVertex { position: [x1, y1], color },
-        UIVertex { position: [x0, y0], color }, UIVertex { position: [x1, y1], color }, UIVertex { position: [x0, y1], color }
-    ]);
-}
-
-fn add_line(verts: &mut Vec<UIVertex>, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, aspect: f32, color: [f32; 4]) {
-    let dx = (x1 - x0) * aspect; let dy = y1 - y0; let len = (dx * dx + dy * dy).sqrt(); if len < 1e-5 { return; }
-    let half_t = thickness * 0.5; let nx = (-dy / len) * half_t / aspect; let ny = (dx / len) * half_t;
-    verts.extend_from_slice(&[
-        UIVertex { position: [x0 - nx, y0 - ny], color }, UIVertex { position: [x1 - nx, y1 - ny], color }, UIVertex { position: [x1 + nx, y1 + ny], color },
-        UIVertex { position: [x0 - nx, y0 - ny], color }, UIVertex { position: [x1 + nx, y1 + ny], color }, UIVertex { position: [x0 + nx, y0 + ny], color }
-    ]);
-}
-
-fn get_glyph_5x7(c: char) -> [u8; 7] {
-    match c {
-        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001], 'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110], 'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
-        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110], 'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111], 'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-        'G' => [0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111], 'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001], 'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'J' => [0b00001, 0b00001, 0b00001, 0b00001, 0b10001, 0b10001, 0b01110], 'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001], 'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        'M' => [0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001], 'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001], 'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000], 'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101], 'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110], 'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100], 'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100], 'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001], 'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100], 'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111], '0' => [0b01110, 0b10011, 0b10101, 0b10101, 0b11001, 0b10001, 0b01110],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110], '2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111], '3' => [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
-        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010], '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110], '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000], '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110], '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
-        ':' => [0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000], '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000, 0b00000], '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
-        '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000], '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100], '%' => [0b11001, 0b11010, 0b00100, 0b01000, 0b01011, 0b10011, 0b00000],
-        '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110], ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110], '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
-        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000], '#' => [0b01010, 0b01010, 0b11111, 0b01010, 0b11111, 0b01010, 0b01010], _ => [0; 7],
-    }
-}
-
-fn draw_glyph_raw(verts: &mut Vec<UIVertex>, glyph: &[u8; 7], x: f32, y: f32, pw: f32, ph: f32, color: [f32; 4]) {
-    for row in 0..7 {
-        let line = glyph[row]; if line == 0 { continue; }
-        let y1 = y + (6 - row) as f32 * ph; let y0 = y1 - ph;
-        for col in 0..5 { if (line & (1 << (4 - col))) != 0 { let x0 = x + col as f32 * pw; let x1 = x0 + pw; add_quad(verts, x0, y0, x1, y1, color); } }
-    }
-}
-
-pub fn draw_text(verts: &mut Vec<UIVertex>, text: &str, start_x: f32, start_y: f32, scale: f32, aspect: f32, color: [f32; 4]) {
-    let ph = 0.0032 * scale; let pw = ph / aspect;
-    let shadow_color = [0.02, 0.02, 0.04, color[3] * 0.9]; let shadow_offset_x = pw * 0.75; let shadow_offset_y = -ph * 0.75;
-    let mut cursor_x = start_x;
-    for c in text.to_ascii_uppercase().chars() {
-        let glyph = get_glyph_5x7(c);
-        draw_glyph_raw(verts, &glyph, cursor_x + shadow_offset_x, start_y + shadow_offset_y, pw, ph, shadow_color);
-        draw_glyph_raw(verts, &glyph, cursor_x, start_y, pw, ph, color); cursor_x += 6.0 * pw;
-    }
-}
-
-pub fn draw_text_centered(verts: &mut Vec<UIVertex>, text: &str, cx: f32, cy: f32, scale: f32, aspect: f32, color: [f32; 4]) {
-    let ph = 0.0032 * scale; let pw = ph / aspect; let total_w = (text.len() as f32 * 6.0 - 1.0) * pw; let total_h = 7.0 * ph;
-    draw_text(verts, text, cx - total_w / 2.0, cy - total_h / 2.0, scale, aspect, color);
-}
-
-const PRESET_SWATCHES: [[f32; 3]; 10] = [
-    [0.95, 0.95, 0.95], [0.10, 0.10, 0.12], [0.90, 0.20, 0.20], [0.95, 0.50, 0.15],
-    [0.95, 0.85, 0.15], [0.20, 0.75, 0.25], [0.15, 0.80, 0.85], [0.20, 0.45, 0.90],
-    [0.65, 0.25, 0.85], [0.55, 0.35, 0.20],
-];
-
-const PRESET_BG_COLORS: [[f32; 3]; 8] = [
-    [0.12, 0.14, 0.18],
-    [0.24, 0.26, 0.30],
-    [0.08, 0.18, 0.32],
-    [0.55, 0.68, 0.82],
-    [0.50, 0.28, 0.28],
-    [0.16, 0.24, 0.18],
-    [0.85, 0.82, 0.76],
-    [0.02, 0.02, 0.03],
-];
-
-const GIZMO_CENTER_X: f32 = 0.86;
-const GIZMO_CENTER_Y: f32 = 0.76;
-const GIZMO_RADIUS: f32 = 0.11;
-
-// Left-side tool palette geometry (widened for great legibility)
-const LEFT_PALETTE_X0: f32 = -0.985;
-const LEFT_PALETTE_X1: f32 = -0.835;
-const LEFT_PALETTE_TOP_Y: f32 = 0.72;
-const LEFT_TOOL_BTN_H: f32 = 0.043;
-const LEFT_TOOL_BTN_GAP: f32 = 0.005;
-
-fn get_left_tool_btn_bounds(index: usize) -> (f32, f32, f32, f32) {
-    let y1 = LEFT_PALETTE_TOP_Y - index as f32 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP);
-    let y0 = y1 - LEFT_TOOL_BTN_H;
-    (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
-}
-
-fn get_left_radius_controls_bounds() -> (f32, f32, f32, f32) {
-    let y1 = LEFT_PALETTE_TOP_Y - 12.0 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP) - 0.005;
-    let y0 = y1 - LEFT_TOOL_BTN_H;
-    (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
-}
-
-fn get_left_mode_btn_bounds() -> (f32, f32, f32, f32) {
-    let rad_y0 = LEFT_PALETTE_TOP_Y - 12.0 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP) - 0.005 - LEFT_TOOL_BTN_H;
-    let y1 = rad_y0 - LEFT_TOOL_BTN_GAP;
-    let y0 = y1 - LEFT_TOOL_BTN_H;
-    (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
-}
-
-#[derive(Clone, Copy)]
-struct GizmoAxis { dir: Vec3, name: &'static str, color: [f32; 4], yaw: f32, pitch: f32, is_positive: bool }
-fn get_gizmo_axes() -> [GizmoAxis; 6] {
-    [
-        GizmoAxis { dir: Vec3::X,  name: "X", color: [0.90, 0.20, 0.25, 1.0], yaw: std::f32::consts::PI, pitch: 0.0, is_positive: true },
-        GizmoAxis { dir: -Vec3::X, name: "-X", color: [0.45, 0.20, 0.20, 0.75], yaw: 0.0, pitch: 0.0, is_positive: false },
-        GizmoAxis { dir: Vec3::Y,  name: "Y", color: [0.30, 0.80, 0.20, 1.0], yaw: -std::f32::consts::FRAC_PI_2, pitch: -1.56, is_positive: true },
-        GizmoAxis { dir: -Vec3::Y, name: "-Y", color: [0.20, 0.45, 0.20, 0.75], yaw: -std::f32::consts::FRAC_PI_2, pitch: 1.56, is_positive: false },
-        GizmoAxis { dir: Vec3::Z,  name: "Z", color: [0.18, 0.55, 0.95, 1.0], yaw: -std::f32::consts::FRAC_PI_2, pitch: 0.0, is_positive: true },
-        GizmoAxis { dir: -Vec3::Z, name: "-Z", color: [0.20, 0.30, 0.50, 0.75], yaw: std::f32::consts::FRAC_PI_2, pitch: 0.0, is_positive: false },
-    ]
-}
-
-fn get_focus_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
-    let g_cx = GIZMO_CENTER_X;
-    let g_cy = GIZMO_CENTER_Y;
-    let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
-    let btn_w = 0.075 / aspect;
-    let btn_h = 0.046;
-    let x1 = g_cx - disc_rx - 0.015;
-    let x0 = x1 - btn_w;
-    let y0 = g_cy + 0.008;
-    let y1 = y0 + btn_h;
-    (x0, y0, x1, y1)
-}
-
-fn get_proj_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
-    let g_cx = GIZMO_CENTER_X;
-    let g_cy = GIZMO_CENTER_Y;
-    let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
-    let btn_w = 0.075 / aspect;
-    let btn_h = 0.046;
-    let x1 = g_cx - disc_rx - 0.015;
-    let x0 = x1 - btn_w;
-    let y1 = g_cy - 0.008;
-    let y0 = y1 - btn_h;
-    (x0, y0, x1, y1)
-}
-
-fn get_render_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
-    let g_cx = GIZMO_CENTER_X;
-    let g_cy = GIZMO_CENTER_Y;
-    let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
-    let btn_w = 0.075 / aspect;
-    let btn_h = 0.046;
-    let x1 = g_cx - disc_rx - 0.015;
-    let x0 = x1 - btn_w;
-    let y1 = g_cy - 0.008 - btn_h - 0.008;
-    let y0 = y1 - btn_h;
-    (x0, y0, x1, y1)
-}
-
-fn format_voxel_count(count: usize) -> String {
-    if count >= 1_000_000 { format!("{:.2}M", count as f64 / 1_000_000.0) }
-    else if count >= 1_000 { format!("{:.1}K", count as f64 / 1_000.0) }
-    else { count.to_string() }
-}
-
-fn clip_line_segment(v0: &mut Vec4, v1: &mut Vec4, near_w: f32) -> bool {
-    if v0.w < near_w && v1.w < near_w {
-        return false;
-    }
-    if v0.w < near_w {
-        let t = (near_w - v0.w) / (v1.w - v0.w);
-        *v0 = *v0 + t * (*v1 - *v0);
-    } else if v1.w < near_w {
-        let t = (near_w - v1.w) / (v0.w - v1.w);
-        *v1 = *v1 + t * (*v0 - *v1);
-    }
-    true
-}
-
-fn clip_line_2d(p0: &mut [f32; 2], p1: &mut [f32; 2], bound: f32) -> bool {
-    let mut t0 = 0.0f32;
-    let mut t1 = 1.0f32;
-    let dx = p1[0] - p0[0];
-    let dy = p1[1] - p0[1];
-
-    let p = [-dx, dx, -dy, dy];
-    let q = [p0[0] + bound, bound - p0[0], p0[1] + bound, bound - p0[1]];
-
-    for i in 0..4 {
-        if p[i].abs() < 1e-6 {
-            if q[i] < 0.0 {
-                return false;
-            }
-        } else {
-            let r = q[i] / p[i];
-            if p[i] < 0.0 {
-                if r > t1 { return false; }
-                if r > t0 { t0 = r; }
-            } else {
-                if r < t0 { return false; }
-                if r < t1 { t1 = r; }
-            }
-        }
-    }
-
-    *p0 = [p0[0] + t0 * dx, p0[1] + t0 * dy];
-    *p1 = [p0[0] + t1 * dx, p0[1] + t1 * dy];
-    true
-}
-
-fn draw_quad_3d(verts: &mut Vec<UIVertex>, pts: [Vec3; 4], view_proj: Mat4, color: [f32; 4]) {
-    let mut ndc = [[0.0f32; 2]; 4];
-    for (i, p) in pts.iter().enumerate() {
-        let v = view_proj * Vec4::new(p.x, p.y, p.z, 1.0);
-        if v.w < 0.05 {
-            return;
-        }
-        ndc[i] = [v.x / v.w, v.y / v.w];
-        if ndc[i][0].abs() > 2.0 || ndc[i][1].abs() > 2.0 {
-            return;
-        }
-    }
-    verts.extend_from_slice(&[
-        UIVertex { position: ndc[0], color },
-        UIVertex { position: ndc[1], color },
-        UIVertex { position: ndc[2], color },
-        UIVertex { position: ndc[0], color },
-        UIVertex { position: ndc[2], color },
-        UIVertex { position: ndc[3], color },
-    ]);
-}
-
-fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspect: f32, view_proj: Mat4, color: [f32; 4]) {
-    let expand = (max_p - min_p) * 0.002;
-    let p0 = min_p - expand;
-    let p1 = max_p + expand;
-
-    let corners = [
-        Vec3::new(p0.x, p0.y, p0.z),
-        Vec3::new(p1.x, p0.y, p0.z),
-        Vec3::new(p0.x, p1.y, p0.z),
-        Vec3::new(p1.x, p1.y, p0.z),
-        Vec3::new(p0.x, p0.y, p1.z),
-        Vec3::new(p1.x, p0.y, p1.z),
-        Vec3::new(p0.x, p1.y, p1.z),
-        Vec3::new(p1.x, p1.y, p1.z),
-    ];
-
-    let face_col = [color[0], color[1], color[2], color[3] * 0.12];
-    let faces = [
-        [corners[0], corners[1], corners[3], corners[2]],
-        [corners[4], corners[5], corners[7], corners[6]],
-        [corners[0], corners[4], corners[6], corners[2]],
-        [corners[1], corners[5], corners[7], corners[3]],
-        [corners[0], corners[1], corners[5], corners[4]],
-        [corners[2], corners[3], corners[7], corners[6]],
-    ];
-    for face in faces {
-        draw_quad_3d(verts, face, view_proj, face_col);
-    }
-
-    let edges = [
-        (0, 1), (2, 3), (4, 5), (6, 7),
-        (0, 2), (1, 3), (4, 6), (5, 7),
-        (0, 4), (1, 5), (2, 6), (3, 7),
-    ];
-
-    for (i0, i1) in edges {
-        let mut v0 = view_proj * Vec4::new(corners[i0].x, corners[i0].y, corners[i0].z, 1.0);
-        let mut v1 = view_proj * Vec4::new(corners[i1].x, corners[i1].y, corners[i1].z, 1.0);
-        if clip_line_segment(&mut v0, &mut v1, 0.05) {
-            let mut ndc0 = [v0.x / v0.w, v0.y / v0.w];
-            let mut ndc1 = [v1.x / v1.w, v1.y / v1.w];
-            if clip_line_2d(&mut ndc0, &mut ndc1, 1.3) {
-                add_line(verts, ndc0[0], ndc0[1], ndc1[0], ndc1[1], 0.0035, aspect, color);
-            }
-        }
-    }
-}
-
-fn draw_circle_wireframe(verts: &mut Vec<UIVertex>, center: Vec3, radius: f32, axis_u: Vec3, axis_v: Vec3, segments: usize, aspect: f32, view_proj: Mat4, color: [f32; 4]) {
-    for i in 0..segments {
-        let a0 = (i as f32 / segments as f32) * std::f32::consts::TAU;
-        let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
-        let p0 = center + axis_u * (a0.cos() * radius) + axis_v * (a0.sin() * radius);
-        let p1 = center + axis_u * (a1.cos() * radius) + axis_v * (a1.sin() * radius);
-        let mut v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
-        let mut v1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
-        if clip_line_segment(&mut v0, &mut v1, 0.05) {
-            let mut ndc0 = [v0.x / v0.w, v0.y / v0.w];
-            let mut ndc1 = [v1.x / v1.w, v1.y / v1.w];
-            if clip_line_2d(&mut ndc0, &mut ndc1, 1.3) {
-                add_line(verts, ndc0[0], ndc0[1], ndc1[0], ndc1[1], 0.003, aspect, color);
-            }
-        }
-    }
-}
-
-const HOTBAR_LABELS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
-const ALL_TOOLS: [ToolType; 12] = [
-    ToolType::Pencil, ToolType::Sphere, ToolType::Cylinder, ToolType::Disc,
-    ToolType::Box, ToolType::Line, ToolType::Cone, ToolType::Pyramid,
-    ToolType::Torus, ToolType::Paint, ToolType::Replace, ToolType::Bucket,
-];
-
-fn build_ui_vertices(
-    selected_slot: usize, active_menu: ActiveMenu, hotbar_colors: &[[f32; 3]; 10], play_mode: PlayMode, is_ortho: bool, world_type: WorldType,
-    edit_size: f32, target_pos: Option<[f32; 3]>, aspect: f32, camera_forward: Vec3, camera_right: Vec3, camera_up: Vec3,
-    _cursor_free: bool, glb_settings: &GlbImportSettings, progress_val: f32, progress_stage: &str, view_proj: Mat4, 
-    error_banner: Option<&str>, tool_state: &ToolState,
-    hud_status: &str, hud_tools: &str, size_str: &str, glb_cost_str: &str, bg_color: [f32; 3]
-) -> Vec<UIVertex> {
-    let mut verts = Vec::new();
-    let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let g_rad = GIZMO_RADIUS; let disc_rx = (g_rad + 0.018) / aspect; let disc_ry = g_rad + 0.018;
-    add_quad(&mut verts, g_cx - disc_rx - 0.003, g_cy - disc_ry - 0.003, g_cx + disc_rx + 0.003, g_cy + disc_ry + 0.003, [0.25, 0.30, 0.38, 0.6]);
-    add_quad(&mut verts, g_cx - disc_rx, g_cy - disc_ry, g_cx + disc_rx, g_cy + disc_ry, [0.08, 0.10, 0.14, 0.70]);
-
-    // Gimbal focus button [.]
-    let (bx0, by0, bx1, by1) = get_focus_button_bounds(aspect);
-    add_quad(&mut verts, bx0 - 0.003, by0 - 0.003, bx1 + 0.003, by1 + 0.003, [0.35, 0.40, 0.50, 0.8]);
-    add_quad(&mut verts, bx0, by0, bx1, by1, [0.12, 0.15, 0.22, 0.90]);
-    draw_text_centered(&mut verts, "[.]", (bx0 + bx1) / 2.0, (by0 + by1) / 2.0, 1.05, aspect, [0.3, 0.9, 1.0, 1.0]);
-
-    // Gimbal projection toggle button [ISO] / [PER]
-    let (px0, py0, px1, py1) = get_proj_button_bounds(aspect);
-    let proj_border = if is_ortho { [0.3, 0.85, 1.0, 0.9] } else { [0.35, 0.40, 0.50, 0.8] };
-    let proj_bg = if is_ortho { [0.18, 0.45, 0.65, 0.95] } else { [0.12, 0.15, 0.22, 0.90] };
-    let proj_text = if is_ortho { "ISO" } else { "PER" };
-    add_quad(&mut verts, px0 - 0.003, py0 - 0.003, px1 + 0.003, py1 + 0.003, proj_border);
-    add_quad(&mut verts, px0, py0, px1, py1, proj_bg);
-    draw_text_centered(&mut verts, proj_text, (px0 + px1) / 2.0, (py0 + py1) / 2.0, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-    // Gimbal Render Mode button [REN]
-    let (rx0, ry0, rx1, ry1) = get_render_button_bounds(aspect);
-    add_quad(&mut verts, rx0 - 0.003, ry0 - 0.003, rx1 + 0.003, ry1 + 0.003, [0.35, 0.40, 0.50, 0.8]);
-    add_quad(&mut verts, rx0, ry0, rx1, ry1, [0.12, 0.15, 0.22, 0.90]);
-    draw_text_centered(&mut verts, "REN", (rx0 + rx1) / 2.0, (ry0 + ry1) / 2.0, 1.0, aspect, [0.3, 0.95, 0.5, 1.0]);
-
-    let mut axes_projected: Vec<(GizmoAxis, f32, f32, f32)> = get_gizmo_axes().into_iter().map(|ax| (ax, ax.dir.dot(camera_right), ax.dir.dot(camera_up), ax.dir.dot(camera_forward))).collect();
-    axes_projected.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
-
-    for (ax, sx, sy, _) in &axes_projected {
-        let tip_x = g_cx + (sx * g_rad) / aspect; let tip_y = g_cy + (sy * g_rad);
-        if ax.is_positive {
-            add_line(&mut verts, g_cx, g_cy, tip_x, tip_y, 0.0045, aspect, [ax.color[0], ax.color[1], ax.color[2], 0.85]);
-            let node_r = 0.021; add_quad(&mut verts, tip_x - node_r / aspect, tip_y - node_r, tip_x + node_r / aspect, tip_y + node_r, ax.color);
-            draw_text_centered(&mut verts, ax.name, tip_x, tip_y, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-        } else {
-            add_line(&mut verts, g_cx, g_cy, tip_x, tip_y, 0.0025, aspect, [ax.color[0], ax.color[1], ax.color[2], 0.35]);
-            let node_r = 0.010; add_quad(&mut verts, tip_x - node_r / aspect, tip_y - node_r, tip_x + node_r / aspect, tip_y + node_r, ax.color);
-        }
-    }
-
-    // Bottom hotbar
-    let num_slots = 10; let slot_w = 0.054; let slot_gap = 0.009; let total_w = num_slots as f32 * slot_w + (num_slots - 1) as f32 * slot_gap;
-    let start_x = -total_w / 2.0; let y_bottom = -0.96; let y_top = -0.86;
-    for (i, &rgb) in hotbar_colors.iter().enumerate() {
-        let x0 = start_x + i as f32 * (slot_w + slot_gap); let x1 = x0 + slot_w;
-        if selected_slot == i { add_quad(&mut verts, x0 - 0.006, y_bottom - 0.006, x1 + 0.006, y_top + 0.006, [1.0, 0.9, 0.1, 1.0]); } else { add_quad(&mut verts, x0 - 0.003, y_bottom - 0.003, x1 + 0.003, y_top + 0.003, [0.15, 0.16, 0.20, 0.9]); }
-        add_quad(&mut verts, x0, y_bottom, x1, y_top, [rgb[0], rgb[1], rgb[2], 1.0]);
-        draw_text_centered(&mut verts, HOTBAR_LABELS[i], (x0 + x1) / 2.0, y_top + 0.02, 1.0, aspect, [0.9, 0.9, 0.9, 0.9]);
-    }
-
-    if active_menu == ActiveMenu::None {
-        // Widened left-side tool palette container
-        let panel_top = LEFT_PALETTE_TOP_Y + 0.035;
-        let panel_bottom = get_left_mode_btn_bounds().1 - 0.010;
-        add_quad(&mut verts, LEFT_PALETTE_X0 - 0.006, panel_bottom - 0.004, LEFT_PALETTE_X1 + 0.006, panel_top + 0.004, [0.25, 0.32, 0.45, 0.75]);
-        add_quad(&mut verts, LEFT_PALETTE_X0 - 0.003, panel_bottom, LEFT_PALETTE_X1 + 0.003, panel_top, [0.08, 0.10, 0.15, 0.94]);
-        draw_text_centered(&mut verts, "VOXEL TOOLS", (LEFT_PALETTE_X0 + LEFT_PALETTE_X1) * 0.5, panel_top - 0.018, 0.95, aspect, [0.35, 0.90, 1.0, 1.0]);
-
-        // Tool buttons
-        for (i, &tool) in ALL_TOOLS.iter().enumerate() {
-            let (x0, y0, x1, y1) = get_left_tool_btn_bounds(i);
-            let is_cur = tool_state.active_tool == tool;
-            let bg = if is_cur { [0.20, 0.58, 0.88, 0.95] } else { [0.12, 0.14, 0.19, 0.85] };
-            let border = if is_cur { [1.0, 0.9, 0.2, 1.0] } else { [0.25, 0.30, 0.40, 0.75] };
-            add_quad(&mut verts, x0 - 0.002, y0 - 0.002, x1 + 0.002, y1 + 0.002, border);
-            add_quad(&mut verts, x0, y0, x1, y1, bg);
-            draw_text_centered(&mut verts, tool.name(), (x0 + x1) * 0.5, (y0 + y1) * 0.5, 0.82, aspect, [1.0, 1.0, 1.0, 1.0]);
-        }
-
-        // Radius adjustment row
-        let (rx0, ry0, rx1, ry1) = get_left_radius_controls_bounds();
-        let rad_minus_x1 = rx0 + 0.032;
-        let rad_plus_x0 = rx1 - 0.032;
-
-        add_quad(&mut verts, rx0, ry0, rad_minus_x1, ry1, [0.20, 0.25, 0.35, 0.9]);
-        draw_text_centered(&mut verts, "-", (rx0 + rad_minus_x1) * 0.5, (ry0 + ry1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-        add_quad(&mut verts, rad_minus_x1 + 0.004, ry0, rad_plus_x0 - 0.004, ry1, [0.08, 0.10, 0.14, 0.9]);
-        draw_text_centered(&mut verts, &format!("R:{:.1}", tool_state.brush_radius), (rx0 + rx1) * 0.5, (ry0 + ry1) * 0.5, 0.9, aspect, [0.3, 0.9, 1.0, 1.0]);
-
-        add_quad(&mut verts, rad_plus_x0, ry0, rx1, ry1, [0.20, 0.25, 0.35, 0.9]);
-        draw_text_centered(&mut verts, "+", (rad_plus_x0 + rx1) * 0.5, (ry0 + ry1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-        // Mode row (Solid / Hollow)
-        let (mx0, my0, mx1, my1) = get_left_mode_btn_bounds();
-        let mode_bg = if tool_state.hollow { [0.70, 0.35, 0.15, 0.9] } else { [0.20, 0.45, 0.30, 0.9] };
-        add_quad(&mut verts, mx0, my0, mx1, my1, mode_bg);
-        draw_text_centered(&mut verts, if tool_state.hollow { "HOLLOW MODE" } else { "SOLID MODE" }, (mx0 + mx1) * 0.5, (my0 + my1) * 0.5, 0.85, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-        if let Some(pos) = target_pos {
-            let p_target = Vec3::from(pos);
-            let p_center = p_target + Vec3::splat(edit_size * 0.5);
-            match tool_state.active_tool {
-                ToolType::Pencil | ToolType::Paint | ToolType::Bucket => {
-                    let col = if tool_state.active_tool == ToolType::Bucket { [0.2, 0.9, 0.7, 0.85] } else { [0.3, 0.9, 1.0, 0.7] };
-                    draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, col);
-                }
-                ToolType::Sphere => {
-                    let r = tool_state.brush_radius;
-                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.95, 0.55, 0.20, 0.9]);
-                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Y, 24, aspect, view_proj, [0.95, 0.55, 0.20, 0.9]);
-                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::Z, Vec3::Y, 24, aspect, view_proj, [0.95, 0.55, 0.20, 0.9]);
-                    draw_box_wireframe(&mut verts, p_center - Vec3::splat(r), p_center + Vec3::splat(r), aspect, view_proj, [0.95, 0.55, 0.20, 0.35]);
-                }
-                ToolType::Cylinder => {
-                    let r = tool_state.brush_radius;
-                    let h = tool_state.cylinder_height;
-                    let bot_c = Vec3::new(p_target.x, p_target.y, p_target.z);
-                    let top_c = bot_c + Vec3::new(0.0, h, 0.0);
-                    draw_circle_wireframe(&mut verts, bot_c, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.3, 0.9, 0.5, 0.9]);
-                    draw_circle_wireframe(&mut verts, top_c, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.3, 0.9, 0.5, 0.9]);
-                    let struts = [Vec3::new(r, 0.0, 0.0), Vec3::new(-r, 0.0, 0.0), Vec3::new(0.0, 0.0, r), Vec3::new(0.0, 0.0, -r)];
-                    for off in struts {
-                        let mut v0 = view_proj * Vec4::new(bot_c.x + off.x, bot_c.y, bot_c.z + off.z, 1.0);
-                        let mut v1 = view_proj * Vec4::new(top_c.x + off.x, top_c.y, top_c.z + off.z, 1.0);
-                        if clip_line_segment(&mut v0, &mut v1, 0.05) {
-                            let n0 = v0.truncate() / v0.w;
-                            let n1 = v1.truncate() / v1.w;
-                            add_line(&mut verts, n0.x, n0.y, n1.x, n1.y, 0.003, aspect, [0.3, 0.9, 0.5, 0.8]);
-                        }
-                    }
-                }
-                ToolType::Disc => {
-                    let r = tool_state.brush_radius;
-                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.2, 0.8, 1.0, 0.95]);
-                }
-                ToolType::Cone => {
-                    let r = tool_state.brush_radius;
-                    let h = tool_state.cylinder_height;
-                    let bot_c = Vec3::new(p_target.x, p_target.y, p_target.z);
-                    let apex = bot_c + Vec3::new(0.0, h, 0.0);
-                    draw_circle_wireframe(&mut verts, bot_c, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [1.0, 0.6, 0.2, 0.9]);
-                    let struts = [Vec3::new(r, 0.0, 0.0), Vec3::new(-r, 0.0, 0.0), Vec3::new(0.0, 0.0, r), Vec3::new(0.0, 0.0, -r)];
-                    for off in struts {
-                        let mut v0 = view_proj * Vec4::new(bot_c.x + off.x, bot_c.y, bot_c.z + off.z, 1.0);
-                        let mut v1 = view_proj * Vec4::new(apex.x, apex.y, apex.z, 1.0);
-                        if clip_line_segment(&mut v0, &mut v1, 0.05) {
-                            let n0 = v0.truncate() / v0.w;
-                            let n1 = v1.truncate() / v1.w;
-                            add_line(&mut verts, n0.x, n0.y, n1.x, n1.y, 0.003, aspect, [1.0, 0.6, 0.2, 0.8]);
-                        }
-                    }
-                }
-                ToolType::Pyramid => {
-                    let r = tool_state.brush_radius;
-                    let h = tool_state.cylinder_height;
-                    let bot_c = Vec3::new(p_target.x, p_target.y, p_target.z);
-                    let apex = bot_c + Vec3::new(0.0, h, 0.0);
-                    let base_corners = [
-                        bot_c + Vec3::new(-r, 0.0, -r), bot_c + Vec3::new(r, 0.0, -r),
-                        bot_c + Vec3::new(r, 0.0, r), bot_c + Vec3::new(-r, 0.0, r),
-                    ];
-                    for i in 0..4 {
-                        let c0 = base_corners[i];
-                        let c1 = base_corners[(i + 1) % 4];
-                        let mut v0 = view_proj * Vec4::new(c0.x, c0.y, c0.z, 1.0);
-                        let mut v1 = view_proj * Vec4::new(c1.x, c1.y, c1.z, 1.0);
-                        if clip_line_segment(&mut v0, &mut v1, 0.05) {
-                            add_line(&mut verts, v0.x / v0.w, v0.y / v0.w, v1.x / v1.w, v1.y / v1.w, 0.003, aspect, [0.8, 0.4, 1.0, 0.9]);
-                        }
-                        let mut va0 = view_proj * Vec4::new(c0.x, c0.y, c0.z, 1.0);
-                        let mut va1 = view_proj * Vec4::new(apex.x, apex.y, apex.z, 1.0);
-                        if clip_line_segment(&mut va0, &mut va1, 0.05) {
-                            add_line(&mut verts, va0.x / va0.w, va0.y / va0.w, va1.x / va1.w, va1.y / va1.w, 0.003, aspect, [0.8, 0.4, 1.0, 0.8]);
-                        }
-                    }
-                }
-                ToolType::Torus => {
-                    let major_r = tool_state.brush_radius;
-                    let minor_r = (major_r * 0.35).max(1.0);
-                    draw_circle_wireframe(&mut verts, p_center, major_r, Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.3, 1.0, 0.4, 0.95]);
-                    draw_circle_wireframe(&mut verts, p_center, major_r + minor_r, Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.3, 1.0, 0.4, 0.6]);
-                    draw_circle_wireframe(&mut verts, p_center, (major_r - minor_r).max(0.1), Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.3, 1.0, 0.4, 0.6]);
-                }
-                ToolType::Box => {
-                    if let Some(anchor) = tool_state.pending_anchor {
-                        let b_min = anchor.min(p_target);
-                        let b_max = anchor.max(p_target) + Vec3::splat(edit_size);
-                        draw_box_wireframe(&mut verts, b_min, b_max, aspect, view_proj, [0.3, 1.0, 0.5, 0.9]);
-                        let dims = (b_max - b_min) / edit_size;
-                        draw_text(&mut verts, &format!("DIM: {:.0} X {:.0} X {:.0}", dims.x, dims.y, dims.z), -0.76, 0.74, 1.0, aspect, [0.4, 1.0, 0.6, 1.0]);
-                    } else {
-                        draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, [0.3, 1.0, 0.5, 0.6]);
-                    }
-                }
-                ToolType::Line => {
-                    if let Some(anchor) = tool_state.pending_anchor {
-                        let mut v0 = view_proj * Vec4::new(anchor.x, anchor.y, anchor.z, 1.0);
-                        let mut v1 = view_proj * Vec4::new(p_target.x, p_target.y, p_target.z, 1.0);
-                        if clip_line_segment(&mut v0, &mut v1, 0.05) {
-                            let ndc0 = v0.truncate() / v0.w;
-                            let ndc1 = v1.truncate() / v1.w;
-                            add_line(&mut verts, ndc0.x, ndc0.y, ndc1.x, ndc1.y, 0.005, aspect, [1.0, 0.8, 0.2, 1.0]);
-                        }
-                        let dist = (p_target - anchor).length();
-                        draw_text(&mut verts, &format!("LEN: {:.1} BLOCKS", dist / edit_size), -0.76, 0.74, 1.0, aspect, [1.0, 0.8, 0.2, 1.0]);
-                    } else {
-                        draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, [1.0, 0.8, 0.2, 0.6]);
-                    }
-                }
-                ToolType::Replace => {
-                    let r = tool_state.brush_radius;
-                    draw_box_wireframe(&mut verts, p_center - Vec3::splat(r), p_center + Vec3::splat(r), aspect, view_proj, [0.9, 0.2, 0.9, 0.9]);
-                    draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.9, 0.2, 0.9, 0.8]);
-                }
-            }
-        }
-    }
-
-    if let Some(err) = error_banner {
-        add_quad(&mut verts, -0.85, 0.68, 0.85, 0.80, [0.70, 0.12, 0.12, 0.95]);
-        draw_text_centered(&mut verts, err, 0.0, 0.74, 0.95, aspect, [1.0, 1.0, 1.0, 1.0]);
-    }
-
-    match active_menu {
-        ActiveMenu::None => {
-            draw_text(&mut verts, hud_status, -0.96, 0.92, 1.25, aspect, [1.0, 1.0, 1.0, 0.95]);
-            draw_text(&mut verts, hud_tools, -0.96, 0.86, 1.0, aspect, [0.3, 0.9, 1.0, 0.95]);
-            draw_text(&mut verts, "[MMB] ORBIT  [SHIFT+MMB] PAN  [CTRL+MMB/WHEEL] ZOOM  [NUM 1/3/7/9/2/4/6/8] NAV  [H] HOLLOW  [C] PICK  [CTRL+Z/Y] UNDO", -0.96, 0.80, 0.90, aspect, [0.9, 0.85, 0.4, 0.85]);
-        }
-        ActiveMenu::Edit => {
-            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.75]); add_quad(&mut verts, -0.566, -0.586, 0.566, 0.656, [0.25, 0.35, 0.50, 1.0]); add_quad(&mut verts, -0.56, -0.58, 0.56, 0.65, [0.10, 0.12, 0.16, 0.98]);
-            draw_text_centered(&mut verts, "EDIT STUDIO - PALETTE & OCTREE (E)", 0.0, 0.58, 1.3, aspect, [1.0, 0.9, 0.2, 1.0]);
-            let sw_w = 0.082; let sw_gap = 0.015; let sw_tot = 10.0 * sw_w + 9.0 * sw_gap; let s_start_x = -sw_tot / 2.0;
-            for (i, &rgb) in hotbar_colors.iter().enumerate() {
-                let sx0 = s_start_x + i as f32 * (sw_w + sw_gap); let sx1 = sx0 + sw_w;
-                if selected_slot == i { add_quad(&mut verts, sx0 - 0.008, 0.422, sx1 + 0.008, 0.528, [1.0, 0.9, 0.1, 1.0]); } else { add_quad(&mut verts, sx0 - 0.004, 0.426, sx1 + 0.004, 0.524, [0.22, 0.24, 0.30, 1.0]); }
-                add_quad(&mut verts, sx0, 0.43, sx1, 0.52, [rgb[0], rgb[1], rgb[2], 1.0]);
-                draw_text_centered(&mut verts, HOTBAR_LABELS[i], (sx0 + sx1) / 2.0, 0.542, 1.0, aspect, [0.8, 0.8, 0.8, 0.9]);
-            }
-            let [cur_r, cur_g, cur_b] = hotbar_colors[selected_slot]; add_quad(&mut verts, 0.24, 0.18, 0.46, 0.37, [0.25, 0.28, 0.35, 1.0]); add_quad(&mut verts, 0.248, 0.188, 0.452, 0.362, [cur_r, cur_g, cur_b, 1.0]); draw_text_centered(&mut verts, "ACTIVE COLOR", 0.35, 0.39, 1.0, aspect, [0.85, 0.85, 0.85, 0.9]);
-            for (lbl, val, y0, y1, bar_col) in [("R", cur_r, 0.32, 0.36, [0.90, 0.25, 0.25, 1.0]), ("G", cur_g, 0.25, 0.29, [0.25, 0.85, 0.30, 1.0]), ("B", cur_b, 0.18, 0.22, [0.25, 0.50, 0.95, 1.0])] {
-                draw_text_centered(&mut verts, lbl, -0.37, (y0 + y1) / 2.0, 1.1, aspect, bar_col); add_quad(&mut verts, -0.32, y0, 0.18, y1, [0.18, 0.20, 0.25, 1.0]); let filled_x = -0.32 + val * 0.50; add_quad(&mut verts, -0.32, y0, filled_x, y1, bar_col); add_quad(&mut verts, filled_x - 0.010, y0 - 0.006, filled_x + 0.010, y1 + 0.006, [1.0, 1.0, 1.0, 1.0]);
-            }
-            draw_text_centered(&mut verts, "QUICK PALETTE CHIPS", 0.0, 0.135, 1.0, aspect, [0.75, 0.75, 0.8, 0.9]);
-            let pw_w = 0.076; let pw_gap = 0.012; let pw_tot = 10.0 * pw_w + 9.0 * pw_gap; let pw_start_x = -pw_tot / 2.0;
-            for (i, &rgb) in PRESET_SWATCHES.iter().enumerate() { let px0 = pw_start_x + i as f32 * (pw_w + pw_gap); add_quad(&mut verts, px0 - 0.003, 0.047, px0 + pw_w + 0.003, 0.113, [0.3, 0.3, 0.35, 1.0]); add_quad(&mut verts, px0, 0.05, px0 + pw_w, 0.11, [rgb[0], rgb[1], rgb[2], 1.0]); }
-            add_quad(&mut verts, -0.40, -0.10, -0.22, -0.02, [0.35, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "/ 2 (F)", -0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); 
-            draw_text_centered(&mut verts, &format!("CURRENT: {}", size_str), 0.0, -0.06, 1.25, aspect, [1.0, 0.85, 0.2, 1.0]); 
-            add_quad(&mut verts, 0.22, -0.10, 0.40, -0.02, [0.35, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "* 2 (R)", 0.31, -0.06, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); add_quad(&mut verts, -0.22, -0.25, 0.22, -0.17, [0.20, 0.50, 0.30, 1.0]); draw_text_centered(&mut verts, "DONE (PRESS E)", 0.0, -0.21, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-        }
-        ActiveMenu::Pause => {
-            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.80]); add_quad(&mut verts, -0.426, -0.766, 0.426, 0.726, [0.45, 0.45, 0.50, 1.0]); add_quad(&mut verts, -0.42, -0.76, 0.42, 0.72, [0.12, 0.13, 0.17, 0.98]);
-            draw_text_centered(&mut verts, "PAUSE / SYSTEM MENU", 0.0, 0.62, 1.3, aspect, [0.95, 0.95, 0.95, 1.0]);
-            
-            add_quad(&mut verts, -0.30, 0.48, 0.30, 0.56, [0.20, 0.55, 0.75, 1.0]); draw_text_centered(&mut verts, ">> IMPORT 3D MODEL (GLB) <<", 0.0, 0.52, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.38, 0.30, 0.46, [0.25, 0.35, 0.55, 1.0]); draw_text_centered(&mut verts, if play_mode == PlayMode::Flying { "PLAY MODE: FLYING (M)" } else { "PLAY MODE: REAL (M)" }, 0.0, 0.42, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.28, 0.30, 0.36, [0.22, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, if is_ortho { "VIEW: ORTHOGRAPHIC (P)" } else { "VIEW: PERSPECTIVE (P)" }, 0.0, 0.32, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.18, 0.30, 0.26, [0.35, 0.25, 0.50, 1.0]); draw_text_centered(&mut verts, &format!("WORLD: {}", world_type.name()), 0.0, 0.22, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.08, 0.30, 0.16, [0.60, 0.30, 0.20, 1.0]); draw_text_centered(&mut verts, "CLEAR SCENE", 0.0, 0.12, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, -0.02, -0.02, 0.06, [0.25, 0.45, 0.35, 1.0]); draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, 0.02, -0.02, 0.30, 0.06, [0.35, 0.45, 0.25, 1.0]); draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
-            
-            add_quad(&mut verts, -0.30, -0.19, 0.30, -0.11, [0.22, 0.38, 0.52, 1.0]);
-            add_quad(&mut verts, -0.285, -0.175, -0.215, -0.125, [0.4, 0.45, 0.55, 1.0]);
-            add_quad(&mut verts, -0.280, -0.170, -0.220, -0.130, [bg_color[0], bg_color[1], bg_color[2], 1.0]);
-            draw_text_centered(&mut verts, "BACKGROUND COLOR (SLIDERS)...", 0.04, -0.15, 0.95, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            add_quad(&mut verts, -0.30, -0.29, 0.30, -0.21, [0.18, 0.45, 0.32, 1.0]);
-            draw_text_centered(&mut verts, "RENDER MODE / HIDE UI (F1)", 0.0, -0.25, 1.05, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            add_quad(&mut verts, -0.30, -0.39, 0.30, -0.31, [0.25, 0.40, 0.55, 1.0]);
-            draw_text_centered(&mut verts, "CONTROLS", 0.0, -0.35, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            add_quad(&mut verts, -0.30, -0.51, 0.30, -0.43, [0.20, 0.55, 0.30, 1.0]);
-            draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.47, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            add_quad(&mut verts, -0.30, -0.63, 0.30, -0.55, [0.55, 0.20, 0.20, 1.0]);
-            draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.59, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-        }
-        ActiveMenu::BgColorModal => {
-            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.02, 0.03, 0.05, 0.70]);
-            add_quad(&mut verts, -0.406, -0.426, 0.406, 0.426, [0.35, 0.45, 0.60, 1.0]);
-            add_quad(&mut verts, -0.400, -0.420, 0.400, 0.420, [0.10, 0.12, 0.16, 0.98]);
-
-            draw_text_centered(&mut verts, "BACKGROUND COLOR PICKER", 0.0, 0.35, 1.25, aspect, [1.0, 0.9, 0.2, 1.0]);
-
-            let [cur_r, cur_g, cur_b] = bg_color;
-            let s_x0 = -0.34;
-            let s_x1 = 0.08;
-
-            add_quad(&mut verts, 0.165, 0.105, 0.355, 0.295, [0.40, 0.45, 0.55, 1.0]);
-            add_quad(&mut verts, 0.170, 0.110, 0.350, 0.290, [cur_r, cur_g, cur_b, 1.0]);
-            draw_text_centered(&mut verts, "PREVIEW", 0.26, 0.315, 0.9, aspect, [0.85, 0.85, 0.85, 1.0]);
-            draw_text_centered(&mut verts, &format!("#{:02X}{:02X}{:02X}", (cur_r * 255.0).round() as u8, (cur_g * 255.0).round() as u8, (cur_b * 255.0).round() as u8), 0.26, 0.075, 0.85, aspect, [0.8, 0.85, 0.9, 1.0]);
-
-            for (lbl, val, y0, y1, bar_col) in [
-                ("R", cur_r, 0.24, 0.28, [0.90, 0.25, 0.25, 1.0]),
-                ("G", cur_g, 0.17, 0.21, [0.25, 0.85, 0.30, 1.0]),
-                ("B", cur_b, 0.10, 0.14, [0.25, 0.50, 0.95, 1.0]),
-            ] {
-                draw_text_centered(&mut verts, lbl, -0.365, (y0 + y1) * 0.5, 1.1, aspect, bar_col);
-                add_quad(&mut verts, s_x0, y0, s_x1, y1, [0.18, 0.20, 0.25, 1.0]);
-                let filled_x = s_x0 + val * (s_x1 - s_x0);
-                add_quad(&mut verts, s_x0, y0, filled_x, y1, bar_col);
-                add_quad(&mut verts, filled_x - 0.008, y0 - 0.005, filled_x + 0.008, y1 + 0.005, [1.0, 1.0, 1.0, 1.0]);
-                draw_text(&mut verts, &format!("{:.0}%", val * 100.0), s_x1 + 0.015, (y0 + y1) * 0.5 - 0.012, 0.85, aspect, [0.85, 0.85, 0.85, 1.0]);
-            }
-
-            draw_text_centered(&mut verts, "QUICK PRESETS", 0.0, 0.01, 0.95, aspect, [0.8, 0.85, 0.9, 1.0]);
-            let bg_w = 0.068; let bg_gap = 0.008; let bg_tot = 8.0 * bg_w + 7.0 * bg_gap; let bg_start_x = -bg_tot / 2.0;
-            let bg_y0 = -0.10; let bg_y1 = -0.04;
-            for (i, &col) in PRESET_BG_COLORS.iter().enumerate() {
-                let x0 = bg_start_x + i as f32 * (bg_w + bg_gap);
-                let x1 = x0 + bg_w;
-                add_quad(&mut verts, x0, bg_y0, x1, bg_y1, [col[0], col[1], col[2], 1.0]);
-            }
-
-            add_quad(&mut verts, -0.22, -0.23, 0.22, -0.15, [0.20, 0.55, 0.35, 1.0]);
-            draw_text_centered(&mut verts, "APPLY & CLOSE (ESC)", 0.0, -0.19, 1.05, aspect, [1.0, 1.0, 1.0, 1.0]);
-        }
-        ActiveMenu::Controls => {
-            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.95]);
-            draw_text_centered(&mut verts, "BLENDER-COMPLIANT CONTROLS", 0.0, 0.60, 1.4, aspect, [1.0, 1.0, 1.0, 1.0]);
-            draw_text_centered(&mut verts, "MMB = ORBIT  |  SHIFT + MMB = PAN  |  CTRL + MMB / WHEEL = ZOOM", 0.0, 0.42, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
-            draw_text_centered(&mut verts, "NUMPAD 2 / 4 / 6 / 8 = ORBIT (15 DEG)  |  NUMPAD 1/3/7/9 = VIEWS", 0.0, 0.32, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
-            draw_text_centered(&mut verts, "CTRL + Z = UNDO  |  CTRL + SHIFT + Z / CTRL + Y = REDO", 0.0, 0.22, 0.95, aspect, [1.0, 0.85, 0.3, 1.0]);
-            draw_text_centered(&mut verts, "V: PEN | O: SPH | Y: CYL | U: DSC | B: BOX | L: LIN | J: CON | N: PYR | T: TOR | K: PNT | G: REP | I: BCK", 0.0, 0.12, 0.80, aspect, [0.9, 0.9, 0.9, 1.0]);
-            draw_text_centered(&mut verts, "H = TOGGLE HOLLOW / SOLID  |  [ / ] = DECREASE / INCREASE RADIUS", 0.0, 0.02, 0.95, aspect, [0.3, 1.0, 0.5, 1.0]);
-            draw_text_centered(&mut verts, "LMB = APPLY TOOL  |  RMB = ERASE TOOL  |  C = PICK COLOR AT CURSOR", 0.0, -0.08, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
-            draw_text_centered(&mut verts, "NUMPAD . / [.] = FOCUS ON SCENE  |  NUMPAD 5 = ORTHO / PERSP", 0.0, -0.18, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
-            add_quad(&mut verts, -0.30, -0.66, 0.30, -0.56, [0.45, 0.22, 0.22, 1.0]); draw_text_centered(&mut verts, "BACK (ESC)", 0.0, -0.61, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-        }
-        ActiveMenu::ImportParams => {
-            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.02, 0.03, 0.05, 0.85]); add_quad(&mut verts, -0.426, -0.686, 0.426, 0.626, [0.30, 0.45, 0.65, 1.0]); add_quad(&mut verts, -0.42, -0.68, 0.42, 0.62, [0.08, 0.10, 0.14, 0.98]);
-            draw_text_centered(&mut verts, "GLB VOXEL IMPORT SETTINGS", 0.0, 0.54, 1.25, aspect, [0.3, 0.9, 1.0, 1.0]);
-            let file_label = glb_settings.selected_file.as_ref().and_then(|f| f.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "NO FILE SELECTED".into());
-            let short_file = if file_label.len() > 18 { format!("{}...", &file_label[..15]) } else { file_label };
-            add_quad(&mut verts, -0.38, 0.38, 0.20, 0.46, [0.05, 0.06, 0.09, 1.0]); draw_text(&mut verts, &format!("FILE: {}", short_file), -0.36, 0.42, 0.95, aspect, [0.85, 0.85, 0.4, 1.0]);
-            add_quad(&mut verts, 0.22, 0.38, 0.38, 0.46, [0.25, 0.35, 0.50, 1.0]); draw_text_centered(&mut verts, "CHANGE", 0.30, 0.42, 0.95, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            draw_text(&mut verts, "TARGET HEIGHT (BLOCKS):", -0.38, 0.29, 1.0, aspect, [0.8, 0.8, 0.8, 1.0]);
-            add_quad(&mut verts, -0.38, 0.19, -0.28, 0.27, [0.25, 0.30, 0.40, 1.0]); draw_text_centered(&mut verts, "- 4", -0.33, 0.23, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            draw_text_centered(&mut verts, &format!("{:.0} BLOCKS", glb_settings.target_height), 0.0, 0.23, 1.1, aspect, [0.3, 0.9, 1.0, 1.0]);
-            add_quad(&mut verts, 0.28, 0.19, 0.38, 0.27, [0.25, 0.30, 0.40, 1.0]); draw_text_centered(&mut verts, "+ 4", 0.33, 0.23, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            draw_text(&mut verts, "VOXEL RESOLUTION:", -0.38, 0.09, 1.0, aspect, [0.8, 0.8, 0.8, 1.0]);
-            add_quad(&mut verts, -0.38, -0.01, -0.28, 0.07, [0.25, 0.30, 0.40, 1.0]); draw_text_centered(&mut verts, "/ 2", -0.33, 0.03, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            draw_text_centered(&mut verts, &format!("{:.3}", glb_settings.voxel_size), 0.0, 0.03, 1.1, aspect, [0.3, 0.9, 1.0, 1.0]);
-            add_quad(&mut verts, 0.28, -0.01, 0.38, 0.07, [0.25, 0.30, 0.40, 1.0]); draw_text_centered(&mut verts, "* 2", 0.33, 0.03, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            draw_text(&mut verts, "MAX PALETTE SIZE:", -0.38, -0.11, 1.0, aspect, [0.8, 0.8, 0.8, 1.0]);
-            add_quad(&mut verts, -0.38, -0.21, -0.28, -0.13, [0.25, 0.30, 0.40, 1.0]); draw_text_centered(&mut verts, "/ 2", -0.33, -0.17, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            draw_text_centered(&mut verts, &format!("{}", glb_settings.palette_size), 0.0, -0.17, 1.1, aspect, [0.3, 0.9, 1.0, 1.0]);
-            add_quad(&mut verts, 0.28, -0.21, 0.38, -0.13, [0.25, 0.30, 0.40, 1.0]); draw_text_centered(&mut verts, "* 2", 0.33, -0.17, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            draw_text(&mut verts, "PLACEMENT ANCHOR:", -0.38, -0.29, 1.0, aspect, [0.8, 0.8, 0.8, 1.0]);
-            add_quad(&mut verts, -0.38, -0.39, 0.38, -0.31, [0.18, 0.24, 0.34, 1.0]); draw_text_centered(&mut verts, if glb_settings.place_at_aim { "CROSSHAIR / RAYCAST AIM" } else { "AT PLAYER POSITION" }, 0.0, -0.35, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
-
-            let cost_col = if glb_settings.is_safe() { [0.3, 0.9, 0.4, 1.0] } else { [0.95, 0.25, 0.2, 1.0] };
-            draw_text_centered(&mut verts, glb_cost_str, 0.0, -0.42, 0.85, aspect, cost_col);
-
-            let btn_col = if glb_settings.selected_file.is_some() && glb_settings.is_safe() { [0.20, 0.60, 0.30, 1.0] } else { [0.35, 0.20, 0.20, 0.8] };
-            add_quad(&mut verts, -0.38, -0.54, 0.38, -0.44, btn_col);
-            draw_text_centered(&mut verts, if glb_settings.is_safe() { "VOXELIZE & INSERT (SOLID)" } else { "TOO DENSE (REDUCE SETTINGS)" }, 0.0, -0.49, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.38, -0.66, 0.38, -0.56, [0.45, 0.22, 0.22, 1.0]); draw_text_centered(&mut verts, "CANCEL (ESC)", 0.0, -0.61, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-        }
-        ActiveMenu::Voxelizing => {
-            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.02, 0.03, 0.05, 0.88]); add_quad(&mut verts, -0.446, -0.246, 0.446, 0.266, [0.25, 0.45, 0.70, 1.0]); add_quad(&mut verts, -0.44, -0.24, 0.44, 0.26, [0.08, 0.10, 0.15, 0.98]);
-            draw_text_centered(&mut verts, "VOXELIZING 3D MODEL", 0.0, 0.18, 1.25, aspect, [0.3, 0.9, 1.0, 1.0]); draw_text_centered(&mut verts, progress_stage, 0.0, 0.09, 0.95, aspect, [0.85, 0.85, 0.9, 1.0]);
-            add_quad(&mut verts, -0.384, -0.054, 0.384, 0.044, [0.20, 0.25, 0.35, 1.0]); add_quad(&mut verts, -0.38, -0.05, 0.38, 0.04, [0.04, 0.05, 0.07, 1.0]);
-            let fill_w = 0.76 * progress_val.clamp(0.0, 1.0); if fill_w > 0.001 { add_quad(&mut verts, -0.38, -0.05, -0.38 + fill_w, 0.04, [0.20, 0.75, 0.90, 1.0]); }
-            draw_text_centered(&mut verts, &format!("{:.0}%", (progress_val * 100.0).clamp(0.0, 100.0)), 0.0, -0.10, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]); draw_text_centered(&mut verts, "SOLID SVO GENERATOR ACTIVE", 0.0, -0.18, 0.85, aspect, [0.5, 0.8, 0.6, 0.9]);
-        }
-    }
-    verts
-}
-
 struct State {
-    surface: wgpu::Surface<'static>, device: wgpu::Device, queue: wgpu::Queue, config: wgpu::SurfaceConfiguration, size: winit::dpi::PhysicalSize<u32>,
-    render_pipeline: wgpu::RenderPipeline, ui_pipeline: wgpu::RenderPipeline, ui_vertex_buffer: wgpu::Buffer, ui_vertices_count: u32,
-    camera_buffer: wgpu::Buffer, svo_buffer: wgpu::Buffer, svo_capacity: usize, svo_bind_group: wgpu::BindGroup, svo_bind_group_layout: wgpu::BindGroupLayout,
-    palette_buffer: wgpu::Buffer, window: Arc<Window>, camera: Camera, input: InputState, octree: Octree,
-    play_mode: PlayMode, selected_slot: usize, hotbar_colors: [[f32; 3]; 10], palette: Arc<RwLock<Palette>>, active_menu: ActiveMenu,
-    cursor_pos: [f32; 2], active_slider: Option<usize>, edit_size: f32, last_target: Option<[f32; 3]>, cursor_free: bool, gimbal_dragging: bool, gimbal_drag_moved: bool, prev_cursor_pos: [f32; 2],
-    glb_settings: GlbImportSettings, voxelize_rx: Option<mpsc::Receiver<VoxelizeMsg>>, voxelize_progress: f32, voxelize_stage: String, collider: PlayerCollider,
-    hide_ui: bool, bg_color: [f32; 3], world_type: WorldType, seed: u32, cube_edits: Vec<CubeEdit>, error_banner: Option<(String, Instant)>,
-    fps: f32, fps_frame_counter: u32, fps_timer: Instant,
-    tool_state: ToolState, history: HistoryManager,
-    orbit_pivot: Vec3, mmb_dragging: bool,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    size: winit::dpi::PhysicalSize<u32>,
+    render_pipeline: wgpu::RenderPipeline,
+    ui_pipeline: wgpu::RenderPipeline,
+    ui_vertex_buffer: wgpu::Buffer,
+    ui_buffer_capacity: usize,
+    ui_vertices_count: u32,
+    camera_buffer: wgpu::Buffer,
+    svo_buffer: wgpu::Buffer,
+    svo_capacity: usize,
+    svo_bind_group: wgpu::BindGroup,
+    svo_bind_group_layout: wgpu::BindGroupLayout,
+    palette_buffer: wgpu::Buffer,
+    window: Arc<Window>,
+    camera: Camera,
+    input: InputState,
+    octree: Octree,
+    play_mode: PlayMode,
+    selected_slot: usize,
+    hotbar_colors: [[f32; 3]; 10],
+    palette: Arc<RwLock<Palette>>,
+    active_menu: ActiveMenu,
+    cursor_pos: [f32; 2],
+    active_slider: Option<usize>,
+    edit_size: f32,
+    last_target: Option<[f32; 3]>,
+    cursor_free: bool,
+    gimbal_dragging: bool,
+    gimbal_drag_moved: bool,
+    prev_cursor_pos: [f32; 2],
+    glb_settings: GlbImportSettings,
+    voxelize_rx: Option<mpsc::Receiver<VoxelizeMsg>>,
+    voxelize_progress: f32,
+    voxelize_stage: String,
+    collider: PlayerCollider,
+    hide_ui: bool,
+    bg_color: [f32; 3],
+    world_type: WorldType,
+    seed: u32,
+    cube_edits: Vec<CubeEdit>,
+    error_banner: Option<(String, Instant)>,
+    fps: f32,
+    fps_frame_counter: u32,
+    fps_timer: Instant,
+    tool_state: ToolState,
+    history: HistoryManager,
+    orbit_pivot: Vec3,
+    mmb_dragging: bool,
     ui_dirty: bool,
+    focused_voxel_size: Option<f32>,
+    intersecting_voxels_count: usize,
 }
 
 impl State {
     async fn new(window: Arc<Window>) -> Self {
         let mut size = window.inner_size();
-        if size.width == 0 || size.height == 0 { size = winit::dpi::PhysicalSize::new(1280, 720); }
+        if size.width == 0 || size.height == 0 {
+            size = winit::dpi::PhysicalSize::new(1280, 720);
+        }
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: Default::default()
-        }).await.unwrap();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: Default::default(),
+            })
+            .await
+            .unwrap();
 
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() }).await.unwrap();
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    required_limits: adapter.limits(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let mut config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
 
-        let camera = Camera { position: Vec3::new(0.0, 16.0, 36.0), yaw: -std::f32::consts::FRAC_PI_2, pitch: -0.30, is_ortho: false, ortho_size: 32.0 };
+        let camera = Camera {
+            position: Vec3::new(0.0, 16.0, 36.0),
+            yaw: -std::f32::consts::FRAC_PI_2,
+            pitch: -0.30,
+            is_ortho: false,
+            ortho_size: 32.0,
+        };
         let aspect = if config.height > 0 { config.width as f32 / config.height as f32 } else { 1.0 };
         let vp = camera.view_proj(aspect);
 
@@ -1086,7 +170,9 @@ impl State {
         let palette = Arc::new(RwLock::new(hotbar_colors.to_vec()));
 
         let mut pal_vec4 = vec![[0.0; 4]; 8192];
-        for (i, c) in hotbar_colors.iter().enumerate() { pal_vec4[i] = [c[0], c[1], c[2], 1.0]; }
+        for (i, c) in hotbar_colors.iter().enumerate() {
+            pal_vec4[i] = [c[0], c[1], c[2], 1.0];
+        }
         let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Palette Storage Buffer"),
             contents: bytemuck::cast_slice(&pal_vec4),
@@ -1104,9 +190,24 @@ impl State {
 
         let svo_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT, count: None, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None } },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, count: None, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None } },
-                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, count: None, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None } },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    count: None,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    count: None,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    count: None,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                },
             ],
             label: Some("SVO Layout"),
         });
@@ -1132,7 +233,12 @@ impl State {
             label: Some("SVO Ray-Marching Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })] }),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
+            }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
@@ -1146,7 +252,12 @@ impl State {
             label: Some("UI Pipeline"),
             layout: Some(&ui_pipeline_layout),
             vertex: wgpu::VertexState { module: &ui_shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(UIVertex::desc())] },
-            fragment: Some(wgpu::FragmentState { module: &ui_shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+            }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
@@ -1157,15 +268,16 @@ impl State {
         let mut glb_settings = GlbImportSettings::default();
         glb_settings.max_gpu_nodes = (device.limits().max_storage_buffer_binding_size as usize / 16).min(35_000_000);
 
+        let ui_buffer_capacity = (65536 * std::mem::size_of::<UIVertex>()).max(2_097_152);
         let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("UI Buffer"),
-            size: (65536 * std::mem::size_of::<UIVertex>()) as wgpu::BufferAddress,
+            size: ui_buffer_capacity as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let mut app_state = Self {
-            window, surface, device, queue, config, size, render_pipeline, ui_pipeline, ui_vertex_buffer, ui_vertices_count: 0,
+            window, surface, device, queue, config, size, render_pipeline, ui_pipeline, ui_vertex_buffer, ui_buffer_capacity, ui_vertices_count: 0,
             camera_buffer, svo_buffer, svo_capacity, svo_bind_group, svo_bind_group_layout, palette_buffer, camera,
             input: InputState::default(), octree, play_mode: PlayMode::Flying, selected_slot: 0,
             hotbar_colors, palette, active_menu: ActiveMenu::None, cursor_pos: [0.0, 0.0], active_slider: None, edit_size: 1.0,
@@ -1175,6 +287,7 @@ impl State {
             fps: 60.0, fps_frame_counter: 0, fps_timer: Instant::now(),
             tool_state: ToolState::default(), history: HistoryManager::new(64),
             orbit_pivot: Vec3::ZERO, mmb_dragging: false, ui_dirty: true,
+            focused_voxel_size: None, intersecting_voxels_count: 0,
         };
         app_state.sync_palette_buffer();
         app_state.update_ui();
@@ -1338,13 +451,23 @@ impl State {
     }
 
     pub fn save_game(&self, filename: &str) -> std::io::Result<()> {
-        std::fs::write(filename, serde_json::to_string_pretty(&SaveData {
-            player_pos: self.camera.position.to_array(), camera_yaw: self.camera.yaw, camera_pitch: self.camera.pitch,
-            is_ortho: self.camera.is_ortho, ortho_size: self.camera.ortho_size, play_mode: self.play_mode,
-            world_type: self.world_type, seed: self.seed, hotbar_colors: self.hotbar_colors,
-            palette: self.palette.read().unwrap().clone(), octree: self.octree.clone(),
-            bg_color: self.bg_color,
-        })?)?;
+        std::fs::write(
+            filename,
+            serde_json::to_string_pretty(&SaveData {
+                player_pos: self.camera.position.to_array(),
+                camera_yaw: self.camera.yaw,
+                camera_pitch: self.camera.pitch,
+                is_ortho: self.camera.is_ortho,
+                ortho_size: self.camera.ortho_size,
+                play_mode: self.play_mode,
+                world_type: self.world_type,
+                seed: self.seed,
+                hotbar_colors: self.hotbar_colors,
+                palette: self.palette.read().unwrap().clone(),
+                octree: self.octree.clone(),
+                bg_color: self.bg_color,
+            })?,
+        )?;
         Ok(())
     }
 
@@ -1361,11 +484,11 @@ impl State {
         self.world_type = data.world_type;
         self.seed = data.seed;
         self.bg_color = data.bg_color;
-        
+
         self.octree = data.octree;
         self.octree.recalculate_voxel_count();
         self.history = HistoryManager::new(64);
-        
+
         self.sync_svo_buffer_full();
         self.sync_palette_buffer();
         self.update_camera_buffer();
@@ -1423,27 +546,194 @@ impl State {
         id
     }
 
+    fn get_tool_aabb(&self, target_vec: Vec3) -> (Vec3, Vec3) {
+        let s = self.edit_size;
+        match self.tool_state.active_tool {
+            ToolType::Sphere | ToolType::Replace => (
+                target_vec - Vec3::splat(self.tool_state.brush_radius),
+                target_vec + Vec3::splat(self.tool_state.brush_radius),
+            ),
+            ToolType::Cylinder | ToolType::Cone | ToolType::Pyramid => (
+                target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius),
+                target_vec + Vec3::new(self.tool_state.brush_radius, self.tool_state.cylinder_height, self.tool_state.brush_radius),
+            ),
+            ToolType::Torus => (
+                target_vec - Vec3::new(self.tool_state.brush_radius * 1.4, self.tool_state.brush_radius * 0.4, self.tool_state.brush_radius * 1.4),
+                target_vec + Vec3::new(self.tool_state.brush_radius * 1.4, self.tool_state.brush_radius * 0.4, self.tool_state.brush_radius * 1.4),
+            ),
+            ToolType::Disc => (
+                target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius),
+                target_vec + Vec3::new(self.tool_state.brush_radius, s, self.tool_state.brush_radius),
+            ),
+            ToolType::Box | ToolType::Line => {
+                let anchor = self.tool_state.pending_anchor.unwrap_or(target_vec);
+                (anchor.min(target_vec), anchor.max(target_vec) + Vec3::splat(s))
+            }
+            ToolType::Select => {
+                let anchor = self.tool_state.selection.anchor.unwrap_or(target_vec);
+                (anchor.min(target_vec), anchor.max(target_vec) + Vec3::splat(s))
+            }
+            ToolType::Bucket => (target_vec - Vec3::splat(32.0 * s), target_vec + Vec3::splat(32.0 * s)),
+            _ => (target_vec, target_vec + Vec3::splat(s)),
+        }
+    }
+
+    fn rotate_floating_or_selection(&mut self) {
+        if self.tool_state.selection.is_floating {
+            for (pos, _, _) in self.tool_state.selection.floating_voxels.iter_mut() {
+                let old_x = pos.x;
+                pos.x = -pos.z;
+                pos.z = old_x;
+            }
+            self.ui_dirty = true;
+            self.window.request_redraw();
+        } else if let Some((min_b, max_b)) = self.tool_state.selection.bounds {
+            let center = (min_b + max_b) * 0.5;
+            let mut removed = Vec::new();
+            self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, min_b, max_b, &mut removed);
+            if removed.is_empty() { return; }
+
+            for (p, s, _) in &removed { self.octree.insert_cube_world(*p, *s, 0, false); }
+
+            let mut added = Vec::with_capacity(removed.len());
+            for (p, s, m) in removed.iter() {
+                let rel = *p - center;
+                let rot_rel = Vec3::new(-rel.z, rel.y, rel.x);
+                let new_pos = (center + rot_rel) / *s;
+                let snapped = Vec3::new(new_pos.x.round(), new_pos.y.round(), new_pos.z.round()) * *s;
+                self.octree.insert_cube_world(snapped, *s, *m, false);
+                added.push((snapped, *s, *m));
+            }
+
+            self.octree.collapse(self.octree.root_index as usize);
+            self.octree.recalculate_voxel_count();
+            self.history.record(HistoryAction { removed, added });
+            self.sync_svo_buffer_full();
+            self.ui_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    fn copy_selection(&mut self) {
+        if let Some((min_b, max_b)) = self.tool_state.selection.bounds {
+            let center = (min_b + max_b) * 0.5;
+            let mut voxels = Vec::new();
+            self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, min_b, max_b, &mut voxels);
+            if !voxels.is_empty() {
+                self.tool_state.clipboard = voxels.into_iter().map(|(p, s, m)| (p - center, s, m)).collect();
+                self.ui_dirty = true;
+            }
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        if !self.tool_state.clipboard.is_empty() {
+            self.tool_state.selection.floating_voxels = self.tool_state.clipboard.clone();
+            self.tool_state.selection.is_floating = true;
+            self.ui_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    fn grab_selection(&mut self) {
+        if let Some((min_b, max_b)) = self.tool_state.selection.bounds {
+            let center = (min_b + max_b) * 0.5;
+            let mut voxels = Vec::new();
+            self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, min_b, max_b, &mut voxels);
+            if voxels.is_empty() { return; }
+
+            for (p, s, _) in &voxels { self.octree.insert_cube_world(*p, *s, 0, false); }
+            self.octree.collapse(self.octree.root_index as usize);
+            self.octree.recalculate_voxel_count();
+            self.history.record(HistoryAction { removed: voxels.clone(), added: Vec::new() });
+            self.sync_svo_buffer_full();
+
+            self.tool_state.selection.floating_voxels = voxels.into_iter().map(|(p, s, m)| (p - center, s, m)).collect();
+            self.tool_state.selection.is_floating = true;
+            self.tool_state.selection.bounds = None;
+            self.ui_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    fn clear_selection_voxels(&mut self) {
+        if let Some((min_b, max_b)) = self.tool_state.selection.bounds.take() {
+            let mut removed = Vec::new();
+            self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, min_b, max_b, &mut removed);
+            if !removed.is_empty() {
+                for (p, s, _) in &removed { self.octree.insert_cube_world(*p, *s, 0, false); }
+                self.octree.collapse(self.octree.root_index as usize);
+                self.octree.recalculate_voxel_count();
+                self.history.record(HistoryAction { removed, added: Vec::new() });
+                self.sync_svo_buffer_full();
+            }
+            self.ui_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
     fn update_ui(&mut self) {
         let aspect = if self.config.height > 0 { self.config.width as f32 / self.config.height as f32 } else { 1.0 };
         let total_voxels = self.octree.total_voxels;
         let error_msg = self.error_banner.as_ref().map(|(msg, _)| msg.as_str());
 
-        let size_str = if self.edit_size < 0.001 { format!("RES: {:.1e}", self.edit_size) } else if self.edit_size < 1.0 { format!("RES: 1/{} ({:.4})", (1.0 / self.edit_size).round() as u32, self.edit_size) } else { format!("RES: {:.0}X{:.0}", self.edit_size, self.edit_size) };
+        let size_str = if self.edit_size < 0.001 {
+            format!("RES: {:.1e}", self.edit_size)
+        } else if self.edit_size < 1.0 {
+            format!("RES: 1/{} ({:.4})", (1.0 / self.edit_size).round() as u32, self.edit_size)
+        } else {
+            format!("RES: {:.0}X{:.0}", self.edit_size, self.edit_size)
+        };
+
         let frame_ms = if self.fps > 0.0 { 1000.0 / self.fps } else { 0.0 };
-        let hud_status = format!("{:.0} FPS ({:.1}MS) | MODE: {} | PROJ: {} | WORLD: {} | VOXELS: {} | {}", self.fps, frame_ms, if self.play_mode == PlayMode::Flying { "FLY" } else { "REAL" }, if self.camera.is_ortho { "ORTHO" } else { "PERSP" }, self.world_type.name(), format_voxel_count(total_voxels), size_str);
-        let hud_tools = format!("TOOL: {} | RAD: {:.1} | {} | UNDO: {} | REDO: {}", self.tool_state.active_tool.name(), self.tool_state.brush_radius, if self.tool_state.hollow { "HOLLOW" } else { "SOLID" }, self.history.undo_stack.len(), self.history.redo_stack.len());
-        
+        let hud_status = format!(
+            "{:.0} FPS ({:.1}MS) | MODE: {} | PROJ: {} | WORLD: {} | VOXELS: {} | {}",
+            self.fps, frame_ms,
+            if self.play_mode == PlayMode::Flying { "FLY" } else { "REAL" },
+            if self.camera.is_ortho { "ORTHO" } else { "PERSP" },
+            self.world_type.name(),
+            format_voxel_count(total_voxels),
+            size_str
+        );
+        let hud_tools = format!(
+            "TOOL: {} | RAD: {:.1} | {} | CLIPBOARD: {} | UNDO: {}",
+            self.tool_state.active_tool.name(),
+            self.tool_state.brush_radius,
+            if self.tool_state.hollow { "HOLLOW" } else { "SOLID" },
+            self.tool_state.clipboard.len(),
+            self.history.undo_stack.len()
+        );
+
         let (est_count, est_mb) = self.glb_settings.estimate_cost();
-        let glb_cost_str = format!("EST: ~{} VOXELS ({:.0} MB SVO) | HW LIMIT: {}", format_voxel_count(est_count as usize), est_mb, format_voxel_count(self.glb_settings.max_gpu_nodes));
+        let glb_cost_str = format!(
+            "EST: ~{} VOXELS ({:.0} MB SVO) | HW LIMIT: {}",
+            format_voxel_count(est_count as usize), est_mb, format_voxel_count(self.glb_settings.max_gpu_nodes)
+        );
 
         let verts = build_ui_vertices(
             self.selected_slot, self.active_menu, &self.hotbar_colors, self.play_mode, self.camera.is_ortho, self.world_type,
             self.edit_size, self.last_target, aspect, self.camera.forward(), self.camera.right(), self.camera.up(), self.cursor_free,
             &self.glb_settings, self.voxelize_progress, &self.voxelize_stage, self.camera.view_proj(aspect), error_msg,
-            &self.tool_state, &hud_status, &hud_tools, &size_str, &glb_cost_str, self.bg_color
+            &self.tool_state, &hud_status, &hud_tools, &size_str, &glb_cost_str, self.bg_color,
+            self.focused_voxel_size, self.intersecting_voxels_count,
         );
+        let raw_bytes: &[u8] = bytemuck::cast_slice(&verts);
+        
+        // Réallocation dynamique si l'UI dépasse la taille allouée sur le GPU
+        if raw_bytes.len() > self.ui_buffer_capacity {
+            self.ui_buffer_capacity = (raw_bytes.len() * 2).max(self.ui_buffer_capacity * 2);
+            self.ui_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("UI Buffer (Resized)"),
+                size: self.ui_buffer_capacity as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+
         self.ui_vertices_count = verts.len() as u32;
-        self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+        if !raw_bytes.is_empty() {
+            self.queue.write_buffer(&self.ui_vertex_buffer, 0, raw_bytes);
+        }
         self.ui_dirty = false;
     }
 
@@ -1464,9 +754,40 @@ impl State {
             None => return,
         };
 
-        if matches!(self.tool_state.active_tool, ToolType::Box | ToolType::Line)
-            && self.tool_state.pending_anchor.is_none()
-        {
+        // Placement d'un tampon flottant
+        if self.tool_state.selection.is_floating {
+            let mut added = Vec::with_capacity(self.tool_state.selection.floating_voxels.len());
+            for &(rel, s, m) in &self.tool_state.selection.floating_voxels {
+                let v_pos = target_vec + rel;
+                self.octree.insert_cube_world(v_pos, s, m, false);
+                added.push((v_pos, s, m));
+            }
+            self.octree.collapse(self.octree.root_index as usize);
+            self.octree.recalculate_voxel_count();
+            self.history.record(HistoryAction { removed: Vec::new(), added });
+            self.tool_state.selection.is_floating = false;
+            self.sync_svo_buffer_full();
+            self.ui_dirty = true;
+            return;
+        }
+
+        // Outil de sélection rectangulaire
+        if self.tool_state.active_tool == ToolType::Select {
+            if let Some(anchor) = self.tool_state.selection.anchor.take() {
+                let min_b = anchor.min(target_vec);
+                let max_b = anchor.max(target_vec) + Vec3::splat(self.edit_size);
+                let mut captured = Vec::new();
+                self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, min_b, max_b, &mut captured);
+                self.tool_state.selection.bounds = Some((min_b, max_b));
+                self.tool_state.selection.captured_voxels = captured;
+            } else {
+                self.tool_state.selection.anchor = Some(target_vec);
+            }
+            self.ui_dirty = true;
+            return;
+        }
+
+        if matches!(self.tool_state.active_tool, ToolType::Box | ToolType::Line) && self.tool_state.pending_anchor.is_none() {
             self.tool_state.pending_anchor = Some(target_vec);
             self.ui_dirty = true;
             return;
@@ -1474,25 +795,7 @@ impl State {
 
         let mat = if is_removal { 0 } else { self.get_or_create_material(self.hotbar_colors[self.selected_slot]) };
         let s = self.edit_size;
-
-        let (aabb_min, aabb_max) = match self.tool_state.active_tool {
-            ToolType::Sphere | ToolType::Replace => (target_vec - Vec3::splat(self.tool_state.brush_radius), target_vec + Vec3::splat(self.tool_state.brush_radius)),
-            ToolType::Cylinder | ToolType::Cone | ToolType::Pyramid => (
-                target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius),
-                target_vec + Vec3::new(self.tool_state.brush_radius, self.tool_state.cylinder_height, self.tool_state.brush_radius)
-            ),
-            ToolType::Torus => (
-                target_vec - Vec3::new(self.tool_state.brush_radius * 1.4, self.tool_state.brush_radius * 0.4, self.tool_state.brush_radius * 1.4),
-                target_vec + Vec3::new(self.tool_state.brush_radius * 1.4, self.tool_state.brush_radius * 0.4, self.tool_state.brush_radius * 1.4)
-            ),
-            ToolType::Disc => (target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius), target_vec + Vec3::new(self.tool_state.brush_radius, s, self.tool_state.brush_radius)),
-            ToolType::Box | ToolType::Line => {
-                let anchor = self.tool_state.pending_anchor.unwrap_or(target_vec);
-                (anchor.min(target_vec), anchor.max(target_vec) + Vec3::splat(s))
-            }
-            ToolType::Bucket => (target_vec - Vec3::splat(32.0 * s), target_vec + Vec3::splat(32.0 * s)),
-            _ => (target_vec, target_vec + Vec3::splat(s)),
-        };
+        let (aabb_min, aabb_max) = self.get_tool_aabb(target_vec);
 
         let mut removed = Vec::new();
         self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut removed);
@@ -1560,6 +863,7 @@ impl State {
                 let deltas = rasterize_bucket(&self.octree, target_vec, s, mat, 65536);
                 if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
             }
+            ToolType::Select => {}
         }
 
         let mut added = Vec::new();
@@ -1636,7 +940,7 @@ impl State {
                     return;
                 }
                 VoxelizeMsg::Done(Err(err)) => {
-                    eprintln!("GLB voxelization failed: {}", err);
+                    eprintln!("GLB voxelization failed: {err}");
                     self.error_banner = Some((err, Instant::now()));
                     self.voxelize_rx = None;
                     self.set_menu(ActiveMenu::ImportParams);
@@ -1647,9 +951,7 @@ impl State {
         }
 
         if self.active_menu != ActiveMenu::None {
-            if self.ui_dirty {
-                self.update_ui();
-            }
+            if self.ui_dirty { self.update_ui(); }
             return;
         }
 
@@ -1661,24 +963,38 @@ impl State {
 
         let prev_target = self.last_target;
         if let Some(ref h) = hit {
-            let p = if self.input.action_remove || matches!(self.tool_state.active_tool, ToolType::Paint | ToolType::Replace | ToolType::Bucket) {
+            self.focused_voxel_size = Some(h.voxel_size);
+            let p = if self.input.action_remove
+                || matches!(self.tool_state.active_tool, ToolType::Paint | ToolType::Replace | ToolType::Bucket | ToolType::Select)
+            {
                 h.hit_pos - h.normal * (s * 0.5)
             } else {
                 h.hit_pos + h.normal * (s * 0.5)
             };
             self.last_target = Some([(p.x / s).floor() * s, (p.y / s).floor() * s, (p.z / s).floor() * s]);
-        } else if ray_dir.y.abs() > 1e-5 && (-ray_orig.y / ray_dir.y) > 0.0 && (-ray_orig.y / ray_dir.y) < 15000.0 {
-            let t = -ray_orig.y / ray_dir.y;
-            let p = ray_orig + ray_dir * t;
-            self.last_target = Some([(p.x / s).floor() * s, 0.0, (p.z / s).floor() * s]);
         } else {
-            let p = self.orbit_pivot;
-            self.last_target = Some([(p.x / s).floor() * s, (p.y / s).floor() * s, (p.z / s).floor() * s]);
+            self.focused_voxel_size = None;
+            if ray_dir.y.abs() > 1e-5 && (-ray_orig.y / ray_dir.y) > 0.0 && (-ray_orig.y / ray_dir.y) < 15000.0 {
+                let t = -ray_orig.y / ray_dir.y;
+                let p = ray_orig + ray_dir * t;
+                self.last_target = Some([(p.x / s).floor() * s, 0.0, (p.z / s).floor() * s]);
+            } else {
+                let p = self.orbit_pivot;
+                self.last_target = Some([(p.x / s).floor() * s, (p.y / s).floor() * s, (p.z / s).floor() * s]);
+            }
         }
 
-        if prev_target != self.last_target {
-            self.ui_dirty = true;
+        // Test de pénétration/croisement du volume de l'outil avec les voxels existants
+        if let Some(target) = self.last_target {
+            let (t_min, t_max) = self.get_tool_aabb(Vec3::from(target));
+            let mut captured = Vec::new();
+            self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, t_min, t_max, &mut captured);
+            self.intersecting_voxels_count = captured.len();
+        } else {
+            self.intersecting_voxels_count = 0;
         }
+
+        if prev_target != self.last_target { self.ui_dirty = true; }
 
         if self.input.action_pick {
             if let Some(ref h) = hit {
@@ -1698,9 +1014,7 @@ impl State {
             self.input.action_remove = false;
         }
 
-        if self.ui_dirty {
-            self.update_ui();
-        }
+        if self.ui_dirty { self.update_ui(); }
     }
 
     fn render(&mut self) {
@@ -1724,7 +1038,10 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: self.bg_color[0] as f64, g: self.bg_color[1] as f64, b: self.bg_color[2] as f64, a: 1.0
+                            r: self.bg_color[0] as f64,
+                            g: self.bg_color[1] as f64,
+                            b: self.bg_color[2] as f64,
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -1764,7 +1081,10 @@ impl State {
     }
 }
 
-struct App { state: Option<State>, last_frame: Instant }
+struct App {
+    state: Option<State>,
+    last_frame: Instant,
+}
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -1774,7 +1094,8 @@ impl ApplicationHandler for App {
                 .with_title("Voxel Studio - SVO Ray-Marching Engine")
                 .with_inner_size(LogicalSize::new(1280.0, 720.0))
                 .with_visible(true);
-            #[cfg(target_os = "linux")] {
+            #[cfg(target_os = "linux")]
+            {
                 window_attributes = WindowAttributesExtWayland::with_name(window_attributes, "octree_voxels", "octree_voxels");
                 window_attributes = WindowAttributesExtX11::with_name(window_attributes, "octree_voxels", "octree_voxels");
             }
@@ -1899,6 +1220,14 @@ impl ApplicationHandler for App {
                     }
 
                     if state.input.ctrl_pressed && is_pressed {
+                        let is_c = match &key_event.logical_key {
+                            winit::keyboard::Key::Character(s) => s.eq_ignore_ascii_case("c"),
+                            _ => key_event.physical_key == PhysicalKey::Code(KeyCode::KeyC),
+                        };
+                        let is_v = match &key_event.logical_key {
+                            winit::keyboard::Key::Character(s) => s.eq_ignore_ascii_case("v"),
+                            _ => key_event.physical_key == PhysicalKey::Code(KeyCode::KeyV),
+                        };
                         let is_z = match &key_event.logical_key {
                             winit::keyboard::Key::Character(s) => s.eq_ignore_ascii_case("z"),
                             _ => key_event.physical_key == PhysicalKey::Code(KeyCode::KeyZ),
@@ -1907,6 +1236,9 @@ impl ApplicationHandler for App {
                             winit::keyboard::Key::Character(s) => s.eq_ignore_ascii_case("y"),
                             _ => key_event.physical_key == PhysicalKey::Code(KeyCode::KeyY),
                         };
+
+                        if is_c { state.copy_selection(); return; }
+                        if is_v { state.paste_clipboard(); return; }
 
                         if is_z {
                             if state.input.shift_pressed {
@@ -1951,92 +1283,43 @@ impl ApplicationHandler for App {
                     if is_pressed {
                         let step_angle = std::f32::consts::PI / 12.0;
                         match key_event.physical_key {
-                            PhysicalKey::Code(KeyCode::Numpad4) => {
-                                state.camera.yaw += step_angle;
-                                state.update_orbit_position();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::Numpad6) => {
-                                state.camera.yaw -= step_angle;
-                                state.update_orbit_position();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::Numpad8) => {
-                                state.camera.pitch = (state.camera.pitch - step_angle).clamp(-1.56, 1.56);
-                                state.update_orbit_position();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::Numpad2) => {
-                                state.camera.pitch = (state.camera.pitch + step_angle).clamp(-1.56, 1.56);
-                                state.update_orbit_position();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::Numpad9) => {
-                                state.camera.yaw += std::f32::consts::PI;
-                                state.camera.pitch = -state.camera.pitch;
-                                state.update_orbit_position();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::Numpad1) => {
-                                state.camera.yaw = if state.input.ctrl_pressed { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
-                                state.camera.pitch = 0.0;
-                                state.update_orbit_position();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::Numpad3) => {
-                                state.camera.yaw = if state.input.ctrl_pressed { 0.0 } else { std::f32::consts::PI };
-                                state.camera.pitch = 0.0;
-                                state.update_orbit_position();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::Numpad7) => {
-                                state.camera.yaw = -std::f32::consts::FRAC_PI_2;
-                                state.camera.pitch = if state.input.ctrl_pressed { 1.56 } else { -1.56 };
-                                state.update_orbit_position();
-                                state.window.request_redraw();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::Numpad5) | PhysicalKey::Code(KeyCode::KeyP) => {
-                                state.toggle_projection();
-                                return;
-                            }
-                            PhysicalKey::Code(KeyCode::NumpadDecimal) | PhysicalKey::Code(KeyCode::Period) => {
-                                state.focus_on_scene();
-                                return;
-                            }
+                            PhysicalKey::Code(KeyCode::Numpad4) => { state.camera.yaw += step_angle; state.update_orbit_position(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::Numpad6) => { state.camera.yaw -= step_angle; state.update_orbit_position(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::Numpad8) => { state.camera.pitch = (state.camera.pitch - step_angle).clamp(-1.56, 1.56); state.update_orbit_position(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::Numpad2) => { state.camera.pitch = (state.camera.pitch + step_angle).clamp(-1.56, 1.56); state.update_orbit_position(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::Numpad9) => { state.camera.yaw += std::f32::consts::PI; state.camera.pitch = -state.camera.pitch; state.update_orbit_position(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::Numpad1) => { state.camera.yaw = if state.input.ctrl_pressed { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 }; state.camera.pitch = 0.0; state.update_orbit_position(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::Numpad3) => { state.camera.yaw = if state.input.ctrl_pressed { 0.0 } else { std::f32::consts::PI }; state.camera.pitch = 0.0; state.update_orbit_position(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::Numpad7) => { state.camera.yaw = -std::f32::consts::FRAC_PI_2; state.camera.pitch = if state.input.ctrl_pressed { 1.56 } else { -1.56 }; state.update_orbit_position(); state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::Numpad5) | PhysicalKey::Code(KeyCode::KeyP) => { state.toggle_projection(); return; }
+                            PhysicalKey::Code(KeyCode::NumpadDecimal) | PhysicalKey::Code(KeyCode::Period) => { state.focus_on_scene(); return; }
                             PhysicalKey::Code(KeyCode::NumpadAdd) | PhysicalKey::Code(KeyCode::Equal) => {
-                                if state.camera.is_ortho {
-                                    state.camera.ortho_size = (state.camera.ortho_size * 0.85).clamp(0.5, 50000.0);
-                                } else {
+                                if state.camera.is_ortho { state.camera.ortho_size = (state.camera.ortho_size * 0.85).clamp(0.5, 50000.0); }
+                                else {
                                     let cur_dist = (state.camera.position - state.orbit_pivot).length().max(1.0);
                                     let new_dist = (cur_dist * 0.85).clamp(1.0, 50000.0);
                                     state.camera.position = state.orbit_pivot - state.camera.forward() * new_dist;
                                 }
-                                state.update_camera_buffer();
-                                state.ui_dirty = true;
-                                state.window.request_redraw();
-                                return;
+                                state.update_camera_buffer(); state.ui_dirty = true; state.window.request_redraw(); return;
                             }
                             PhysicalKey::Code(KeyCode::NumpadSubtract) | PhysicalKey::Code(KeyCode::Minus) => {
-                                if state.camera.is_ortho {
-                                    state.camera.ortho_size = (state.camera.ortho_size * 1.15).clamp(0.5, 50000.0);
-                                } else {
+                                if state.camera.is_ortho { state.camera.ortho_size = (state.camera.ortho_size * 1.15).clamp(0.5, 50000.0); }
+                                else {
                                     let cur_dist = (state.camera.position - state.orbit_pivot).length().max(1.0);
                                     let new_dist = (cur_dist * 1.15).clamp(1.0, 50000.0);
                                     state.camera.position = state.orbit_pivot - state.camera.forward() * new_dist;
                                 }
-                                state.update_camera_buffer();
-                                state.ui_dirty = true;
-                                state.window.request_redraw();
-                                return;
+                                state.update_camera_buffer(); state.ui_dirty = true; state.window.request_redraw(); return;
                             }
+                            _ => {}
+                        }
+
+                        // Raccourcis de manipulation
+                        match key_event.physical_key {
+                            PhysicalKey::Code(KeyCode::KeyS) => { state.tool_state.active_tool = ToolType::Select; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyG) if !state.input.ctrl_pressed => { state.grab_selection(); return; }
+                            PhysicalKey::Code(KeyCode::KeyR) if !state.input.ctrl_pressed && state.active_menu == ActiveMenu::None => { state.rotate_floating_or_selection(); return; }
+                            PhysicalKey::Code(KeyCode::Delete) | PhysicalKey::Code(KeyCode::Backspace) => { state.clear_selection_voxels(); return; }
                             _ => {}
                         }
 
@@ -2051,17 +1334,16 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::KeyN) => { state.tool_state.active_tool = ToolType::Pyramid; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyT) => { state.tool_state.active_tool = ToolType::Torus; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyK) => { state.tool_state.active_tool = ToolType::Paint; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyG) => { state.tool_state.active_tool = ToolType::Replace; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyI) => { state.tool_state.active_tool = ToolType::Bucket; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyH) => { state.tool_state.hollow = !state.tool_state.hollow; state.ui_dirty = true; state.window.request_redraw(); return; }
-                            PhysicalKey::Code(KeyCode::KeyX) => { 
-                                state.input.wireframe_mode = !state.input.wireframe_mode; 
-                                state.update_camera_buffer(); 
-                                state.ui_dirty = true; 
-                                state.window.request_redraw(); 
-                                return; 
+                            PhysicalKey::Code(KeyCode::KeyX) => {
+                                state.input.wireframe_mode = !state.input.wireframe_mode;
+                                state.update_camera_buffer();
+                                state.ui_dirty = true;
+                                state.window.request_redraw();
+                                return;
                             }
-                            PhysicalKey::Code(KeyCode::KeyC) if state.active_menu == ActiveMenu::None => {
+                            PhysicalKey::Code(KeyCode::KeyC) if state.active_menu == ActiveMenu::None && !state.input.ctrl_pressed => {
                                 state.input.action_pick = true;
                                 state.window.request_redraw();
                                 return;
@@ -2098,9 +1380,7 @@ impl ApplicationHandler for App {
                         }
                         if key_event.physical_key == PhysicalKey::Code(KeyCode::F1) {
                             state.hide_ui = !state.hide_ui;
-                            if state.hide_ui {
-                                state.active_menu = ActiveMenu::None;
-                            }
+                            if state.hide_ui { state.active_menu = ActiveMenu::None; }
                             state.ui_dirty = true;
                             state.window.request_redraw();
                             return;
@@ -2108,6 +1388,18 @@ impl ApplicationHandler for App {
                         if key_event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
                             if state.hide_ui {
                                 state.hide_ui = false;
+                                state.ui_dirty = true;
+                                state.window.request_redraw();
+                                return;
+                            }
+                            if state.tool_state.selection.is_floating {
+                                state.tool_state.selection.is_floating = false;
+                                state.ui_dirty = true;
+                                state.window.request_redraw();
+                                return;
+                            }
+                            if state.tool_state.selection.anchor.is_some() {
+                                state.tool_state.selection.anchor = None;
                                 state.ui_dirty = true;
                                 state.window.request_redraw();
                                 return;
@@ -2130,7 +1422,6 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::F5) => { let _ = state.save_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::F9) => { let _ = state.load_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::KeyF) => state.scale_voxel_size(false),
-                            PhysicalKey::Code(KeyCode::KeyR) => state.scale_voxel_size(true),
                             PhysicalKey::Code(KeyCode::Digit1) => { state.selected_slot = 0; state.ui_dirty = true; state.window.request_redraw(); },
                             PhysicalKey::Code(KeyCode::Digit2) => { state.selected_slot = 1; state.ui_dirty = true; state.window.request_redraw(); },
                             PhysicalKey::Code(KeyCode::Digit3) => { state.selected_slot = 2; state.ui_dirty = true; state.window.request_redraw(); },
@@ -2177,7 +1468,6 @@ impl ApplicationHandler for App {
                                 return;
                             }
 
-                            // Hotbar click
                             let num_slots = 10;
                             let slot_w = 0.054;
                             let slot_gap = 0.009;
@@ -2197,7 +1487,6 @@ impl ApplicationHandler for App {
                                 return;
                             }
 
-                            // Left tool palette click handling
                             if state.active_menu == ActiveMenu::None {
                                 for (i, &tool) in ALL_TOOLS.iter().enumerate() {
                                     let (tx0, ty0, tx1, ty1) = get_left_tool_btn_bounds(i);
@@ -2265,17 +1554,30 @@ impl ApplicationHandler for App {
                         ActiveMenu::Edit => {
                             if button == MouseButton::Left && element_state == ElementState::Pressed {
                                 let sw_w = 0.082; let sw_gap = 0.015; let sw_tot = 10.0 * sw_w + 9.0 * sw_gap; let s_start_x = -sw_tot / 2.0;
-                                for i in 0..10 { if mx >= s_start_x + i as f32 * (sw_w + sw_gap) && mx <= s_start_x + i as f32 * (sw_w + sw_gap) + sw_w && my >= 0.43 && my <= 0.52 { state.selected_slot = i; state.ui_dirty = true; state.window.request_redraw(); return; } }
+                                for i in 0..10 {
+                                    if mx >= s_start_x + i as f32 * (sw_w + sw_gap) && mx <= s_start_x + i as f32 * (sw_w + sw_gap) + sw_w && my >= 0.43 && my <= 0.52 {
+                                        state.selected_slot = i; state.ui_dirty = true; state.window.request_redraw(); return;
+                                    }
+                                }
                                 if mx >= -0.34 && mx <= 0.20 {
                                     state.active_slider = if my >= 0.30 && my <= 0.38 { Some(0) } else if my >= 0.23 && my <= 0.31 { Some(1) } else if my >= 0.16 && my <= 0.24 { Some(2) } else { None };
-                                    if let Some(channel) = state.active_slider { state.hotbar_colors[state.selected_slot][channel] = ((mx - -0.32) / (0.18 - -0.32)).clamp(0.0, 1.0); state.ui_dirty = true; state.window.request_redraw(); return; }
+                                    if let Some(channel) = state.active_slider {
+                                        state.hotbar_colors[state.selected_slot][channel] = ((mx - -0.32) / (0.18 - -0.32)).clamp(0.0, 1.0);
+                                        state.ui_dirty = true; state.window.request_redraw(); return;
+                                    }
                                 }
                                 let pw_w = 0.076; let pw_gap = 0.012; let pw_tot = 10.0 * pw_w + 9.0 * pw_gap; let pw_start_x = -pw_tot / 2.0;
-                                for (i, &preset_col) in PRESET_SWATCHES.iter().enumerate() { if mx >= pw_start_x + i as f32 * (pw_w + pw_gap) && mx <= pw_start_x + i as f32 * (pw_w + pw_gap) + pw_w && my >= 0.05 && my <= 0.11 { state.hotbar_colors[state.selected_slot] = preset_col; state.ui_dirty = true; state.window.request_redraw(); return; } }
+                                for (i, &preset_col) in PRESET_SWATCHES.iter().enumerate() {
+                                    if mx >= pw_start_x + i as f32 * (pw_w + pw_gap) && mx <= pw_start_x + i as f32 * (pw_w + pw_gap) + pw_w && my >= 0.05 && my <= 0.11 {
+                                        state.hotbar_colors[state.selected_slot] = preset_col; state.ui_dirty = true; state.window.request_redraw(); return;
+                                    }
+                                }
                                 if mx >= -0.40 && mx <= -0.22 && my >= -0.10 && my <= -0.02 { state.scale_voxel_size(false); return; }
                                 if mx >= 0.22 && mx <= 0.40 && my >= -0.10 && my <= -0.02 { state.scale_voxel_size(true); return; }
                                 if mx >= -0.22 && mx <= 0.22 && my >= -0.25 && my <= -0.17 { state.set_menu(ActiveMenu::None); return; }
-                            } else if button == MouseButton::Left { state.active_slider = None; }
+                            } else if button == MouseButton::Left {
+                                state.active_slider = None;
+                            }
                         }
                         ActiveMenu::Pause => {
                             if button == MouseButton::Left && element_state == ElementState::Pressed {
@@ -2286,20 +1588,8 @@ impl ApplicationHandler for App {
                                 if mx >= -0.30 && mx <= 0.30 && my >= 0.08 && my <= 0.16 { state.clear_all_blocks(); return; }
                                 if mx >= -0.30 && mx <= -0.02 && my >= -0.02 && my <= 0.06 { let _ = state.save_game("world_save.json"); return; }
                                 if mx >= 0.02 && mx <= 0.30 && my >= -0.02 && my <= 0.06 { let _ = state.load_game("world_save.json"); return; }
-                                
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.19 && my <= -0.11 {
-                                    state.set_menu(ActiveMenu::BgColorModal);
-                                    return;
-                                }
-
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.29 && my <= -0.21 {
-                                    state.hide_ui = true;
-                                    state.active_menu = ActiveMenu::None;
-                                    state.ui_dirty = true;
-                                    state.window.request_redraw();
-                                    return;
-                                }
-
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.19 && my <= -0.11 { state.set_menu(ActiveMenu::BgColorModal); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.29 && my <= -0.21 { state.hide_ui = true; state.active_menu = ActiveMenu::None; state.ui_dirty = true; state.window.request_redraw(); return; }
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.39 && my <= -0.31 { state.set_menu(ActiveMenu::Controls); return; }
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.51 && my <= -0.43 { state.set_menu(ActiveMenu::None); return; }
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.63 && my <= -0.55 { event_loop.exit(); return; }
@@ -2309,9 +1599,9 @@ impl ApplicationHandler for App {
                             if button == MouseButton::Left && element_state == ElementState::Pressed {
                                 if mx >= -0.36 && mx <= 0.12 {
                                     state.active_slider = if my >= 0.22 && my <= 0.30 { Some(0) }
-                                        else if my >= 0.15 && my <= 0.23 { Some(1) }
-                                        else if my >= 0.08 && my <= 0.16 { Some(2) }
-                                        else { None };
+                                    else if my >= 0.15 && my <= 0.23 { Some(1) }
+                                    else if my >= 0.08 && my <= 0.16 { Some(2) }
+                                    else { None };
                                     if let Some(channel) = state.active_slider {
                                         state.bg_color[channel] = ((mx - -0.34) / (0.08 - -0.34)).clamp(0.0, 1.0);
                                         state.update_camera_buffer();
@@ -2365,7 +1655,8 @@ impl ApplicationHandler for App {
                                     if mx >= wx1 - 0.14 && mx <= wx1 - 0.04 { state.glb_settings.palette_size = (state.glb_settings.palette_size * 2).min(8192); state.ui_dirty = true; state.window.request_redraw(); return; }
                                 }
                                 if mx >= wx0 + 0.04 && mx <= wx1 - 0.04 && my >= -0.39 && my <= -0.31 {
-                                    state.glb_settings.place_at_aim = !state.glb_settings.place_at_aim; state.ui_dirty = true; state.window.request_redraw(); return; }
+                                    state.glb_settings.place_at_aim = !state.glb_settings.place_at_aim; state.ui_dirty = true; state.window.request_redraw(); return;
+                                }
                                 if mx >= wx0 + 0.04 && mx <= wx1 - 0.04 && my >= -0.54 && my <= -0.44 {
                                     if state.glb_settings.is_safe() { state.start_nonblocking_voxelization(); }
                                     return;

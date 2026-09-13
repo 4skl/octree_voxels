@@ -1,7 +1,7 @@
 use glam::{Mat4, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 pub const MAX_DEPTH: u8 = 16;
 pub const VERTICAL_FOV_DEGREES: f32 = 60.0;
@@ -56,6 +56,7 @@ pub enum ToolType {
     Pyramid,
     Torus,
     Bucket,
+    Select,
 }
 
 impl ToolType {
@@ -73,6 +74,7 @@ impl ToolType {
             ToolType::Pyramid => "PYRAMID [N]",
             ToolType::Torus => "TORUS [T]",
             ToolType::Bucket => "BUCKET [I]",
+            ToolType::Select => "SELECT [S]",
         }
     }
 
@@ -90,8 +92,18 @@ impl ToolType {
             ToolType::Pyramid => "PYR",
             ToolType::Torus => "TOR",
             ToolType::Bucket => "BCK",
+            ToolType::Select => "SEL",
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SelectionData {
+    pub anchor: Option<Vec3>,
+    pub bounds: Option<(Vec3, Vec3)>,
+    pub captured_voxels: Vec<(Vec3, f32, u16)>,
+    pub floating_voxels: Vec<(Vec3, f32, u16)>,
+    pub is_floating: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +114,8 @@ pub struct ToolState {
     pub line_radius: f32,
     pub hollow: bool,
     pub pending_anchor: Option<Vec3>,
+    pub selection: SelectionData,
+    pub clipboard: Vec<(Vec3, f32, u16)>,
 }
 
 impl Default for ToolState {
@@ -113,6 +127,8 @@ impl Default for ToolState {
             line_radius: 0.0,
             hollow: false,
             pending_anchor: None,
+            selection: SelectionData::default(),
+            clipboard: Vec::new(),
         }
     }
 }
@@ -139,7 +155,11 @@ pub struct HistoryManager {
 
 impl HistoryManager {
     pub fn new(max_history: usize) -> Self {
-        Self { undo_stack: VecDeque::with_capacity(max_history), redo_stack: VecDeque::new(), max_history }
+        Self {
+            undo_stack: VecDeque::with_capacity(max_history),
+            redo_stack: VecDeque::new(),
+            max_history,
+        }
     }
 
     pub fn record(&mut self, action: HistoryAction) {
