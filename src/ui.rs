@@ -52,17 +52,47 @@ pub fn get_left_tool_btn_bounds(index: usize) -> (f32, f32, f32, f32) {
     let y0 = y1 - LEFT_TOOL_BTN_H;
     (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
 }
-pub fn get_left_radius_controls_bounds() -> (f32, f32, f32, f32) {
-    let y1 = LEFT_PALETTE_TOP_Y - 13.0 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP) - 0.004;
+pub fn get_left_param_slot_bounds(slot: usize) -> (f32, f32, f32, f32) {
+    let base_y1 = LEFT_PALETTE_TOP_Y - 13.0 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP) - 0.006;
+    let y1 = base_y1 - slot as f32 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP);
     let y0 = y1 - LEFT_TOOL_BTN_H;
     (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
 }
-pub fn get_left_mode_btn_bounds() -> (f32, f32, f32, f32) {
-    let rad_y0 = LEFT_PALETTE_TOP_Y - 13.0 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP) - 0.004 - LEFT_TOOL_BTN_H;
-    let y1 = rad_y0 - LEFT_TOOL_BTN_GAP;
-    let y0 = y1 - LEFT_TOOL_BTN_H;
-    (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
+
+pub fn draw_param_stepper(
+    verts: &mut Vec<UIVertex>,
+    x0: f32, y0: f32, x1: f32, y1: f32,
+    label: &str,
+    aspect: f32,
+    accent: [f32; 4],
+) {
+    let btn_w = 0.032;
+    let minus_x1 = x0 + btn_w;
+    let plus_x0 = x1 - btn_w;
+    add_quad(verts, x0 - 0.002, y0 - 0.002, x1 + 0.002, y1 + 0.002, [0.25, 0.30, 0.38, 0.7]);
+    add_quad(verts, x0, y0, x1, y1, [0.10, 0.12, 0.16, 0.85]);
+    add_quad(verts, x0, y0, minus_x1, y1, [0.18, 0.22, 0.30, 0.9]);
+    draw_text_centered(verts, "-", (x0 + minus_x1) * 0.5, (y0 + y1) * 0.5, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
+    draw_text_centered(verts, label, (minus_x1 + plus_x0) * 0.5, (y0 + y1) * 0.5, 0.82, aspect, accent);
+    add_quad(verts, plus_x0, y0, x1, y1, [0.18, 0.22, 0.30, 0.9]);
+    draw_text_centered(verts, "+", (plus_x0 + x1) * 0.5, (y0 + y1) * 0.5, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
 }
+
+pub fn draw_param_toggle(
+    verts: &mut Vec<UIVertex>,
+    x0: f32, y0: f32, x1: f32, y1: f32,
+    label: &str,
+    aspect: f32,
+    active: bool,
+    active_col: [f32; 4],
+) {
+    let border = if active { active_col } else { [0.25, 0.30, 0.38, 0.7] };
+    let bg = if active { [active_col[0] * 0.35, active_col[1] * 0.35, active_col[2] * 0.35, 0.95] } else { [0.10, 0.12, 0.16, 0.85] };
+    add_quad(verts, x0 - 0.002, y0 - 0.002, x1 + 0.002, y1 + 0.002, border);
+    add_quad(verts, x0, y0, x1, y1, bg);
+    draw_text_centered(verts, label, (x0 + x1) * 0.5, (y0 + y1) * 0.5, 0.85, aspect, [1.0, 1.0, 1.0, 1.0]);
+}
+
 pub fn get_focus_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
     let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
     let btn_w = 0.075 / aspect;
@@ -547,35 +577,91 @@ pub fn build_ui_vertices(
         for (i, &tool) in ALL_TOOLS.iter().enumerate() {
             let (tx0, ty0, tx1, ty1) = get_left_tool_btn_bounds(i);
             let is_active = tool_state.active_tool == tool;
-            let border_col = if is_active { [1.0, 0.85, 0.2, 1.0] } else { [0.25, 0.30, 0.38, 0.7] };
-            let bg_col = if is_active { [0.22, 0.35, 0.50, 0.95] } else { [0.10, 0.12, 0.16, 0.85] };
+            let is_hovered = tool_state.hovered_tool == Some(tool);
+
+            let border_col = if is_active {
+                [1.0, 0.85, 0.2, 1.0]
+            } else if is_hovered {
+                [0.55, 0.70, 0.90, 0.9]
+            } else {
+                [0.25, 0.30, 0.38, 0.7]
+            };
+
+            let bg_col = if is_active {
+                [0.22, 0.35, 0.50, 0.95]
+            } else if is_hovered {
+                [0.18, 0.22, 0.30, 0.90]
+            } else {
+                [0.10, 0.12, 0.16, 0.85]
+            };
 
             add_quad(&mut verts, tx0 - 0.002, ty0 - 0.002, tx1 + 0.002, ty1 + 0.002, border_col);
             add_quad(&mut verts, tx0, ty0, tx1, ty1, bg_col);
 
-            let text_col = if is_active { [1.0, 1.0, 1.0, 1.0] } else { [0.80, 0.85, 0.90, 0.9] };
-            draw_text_centered(&mut verts, tool.short_name(), (tx0 + tx1) * 0.5, (ty0 + ty1) * 0.5, 0.95, aspect, text_col);
+            let text_col = if is_active {
+                [1.0, 1.0, 1.0, 1.0]
+            } else if is_hovered {
+                [0.95, 0.98, 1.0, 1.0]
+            } else {
+                [0.80, 0.85, 0.90, 0.9]
+            };
+
+            let key_col = if is_active {
+                [1.0, 0.90, 0.25, 1.0]
+            } else if is_hovered {
+                [0.75, 0.85, 1.0, 1.0]
+            } else {
+                [0.55, 0.65, 0.78, 0.85]
+            };
+
+            let key_str = format!("[{}]", tool.shortcut());
+            let pw = (0.0032 * 0.85) / aspect;
+            let key_w = (key_str.len() as f32 * 6.0 - 1.0) * pw;
+            let text_y = (ty0 + ty1) * 0.5 - (7.0 * 0.0032 * 0.85) * 0.5;
+
+            draw_text(&mut verts, tool.short_name(), tx0 + 0.010, text_y, 0.85, aspect, text_col);
+            draw_text(&mut verts, &key_str, tx1 - 0.010 - key_w, text_y, 0.85, aspect, key_col);
         }
 
-        // --- Radius Controls [-] R [+] ---
-        let (rx0, ry0, rx1, ry1) = get_left_radius_controls_bounds();
-        let rad_minus_x1 = rx0 + 0.032;
-        let rad_plus_x0 = rx1 - 0.032;
-        add_quad(&mut verts, rx0 - 0.002, ry0 - 0.002, rx1 + 0.002, ry1 + 0.002, [0.25, 0.30, 0.38, 0.7]);
-        add_quad(&mut verts, rx0, ry0, rx1, ry1, [0.10, 0.12, 0.16, 0.85]);
-        add_quad(&mut verts, rx0, ry0, rad_minus_x1, ry1, [0.18, 0.22, 0.30, 0.9]);
-        draw_text_centered(&mut verts, "-", (rx0 + rad_minus_x1) * 0.5, (ry0 + ry1) * 0.5, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
-        draw_text_centered(&mut verts, &format!("R:{:.0}", tool_state.brush_radius), (rad_minus_x1 + rad_plus_x0) * 0.5, (ry0 + ry1) * 0.5, 0.85, aspect, [0.3, 0.9, 1.0, 1.0]);
-        add_quad(&mut verts, rad_plus_x0, ry0, rx1, ry1, [0.18, 0.22, 0.30, 0.9]);
-        draw_text_centered(&mut verts, "+", (rad_plus_x0 + rx1) * 0.5, (ry0 + ry1) * 0.5, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
+        // --- Contextual Parameters per Tool (Slots below tool list) ---
+        let (s0_x0, s0_y0, s0_x1, s0_y1) = get_left_param_slot_bounds(0);
+        let (s1_x0, s1_y0, s1_x1, s1_y1) = get_left_param_slot_bounds(1);
+        let (s2_x0, s2_y0, s2_x1, s2_y1) = get_left_param_slot_bounds(2);
 
-        // --- Mode Toggle (SOLID / HOLLOW) ---
-        let (mx0, my0, mx1, my1) = get_left_mode_btn_bounds();
-        let mode_border = if tool_state.hollow { [0.95, 0.60, 0.20, 0.9] } else { [0.25, 0.30, 0.38, 0.7] };
-        let mode_bg = if tool_state.hollow { [0.35, 0.22, 0.12, 0.95] } else { [0.10, 0.12, 0.16, 0.85] };
-        add_quad(&mut verts, mx0 - 0.002, my0 - 0.002, mx1 + 0.002, my1 + 0.002, mode_border);
-        add_quad(&mut verts, mx0, my0, mx1, my1, mode_bg);
-        draw_text_centered(&mut verts, if tool_state.hollow { "HOLLOW" } else { "SOLID" }, (mx0 + mx1) * 0.5, (my0 + my1) * 0.5, 0.85, aspect, [1.0, 1.0, 1.0, 1.0]);
+        match tool_state.active_tool {
+            ToolType::Cylinder | ToolType::Cone | ToolType::Pyramid => {
+                draw_param_stepper(&mut verts, s0_x0, s0_y0, s0_x1, s0_y1, &format!("RAD:{:.0}", tool_state.brush_radius), aspect, [0.3, 0.9, 1.0, 1.0]);
+                draw_param_stepper(&mut verts, s1_x0, s1_y0, s1_x1, s1_y1, &format!("HGT:{:.0}", tool_state.cylinder_height), aspect, [0.3, 1.0, 0.6, 1.0]);
+                draw_param_toggle(&mut verts, s2_x0, s2_y0, s2_x1, s2_y1, if tool_state.hollow { "HOLLOW" } else { "SOLID" }, aspect, tool_state.hollow, [0.95, 0.60, 0.20, 0.9]);
+            }
+            ToolType::Sphere | ToolType::Disc | ToolType::Torus => {
+                draw_param_stepper(&mut verts, s0_x0, s0_y0, s0_x1, s0_y1, &format!("RAD:{:.0}", tool_state.brush_radius), aspect, [0.3, 0.9, 1.0, 1.0]);
+                draw_param_toggle(&mut verts, s1_x0, s1_y0, s1_x1, s1_y1, if tool_state.hollow { "HOLLOW" } else { "SOLID" }, aspect, tool_state.hollow, [0.95, 0.60, 0.20, 0.9]);
+            }
+            ToolType::Replace => {
+                draw_param_stepper(&mut verts, s0_x0, s0_y0, s0_x1, s0_y1, &format!("RAD:{:.0}", tool_state.brush_radius), aspect, [0.3, 0.9, 1.0, 1.0]);
+            }
+            ToolType::Line => {
+                draw_param_stepper(&mut verts, s0_x0, s0_y0, s0_x1, s0_y1, &format!("PIPE:{:.1}", tool_state.line_radius), aspect, [0.3, 0.9, 1.0, 1.0]);
+            }
+            ToolType::Box => {
+                draw_param_toggle(&mut verts, s0_x0, s0_y0, s0_x1, s0_y1, if tool_state.hollow { "HOLLOW" } else { "SOLID" }, aspect, tool_state.hollow, [0.95, 0.60, 0.20, 0.9]);
+            }
+            ToolType::Pencil | ToolType::Paint => {
+                draw_param_stepper(&mut verts, s0_x0, s0_y0, s0_x1, s0_y1, size_str, aspect, [1.0, 0.85, 0.2, 1.0]);
+            }
+            ToolType::Bucket => {
+                draw_param_stepper(&mut verts, s0_x0, s0_y0, s0_x1, s0_y1, &format!("MAX:{}", tool_state.bucket_limit), aspect, [0.3, 0.9, 1.0, 1.0]);
+            }
+            ToolType::Select => {
+                draw_param_toggle(&mut verts, s0_x0, s0_y0, s0_x1, s0_y1, &format!("MODE:{}", tool_state.gizmo.mode.label()), aspect, true, [0.25, 0.55, 0.85, 0.95]);
+                if tool_state.selection.is_floating {
+                    draw_param_toggle(&mut verts, s1_x0, s1_y0, s1_x1, s1_y1, "PLACE: [LMB]", aspect, true, [0.2, 0.85, 0.4, 0.95]);
+                } else if tool_state.selection.bounds.is_some() {
+                    draw_param_toggle(&mut verts, s1_x0, s1_y0, s1_x1, s1_y1, "GRAB: [G]", aspect, true, [0.95, 0.80, 0.2, 0.95]);
+                }
+            }
+        }
 
         // Floating voxels preview + transform gizmo
         if tool_state.selection.is_floating {

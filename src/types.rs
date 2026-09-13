@@ -71,6 +71,23 @@ impl ToolType {
             ToolType::Select => "SEL",
         }
     }
+    pub fn shortcut(&self) -> &'static str {
+        match self {
+            ToolType::Pencil   => "V",
+            ToolType::Sphere   => "O",
+            ToolType::Cylinder => "Y",
+            ToolType::Disc     => "U",
+            ToolType::Box      => "B",
+            ToolType::Line     => "L",
+            ToolType::Cone     => "J",
+            ToolType::Pyramid  => "N",
+            ToolType::Torus    => "T",
+            ToolType::Paint    => "K",
+            ToolType::Replace  => "G",
+            ToolType::Bucket   => "I",
+            ToolType::Select   => "S",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -160,9 +177,11 @@ impl Default for TransformGizmo {
 #[derive(Clone, Debug)]
 pub struct ToolState {
     pub active_tool: ToolType,
+    pub hovered_tool: Option<ToolType>,
     pub brush_radius: f32,
     pub cylinder_height: f32,
     pub line_radius: f32,
+    pub bucket_limit: usize,
     pub hollow: bool,
     pub pending_anchor: Option<Vec3>,
     pub selection: SelectionData,
@@ -174,9 +193,11 @@ impl Default for ToolState {
     fn default() -> Self {
         Self {
             active_tool: ToolType::Pencil,
+            hovered_tool: None,
             brush_radius: 3.0,
             cylinder_height: 5.0,
             line_radius: 0.0,
+            bucket_limit: 512,
             hollow: false,
             pending_anchor: None,
             selection: SelectionData::default(),

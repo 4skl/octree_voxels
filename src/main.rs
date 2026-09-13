@@ -582,7 +582,7 @@ impl State {
                 }
             }
             ToolType::Replace => rasterize_replace(&self.octree, target_vec + Vec3::splat(s * 0.5), self.tool_state.brush_radius, s, self.octree.query_point(target_vec), active_mat),
-            ToolType::Bucket => rasterize_bucket(&self.octree, target_vec, s, active_mat, 512),
+            ToolType::Bucket => rasterize_bucket(&self.octree, target_vec, s, active_mat, self.tool_state.bucket_limit),
             ToolType::Select => Vec::new(),
         }
     }
@@ -811,11 +811,24 @@ impl State {
             format_voxel_count(total_voxels),
             size_str
         );
+        let tool_param_str = match self.tool_state.active_tool {
+            ToolType::Cylinder | ToolType::Cone | ToolType::Pyramid => {
+                format!("RAD: {:.0} | HGT: {:.0} | {}", self.tool_state.brush_radius, self.tool_state.cylinder_height, if self.tool_state.hollow { "HOLLOW" } else { "SOLID" })
+            }
+            ToolType::Sphere | ToolType::Disc | ToolType::Torus => {
+                format!("RAD: {:.0} | {}", self.tool_state.brush_radius, if self.tool_state.hollow { "HOLLOW" } else { "SOLID" })
+            }
+            ToolType::Replace => format!("RAD: {:.0}", self.tool_state.brush_radius),
+            ToolType::Line    => format!("PIPE: {:.1}", self.tool_state.line_radius),
+            ToolType::Box     => format!("{}", if self.tool_state.hollow { "HOLLOW" } else { "SOLID" }),
+            ToolType::Bucket  => format!("MAX: {}", self.tool_state.bucket_limit),
+            ToolType::Pencil | ToolType::Paint => size_str.to_string(),
+            ToolType::Select  => format!("GIZMO: {}", self.tool_state.gizmo.mode.label()),
+        };
         let hud_tools = format!(
-            "TOOL: {} | RAD: {:.1} | {} | CLIPBOARD: {} | UNDO: {}",
+            "TOOL: {} | {} | CLIP: {} | UNDO: {}",
             self.tool_state.active_tool.name(),
-            self.tool_state.brush_radius,
-            if self.tool_state.hollow { "HOLLOW" } else { "SOLID" },
+            tool_param_str,
             self.tool_state.clipboard.len(),
             self.history.undo_stack.len()
         );
@@ -1340,6 +1353,18 @@ impl ApplicationHandler for App {
                             state.window.request_redraw();
                         }
                     } else if state.active_menu == ActiveMenu::None {
+                        let mut hovered = None;
+                        for (i, &tool) in ALL_TOOLS.iter().enumerate() {
+                            let (tx0, ty0, tx1, ty1) = get_left_tool_btn_bounds(i);
+                            if mx >= tx0 && mx <= tx1 && my >= ty0 && my <= ty1 {
+                                hovered = Some(tool);
+                                break;
+                            }
+                        }
+                        if state.tool_state.hovered_tool != hovered {
+                            state.tool_state.hovered_tool = hovered;
+                            state.ui_dirty = true;
+                        }
                         state.window.request_redraw();
                     }
                     state.prev_cursor_pos = [mx, my];
@@ -1512,20 +1537,42 @@ impl ApplicationHandler for App {
                                 return;
                             }
                             PhysicalKey::Code(KeyCode::BracketLeft) => {
-                                state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
-                                state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
-                                state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0);
-                                state.ui_dirty = true;
-                                state.window.request_redraw();
-                                return;
+                                match state.tool_state.active_tool {
+                                    ToolType::Sphere | ToolType::Disc | ToolType::Torus | ToolType::Replace => {
+                                        state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
+                                    }
+                                    ToolType::Cylinder | ToolType::Cone | ToolType::Pyramid => {
+                                        if state.input.shift_pressed {
+                                            state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
+                                        } else {
+                                            state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
+                                        }
+                                    }
+                                    ToolType::Line => state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0),
+                                    ToolType::Bucket => state.tool_state.bucket_limit = (state.tool_state.bucket_limit / 2).max(64),
+                                    ToolType::Pencil | ToolType::Paint => state.scale_voxel_size(false),
+                                    _ => {}
+                                }
+                                state.ui_dirty = true; state.window.request_redraw(); return;
                             }
                             PhysicalKey::Code(KeyCode::BracketRight) => {
-                                state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
-                                state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(32.0);
-                                state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0);
-                                state.ui_dirty = true;
-                                state.window.request_redraw();
-                                return;
+                                match state.tool_state.active_tool {
+                                    ToolType::Sphere | ToolType::Disc | ToolType::Torus | ToolType::Replace => {
+                                        state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
+                                    }
+                                    ToolType::Cylinder | ToolType::Cone | ToolType::Pyramid => {
+                                        if state.input.shift_pressed {
+                                            state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(64.0);
+                                        } else {
+                                            state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
+                                        }
+                                    }
+                                    ToolType::Line => state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0),
+                                    ToolType::Bucket => state.tool_state.bucket_limit = (state.tool_state.bucket_limit * 2).min(8192),
+                                    ToolType::Pencil | ToolType::Paint => state.scale_voxel_size(true),
+                                    _ => {}
+                                }
+                                state.ui_dirty = true; state.window.request_redraw(); return;
                             }
                             _ => {}
                         }
@@ -1674,42 +1721,111 @@ impl ApplicationHandler for App {
                                 }
                                 return;
                             }
+
                             if state.active_menu == ActiveMenu::None {
+                                // 1. Outils cliquables
                                 for (i, &tool) in ALL_TOOLS.iter().enumerate() {
                                     let (tx0, ty0, tx1, ty1) = get_left_tool_btn_bounds(i);
                                     if mx >= tx0 && mx <= tx1 && my >= ty0 && my <= ty1 {
                                         state.tool_state.active_tool = tool;
                                         state.tool_state.pending_anchor = None;
+                                        if let Some(target) = state.last_target {
+                                            state.preview_deltas = state.compute_preview_deltas(Vec3::from(target));
+                                        }
                                         state.ui_dirty = true;
                                         state.window.request_redraw();
                                         return;
                                     }
                                 }
-                                let (rx0, ry0, rx1, ry1) = get_left_radius_controls_bounds();
-                                if my >= ry0 && my <= ry1 {
-                                    let rad_minus_x1 = rx0 + 0.032;
-                                    let rad_plus_x0 = rx1 - 0.032;
-                                    if mx >= rx0 && mx <= rad_minus_x1 {
-                                        state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
-                                        state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
-                                        state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0);
-                                        state.ui_dirty = true;
-                                        state.window.request_redraw();
-                                        return;
-                                    } else if mx >= rad_plus_x0 && mx <= rx1 {
-                                        state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
-                                        state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(32.0);
-                                        state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0);
-                                        state.ui_dirty = true;
-                                        state.window.request_redraw();
-                                        return;
+
+                                // 2. Paramètres contextuels dynamiques
+                                let is_minus = |x0: f32, x1: f32| mx >= x0 && mx <= x0 + 0.032;
+                                let is_plus  = |x0: f32, x1: f32| mx >= x1 - 0.032 && mx <= x1;
+                                let in_slot  = |x0: f32, y0: f32, x1: f32, y1: f32| mx >= x0 && mx <= x1 && my >= y0 && my <= y1;
+
+                                let (s0_x0, s0_y0, s0_x1, s0_y1) = get_left_param_slot_bounds(0);
+                                let (s1_x0, s1_y0, s1_x1, s1_y1) = get_left_param_slot_bounds(1);
+                                let (s2_x0, s2_y0, s2_x1, s2_y1) = get_left_param_slot_bounds(2);
+
+                                match state.tool_state.active_tool {
+                                    ToolType::Cylinder | ToolType::Cone | ToolType::Pyramid => {
+                                        if in_slot(s0_x0, s0_y0, s0_x1, s0_y1) {
+                                            if is_minus(s0_x0, s0_x1) { state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0); }
+                                            else if is_plus(s0_x0, s0_x1) { state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0); }
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                        if in_slot(s1_x0, s1_y0, s1_x1, s1_y1) {
+                                            if is_minus(s1_x0, s1_x1) { state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0); }
+                                            else if is_plus(s1_x0, s1_x1) { state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(64.0); }
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                        if in_slot(s2_x0, s2_y0, s2_x1, s2_y1) {
+                                            state.tool_state.hollow = !state.tool_state.hollow;
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                    }
+                                    ToolType::Sphere | ToolType::Disc | ToolType::Torus => {
+                                        if in_slot(s0_x0, s0_y0, s0_x1, s0_y1) {
+                                            if is_minus(s0_x0, s0_x1) { state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0); }
+                                            else if is_plus(s0_x0, s0_x1) { state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0); }
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                        if in_slot(s1_x0, s1_y0, s1_x1, s1_y1) {
+                                            state.tool_state.hollow = !state.tool_state.hollow;
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                    }
+                                    ToolType::Replace => {
+                                        if in_slot(s0_x0, s0_y0, s0_x1, s0_y1) {
+                                            if is_minus(s0_x0, s0_x1) { state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0); }
+                                            else if is_plus(s0_x0, s0_x1) { state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0); }
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                    }
+                                    ToolType::Line => {
+                                        if in_slot(s0_x0, s0_y0, s0_x1, s0_y1) {
+                                            if is_minus(s0_x0, s0_x1) { state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0); }
+                                            else if is_plus(s0_x0, s0_x1) { state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0); }
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                    }
+                                    ToolType::Box => {
+                                        if in_slot(s0_x0, s0_y0, s0_x1, s0_y1) {
+                                            state.tool_state.hollow = !state.tool_state.hollow;
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                    }
+                                    ToolType::Pencil | ToolType::Paint => {
+                                        if in_slot(s0_x0, s0_y0, s0_x1, s0_y1) {
+                                            if is_minus(s0_x0, s0_x1) { state.scale_voxel_size(false); }
+                                            else if is_plus(s0_x0, s0_x1) { state.scale_voxel_size(true); }
+                                            return;
+                                        }
+                                    }
+                                    ToolType::Bucket => {
+                                        if in_slot(s0_x0, s0_y0, s0_x1, s0_y1) {
+                                            if is_minus(s0_x0, s0_x1) { state.tool_state.bucket_limit = (state.tool_state.bucket_limit / 2).max(64); }
+                                            else if is_plus(s0_x0, s0_x1) { state.tool_state.bucket_limit = (state.tool_state.bucket_limit * 2).min(8192); }
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                    }
+                                    ToolType::Select => {
+                                        if in_slot(s0_x0, s0_y0, s0_x1, s0_y1) {
+                                            state.tool_state.gizmo.mode = state.tool_state.gizmo.mode.next();
+                                            state.clear_gizmo_state();
+                                            state.ui_dirty = true; state.window.request_redraw(); return;
+                                        }
+                                        if in_slot(s1_x0, s1_y0, s1_x1, s1_y1) {
+                                            if state.tool_state.selection.bounds.is_some() && !state.tool_state.selection.is_floating {
+                                                state.grab_selection();
+                                            }
+                                            return;
+                                        }
                                     }
                                 }
-                                let (mx0, my0, mx1, my1) = get_left_mode_btn_bounds();
-                                if mx >= mx0 && mx <= mx1 && my >= my0 && my <= my1 {
-                                    state.tool_state.hollow = !state.tool_state.hollow;
-                                    state.ui_dirty = true;
-                                    state.window.request_redraw();
+
+                                // 3. Éviter tout placement de voxel accidentel lors du clic sur l'UI gauche
+                                if mx >= LEFT_PALETTE_X0 - 0.01 && mx <= LEFT_PALETTE_X1 + 0.01 && my <= LEFT_PALETTE_TOP_Y + 0.01 {
                                     return;
                                 }
                             }
