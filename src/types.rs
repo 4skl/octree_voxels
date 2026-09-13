@@ -33,30 +33,13 @@ pub fn morton_encode_coords(x: i32, y: i32, z: i32) -> u64 {
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum ActiveMenu {
-    None,
-    Edit,
-    Pause,
-    ImportParams,
-    Voxelizing,
-    Controls,
-    BgColorModal,
+    None, Edit, Pause, ImportParams, Voxelizing, Controls, BgColorModal,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum ToolType {
-    Pencil,
-    Sphere,
-    Cylinder,
-    Disc,
-    Box,
-    Line,
-    Paint,
-    Replace,
-    Cone,
-    Pyramid,
-    Torus,
-    Bucket,
-    Select,
+    Pencil, Sphere, Cylinder, Disc, Box, Line, Paint, Replace,
+    Cone, Pyramid, Torus, Bucket, Select,
 }
 
 impl ToolType {
@@ -77,21 +60,14 @@ impl ToolType {
             ToolType::Select => "SELECT [S]",
         }
     }
-
     pub fn short_name(&self) -> &'static str {
         match self {
-            ToolType::Pencil => "PEN",
-            ToolType::Sphere => "SPH",
-            ToolType::Cylinder => "CYL",
-            ToolType::Disc => "DSC",
-            ToolType::Box => "BOX",
-            ToolType::Line => "LIN",
-            ToolType::Paint => "PNT",
-            ToolType::Replace => "REP",
-            ToolType::Cone => "CON",
-            ToolType::Pyramid => "PYR",
-            ToolType::Torus => "TOR",
-            ToolType::Bucket => "BCK",
+            ToolType::Pencil => "PEN", ToolType::Sphere => "SPH",
+            ToolType::Cylinder => "CYL", ToolType::Disc => "DSC",
+            ToolType::Box => "BOX", ToolType::Line => "LIN",
+            ToolType::Paint => "PNT", ToolType::Replace => "REP",
+            ToolType::Cone => "CON", ToolType::Pyramid => "PYR",
+            ToolType::Torus => "TOR", ToolType::Bucket => "BCK",
             ToolType::Select => "SEL",
         }
     }
@@ -106,6 +82,75 @@ pub struct SelectionData {
     pub is_floating: bool,
 }
 
+// ---------- Transform Gizmo ----------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransformAxis { X, Y, Z }
+
+impl TransformAxis {
+    pub fn dir(self) -> Vec3 {
+        match self { TransformAxis::X => Vec3::X, TransformAxis::Y => Vec3::Y, TransformAxis::Z => Vec3::Z }
+    }
+    pub fn color(self, hovered: bool, active: bool) -> [f32; 4] {
+        let (r, g, b) = match self {
+            TransformAxis::X => (0.92, 0.25, 0.28),
+            TransformAxis::Y => (0.30, 0.85, 0.25),
+            TransformAxis::Z => (0.20, 0.55, 0.98),
+        };
+        if active       { [1.0, 1.0, 1.0, 1.0] }
+        // FIX: Added _f32 suffix to resolve ambiguous float type for .min()
+        else if hovered { [(r * 1.25_f32).min(1.0), (g * 1.25_f32).min(1.0), (b * 1.25_f32).min(1.0), 1.0] }
+        else            { [r, g, b, 0.95] }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GizmoTransformMode { Move, Rotate, Scale }
+
+impl GizmoTransformMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Move   => Self::Rotate,
+            Self::Rotate => Self::Scale,
+            Self::Scale  => Self::Move,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Move => "MOVE", Self::Rotate => "ROTATE", Self::Scale => "SCALE" }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TransformGizmo {
+    pub mode: GizmoTransformMode,
+    pub dragging_axis: Option<TransformAxis>,
+    pub hover_axis: Option<TransformAxis>,
+    pub drag_start_world: Vec3,
+    pub drag_start_cursor: [f32; 2],
+    pub accumulated_move: Vec3,
+    pub accumulated_angle: f32,
+    pub accumulated_scale: f32,
+    pub snapshot: Vec<(Vec3, f32, u16)>,
+}
+
+impl Default for TransformGizmo {
+    fn default() -> Self {
+        Self {
+            mode: GizmoTransformMode::Move,
+            dragging_axis: None,
+            hover_axis: None,
+            drag_start_world: Vec3::ZERO,
+            drag_start_cursor: [0.0, 0.0],
+            accumulated_move: Vec3::ZERO,
+            accumulated_angle: 0.0,
+            accumulated_scale: 1.0,
+            snapshot: Vec::new(),
+        }
+    }
+}
+
+// ---------- ToolState ----------
+
 #[derive(Clone, Debug)]
 pub struct ToolState {
     pub active_tool: ToolType,
@@ -116,6 +161,7 @@ pub struct ToolState {
     pub pending_anchor: Option<Vec3>,
     pub selection: SelectionData,
     pub clipboard: Vec<(Vec3, f32, u16)>,
+    pub gizmo: TransformGizmo,
 }
 
 impl Default for ToolState {
@@ -129,6 +175,7 @@ impl Default for ToolState {
             pending_anchor: None,
             selection: SelectionData::default(),
             clipboard: Vec::new(),
+            gizmo: TransformGizmo::default(),
         }
     }
 }
@@ -155,13 +202,8 @@ pub struct HistoryManager {
 
 impl HistoryManager {
     pub fn new(max_history: usize) -> Self {
-        Self {
-            undo_stack: VecDeque::with_capacity(max_history),
-            redo_stack: VecDeque::new(),
-            max_history,
-        }
+        Self { undo_stack: VecDeque::with_capacity(max_history), redo_stack: VecDeque::new(), max_history }
     }
-
     pub fn record(&mut self, action: HistoryAction) {
         if action.removed.is_empty() && action.added.is_empty() { return; }
         if self.undo_stack.len() >= self.max_history { self.undo_stack.pop_front(); }
@@ -214,9 +256,7 @@ pub struct PlayerCollider {
 }
 
 impl Default for PlayerCollider {
-    fn default() -> Self {
-        Self { radius: 0.35, height: 1.8, eye_offset: 1.6 }
-    }
+    fn default() -> Self { Self { radius: 0.35, height: 1.8, eye_offset: 1.6 } }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -248,12 +288,8 @@ pub struct GlbImportSettings {
 impl Default for GlbImportSettings {
     fn default() -> Self {
         Self {
-            selected_file: None,
-            target_height: 24.0,
-            voxel_size: 0.25,
-            place_at_aim: true,
-            palette_size: 256,
-            max_gpu_nodes: 30_000_000,
+            selected_file: None, target_height: 24.0, voxel_size: 0.25,
+            place_at_aim: true, palette_size: 256, max_gpu_nodes: 30_000_000,
         }
     }
 }
@@ -267,7 +303,6 @@ impl GlbImportSettings {
         let est_mb = (est_voxels as f32 * 16.0) / (1024.0 * 1024.0);
         (est_voxels, est_mb)
     }
-
     pub fn is_safe(&self) -> bool {
         let (est_voxels, _) = self.estimate_cost();
         (est_voxels as usize) <= self.max_gpu_nodes
@@ -297,34 +332,30 @@ impl Camera {
         };
         proj * view
     }
-
     pub fn forward(&self) -> Vec3 {
         let (sin_p, cos_p) = self.pitch.sin_cos();
         let (sin_y, cos_y) = self.yaw.sin_cos();
         Vec3::new(cos_y * cos_p, sin_p, sin_y * cos_p).normalize()
     }
-
     pub fn right(&self) -> Vec3 {
         let (sin_y, cos_y) = self.yaw.sin_cos();
         Vec3::new(-sin_y, 0.0, cos_y).normalize()
     }
-
     pub fn up(&self) -> Vec3 {
         self.right().cross(self.forward()).normalize()
     }
-
     pub fn ray_from_ndc(&self, ndc_x: f32, ndc_y: f32, aspect: f32) -> (Vec3, Vec3) {
         let inv_vp = self.view_proj(aspect).inverse();
         if self.is_ortho {
             let p_near = inv_vp * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
             let dir = self.forward();
-            let orig = p_near.truncate() / p_near.w - dir * 2000.0; 
+            let orig = p_near.truncate() / p_near.w - dir * 2000.0;
             (orig, dir)
         } else {
             let p_near = inv_vp * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
-            let p_far = inv_vp * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+            let p_far  = inv_vp * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
             let p_w_near = p_near.truncate() / p_near.w;
-            let p_w_far = p_far.truncate() / p_far.w;
+            let p_w_far  = p_far.truncate()  / p_far.w;
             let orig = self.position;
             let dir = (p_w_far - p_w_near).normalize();
             (orig, dir)
