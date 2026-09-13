@@ -482,9 +482,31 @@ pub fn rasterize_sphere(octree: &Octree, center: Vec3, radius: f32, voxel_size: 
                 if d_sq <= r_sq && (!hollow || d_sq >= inner_r_sq) {
                     let p = center + offset;
                     let old_mat = octree.query_point(p);
-                    if old_mat != material {
-                        deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
-                    }
+                    deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                }
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_box(octree: &Octree, corner_a: Vec3, corner_b: Vec3, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let min_p = corner_a.min(corner_b);
+    let max_p = corner_a.max(corner_b);
+
+    let sx = ((max_p.x - min_p.x) / voxel_size).round() as i32;
+    let sy = ((max_p.y - min_p.y) / voxel_size).round() as i32;
+    let sz = ((max_p.z - min_p.z) / voxel_size).round() as i32;
+
+    for ix in 0..=sx {
+        for iy in 0..=sy {
+            for iz in 0..=sz {
+                let is_boundary = ix == 0 || ix == sx || iy == 0 || iy == sy || iz == 0 || iz == sz;
+                if !hollow || is_boundary {
+                    let p = min_p + Vec3::new(ix as f32, iy as f32, iz as f32) * voxel_size;
+                    let old_mat = octree.query_point(p);
+                    deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
                 }
             }
         }
@@ -511,9 +533,7 @@ pub fn rasterize_cylinder(octree: &Octree, base_center: Vec3, radius: f32, heigh
                     if !hollow || is_wall || is_cap {
                         let p = base_center + Vec3::new(offset_xz.x, dy as f32 * voxel_size, offset_xz.z);
                         let old_mat = octree.query_point(p);
-                        if old_mat != material {
-                            deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
-                        }
+                        deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
                     }
                 }
             }
@@ -536,7 +556,62 @@ pub fn rasterize_disc(octree: &Octree, center: Vec3, radius: f32, voxel_size: f3
             if d_sq <= r_sq && (!hollow || d_sq >= inner_r_sq) {
                 let p = center + offset;
                 let old_mat = octree.query_point(p);
-                if old_mat != material {
+                deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_cone(octree: &Octree, base_center: Vec3, radius: f32, height: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let h_vox = (height / voxel_size).ceil() as i32;
+    let r_vox = (radius / voxel_size).ceil() as i32;
+
+    for dy in 0..=h_vox {
+        let curr_y = dy as f32 * voxel_size;
+        let t = (1.0 - (curr_y / height.max(0.001))).clamp(0.0, 1.0);
+        let curr_r = radius * t;
+        let curr_r_sq = curr_r * curr_r;
+        let inner_r = (curr_r - voxel_size).max(0.0);
+        let inner_r_sq = inner_r * inner_r;
+        let is_cap = dy == 0;
+
+        for dx in -r_vox..=r_vox {
+            for dz in -r_vox..=r_vox {
+                let off_xz = Vec3::new(dx as f32, 0.0, dz as f32) * voxel_size;
+                let d_sq = off_xz.length_squared();
+                if d_sq <= curr_r_sq {
+                    let is_wall = d_sq >= inner_r_sq;
+                    if !hollow || is_wall || is_cap {
+                        let p = base_center + Vec3::new(off_xz.x, curr_y, off_xz.z);
+                        let old_mat = octree.query_point(p);
+                        deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                    }
+                }
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_pyramid(octree: &Octree, base_center: Vec3, half_extent: f32, height: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let h_vox = (height / voxel_size).ceil() as i32;
+    let base_cells = (half_extent / voxel_size).ceil() as i32;
+
+    for dy in 0..=h_vox {
+        let curr_y = dy as f32 * voxel_size;
+        let t = (1.0 - (curr_y / height.max(0.001))).clamp(0.0, 1.0);
+        let cur_cells = (base_cells as f32 * t).round() as i32;
+        let is_cap = dy == 0;
+
+        for dx in -cur_cells..=cur_cells {
+            for dz in -cur_cells..=cur_cells {
+                let is_wall = dx.abs() == cur_cells || dz.abs() == cur_cells;
+                if !hollow || is_wall || is_cap {
+                    let p = base_center + Vec3::new(dx as f32 * voxel_size, curr_y, dz as f32 * voxel_size);
+                    let old_mat = octree.query_point(p);
                     deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
                 }
             }
@@ -545,23 +620,28 @@ pub fn rasterize_disc(octree: &Octree, center: Vec3, radius: f32, voxel_size: f3
     deltas
 }
 
-pub fn rasterize_box(octree: &Octree, corner_a: Vec3, corner_b: Vec3, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+pub fn rasterize_torus(octree: &Octree, center: Vec3, major_r: f32, minor_r: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
     let mut deltas = Vec::new();
-    let min_p = corner_a.min(corner_b);
-    let max_p = corner_a.max(corner_b);
+    let outer_vox = ((major_r + minor_r) / voxel_size).ceil() as i32;
+    let min_vox = (minor_r / voxel_size).ceil() as i32;
+    let r_tube_sq = minor_r * minor_r;
+    let inner_tube_r = (minor_r - voxel_size).max(0.0);
+    let inner_tube_r_sq = inner_tube_r * inner_tube_r;
 
-    let sx = ((max_p.x - min_p.x) / voxel_size).round() as i32;
-    let sy = ((max_p.y - min_p.y) / voxel_size).round() as i32;
-    let sz = ((max_p.z - min_p.z) / voxel_size).round() as i32;
+    for dx in -outer_vox..=outer_vox {
+        for dz in -outer_vox..=outer_vox {
+            let off_xz = Vec3::new(dx as f32, 0.0, dz as f32) * voxel_size;
+            let d_plane = off_xz.length();
+            let dist_from_ring = d_plane - major_r;
 
-    for ix in 0..=sx {
-        for iy in 0..=sy {
-            for iz in 0..=sz {
-                let is_boundary = ix == 0 || ix == sx || iy == 0 || iy == sy || iz == 0 || iz == sz;
-                if !hollow || is_boundary {
-                    let p = min_p + Vec3::new(ix as f32, iy as f32, iz as f32) * voxel_size;
-                    let old_mat = octree.query_point(p);
-                    if old_mat != material {
+            for dy in -min_vox..=min_vox {
+                let y = dy as f32 * voxel_size;
+                let d_sq = dist_from_ring * dist_from_ring + y * y;
+                if d_sq <= r_tube_sq {
+                    let is_surface = d_sq >= inner_tube_r_sq;
+                    if !hollow || is_surface {
+                        let p = center + Vec3::new(off_xz.x, y, off_xz.z);
+                        let old_mat = octree.query_point(p);
                         deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
                     }
                 }
@@ -600,9 +680,7 @@ pub fn rasterize_line_pipe(octree: &Octree, p0: Vec3, p1: Vec3, radius: f32, vox
                     ];
                     if visited.insert(cell_coord) {
                         let old_mat = octree.query_point(p);
-                        if old_mat != material {
-                            deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
-                        }
+                        deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
                     }
                 }
             }
@@ -625,100 +703,6 @@ pub fn rasterize_replace(octree: &Octree, center: Vec3, radius: f32, voxel_size:
                     let cur_mat = octree.query_point(p);
                     if cur_mat == target_material && cur_mat != new_material {
                         deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: cur_mat, new_material });
-                    }
-                }
-            }
-        }
-    }
-    deltas
-}
-
-pub fn rasterize_cone(octree: &Octree, base_center: Vec3, radius: f32, height: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
-    let mut deltas = Vec::new();
-    let h_vox = (height / voxel_size).ceil() as i32;
-    let r_vox = (radius / voxel_size).ceil() as i32;
-
-    for dy in 0..=h_vox {
-        let curr_y = dy as f32 * voxel_size;
-        let t = (1.0 - (curr_y / height.max(0.001))).clamp(0.0, 1.0);
-        let curr_r = radius * t;
-        let curr_r_sq = curr_r * curr_r;
-        let inner_r = (curr_r - voxel_size).max(0.0);
-        let inner_r_sq = inner_r * inner_r;
-        let is_cap = dy == 0;
-
-        for dx in -r_vox..=r_vox {
-            for dz in -r_vox..=r_vox {
-                let off_xz = Vec3::new(dx as f32, 0.0, dz as f32) * voxel_size;
-                let d_sq = off_xz.length_squared();
-                if d_sq <= curr_r_sq {
-                    let is_wall = d_sq >= inner_r_sq;
-                    if !hollow || is_wall || is_cap {
-                        let p = base_center + Vec3::new(off_xz.x, curr_y, off_xz.z);
-                        let old_mat = octree.query_point(p);
-                        if old_mat != material {
-                            deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    deltas
-}
-
-pub fn rasterize_pyramid(octree: &Octree, base_center: Vec3, half_extent: f32, height: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
-    let mut deltas = Vec::new();
-    let h_vox = (height / voxel_size).ceil() as i32;
-    let base_cells = (half_extent / voxel_size).ceil() as i32;
-
-    for dy in 0..=h_vox {
-        let curr_y = dy as f32 * voxel_size;
-        let t = (1.0 - (curr_y / height.max(0.001))).clamp(0.0, 1.0);
-        let cur_cells = (base_cells as f32 * t).round() as i32;
-        let is_cap = dy == 0;
-
-        for dx in -cur_cells..=cur_cells {
-            for dz in -cur_cells..=cur_cells {
-                let is_wall = dx.abs() == cur_cells || dz.abs() == cur_cells;
-                if !hollow || is_wall || is_cap {
-                    let p = base_center + Vec3::new(dx as f32 * voxel_size, curr_y, dz as f32 * voxel_size);
-                    let old_mat = octree.query_point(p);
-                    if old_mat != material {
-                        deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
-                    }
-                }
-            }
-        }
-    }
-    deltas
-}
-
-pub fn rasterize_torus(octree: &Octree, center: Vec3, major_r: f32, minor_r: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
-    let mut deltas = Vec::new();
-    let outer_vox = ((major_r + minor_r) / voxel_size).ceil() as i32;
-    let min_vox = (minor_r / voxel_size).ceil() as i32;
-    let r_tube_sq = minor_r * minor_r;
-    let inner_tube_r = (minor_r - voxel_size).max(0.0);
-    let inner_tube_r_sq = inner_tube_r * inner_tube_r;
-
-    for dx in -outer_vox..=outer_vox {
-        for dz in -outer_vox..=outer_vox {
-            let off_xz = Vec3::new(dx as f32, 0.0, dz as f32) * voxel_size;
-            let d_plane = off_xz.length();
-            let dist_from_ring = d_plane - major_r;
-
-            for dy in -min_vox..=min_vox {
-                let y = dy as f32 * voxel_size;
-                let d_sq = dist_from_ring * dist_from_ring + y * y;
-                if d_sq <= r_tube_sq {
-                    let is_surface = d_sq >= inner_tube_r_sq;
-                    if !hollow || is_surface {
-                        let p = center + Vec3::new(off_xz.x, y, off_xz.z);
-                        let old_mat = octree.query_point(p);
-                        if old_mat != material {
-                            deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
-                        }
                     }
                 }
             }

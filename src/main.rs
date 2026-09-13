@@ -651,7 +651,7 @@ impl State {
         if !self.tool_state.clipboard.is_empty() {
             self.tool_state.selection.floating_voxels = self.tool_state.clipboard.clone();
             self.tool_state.selection.is_floating = true;
-            self.tool_state.gizmo.dragging_axis = None;
+            self.tool_state.gizmo.dragging_handle = None;
             self.tool_state.gizmo.snapshot.clear();
             self.tool_state.gizmo.accumulated_move = Vec3::ZERO;
             self.tool_state.gizmo.accumulated_angle = 0.0;
@@ -675,7 +675,7 @@ impl State {
             self.tool_state.selection.floating_voxels = voxels.into_iter().map(|(p, s, m)| (p - center, s, m)).collect();
             self.tool_state.selection.is_floating = true;
             self.tool_state.selection.bounds = None;
-            self.tool_state.gizmo.dragging_axis = None;
+            self.tool_state.gizmo.dragging_handle = None;
             self.tool_state.gizmo.snapshot.clear();
             self.tool_state.gizmo.accumulated_move = Vec3::ZERO;
             self.tool_state.gizmo.accumulated_angle = 0.0;
@@ -702,12 +702,92 @@ impl State {
     }
 
     fn clear_gizmo_state(&mut self) {
-        self.tool_state.gizmo.dragging_axis = None;
-        self.tool_state.gizmo.hover_axis = None;
+        self.tool_state.gizmo.dragging_handle = None;
+        self.tool_state.gizmo.hover_handle = None;
         self.tool_state.gizmo.snapshot.clear();
         self.tool_state.gizmo.accumulated_move = Vec3::ZERO;
         self.tool_state.gizmo.accumulated_angle = 0.0;
         self.tool_state.gizmo.accumulated_scale = 1.0;
+    }
+
+    fn execute_tool_action(&mut self, is_removal: bool) {
+        let target_vec = match self.last_target {
+            Some(t) => Vec3::from(t),
+            None => return,
+        };
+        if self.tool_state.selection.is_floating {
+            let mut added = Vec::with_capacity(self.tool_state.selection.floating_voxels.len());
+            for &(rel, s, m) in &self.tool_state.selection.floating_voxels {
+                let v_pos = target_vec + rel;
+                self.octree.insert_cube_world(v_pos, s, m, false);
+                added.push((v_pos, s, m));
+            }
+            self.octree.collapse(self.octree.root_index as usize);
+            self.octree.recalculate_voxel_count();
+            self.history.record(HistoryAction { removed: Vec::new(), added });
+            self.tool_state.selection.is_floating = false;
+            self.clear_gizmo_state();
+            self.sync_svo_buffer_full();
+            self.ui_dirty = true;
+            return;
+        }
+        if self.tool_state.active_tool == ToolType::Select {
+            if is_removal {
+                if self.tool_state.selection.anchor.is_some() {
+                    self.tool_state.selection.anchor = None;
+                } else {
+                    self.tool_state.selection.bounds = None;
+                    self.tool_state.selection.captured_voxels.clear();
+                }
+                self.ui_dirty = true;
+                return;
+            }
+
+            if let Some(anchor) = self.tool_state.selection.anchor.take() {
+                let min_b = anchor.min(target_vec) - Vec3::splat(1e-4);
+                let max_b = anchor.max(target_vec) + Vec3::splat(self.edit_size + 1e-4);
+                let mut captured = Vec::new();
+                self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, min_b, max_b, &mut captured);
+                self.tool_state.selection.bounds = Some((min_b, max_b));
+                self.tool_state.selection.captured_voxels = captured;
+            } else {
+                self.tool_state.selection.anchor = Some(target_vec);
+            }
+            self.ui_dirty = true;
+            return;
+        }
+        if matches!(self.tool_state.active_tool, ToolType::Box | ToolType::Line) && self.tool_state.pending_anchor.is_none() {
+            self.tool_state.pending_anchor = Some(target_vec);
+            self.ui_dirty = true;
+            return;
+        }
+        let mat = if is_removal { 0 } else { self.get_or_create_material(self.hotbar_colors[self.selected_slot]) };
+        let deltas = self.compute_preview_deltas(target_vec);
+        if deltas.is_empty() { return; }
+        let mut aabb_min = Vec3::splat(f32::MAX);
+        let mut aabb_max = Vec3::splat(f32::MIN);
+        for d in &deltas {
+            let p = Vec3::from(d.pos);
+            aabb_min = aabb_min.min(p);
+            aabb_max = aabb_max.max(p + Vec3::splat(d.size));
+        }
+        let mut removed = Vec::new();
+        self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut removed);
+        for mut d in deltas {
+            d.new_material = mat;
+            if d.old_material != d.new_material {
+                apply_deltas(&mut self.octree, &[d], true);
+            }
+        }
+        let mut added = Vec::new();
+        self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut added);
+        if self.tool_state.pending_anchor.is_some() {
+            self.tool_state.pending_anchor = None;
+        }
+        self.history.record(HistoryAction { removed, added });
+        self.sync_svo_buffer();
+        self.update_camera_buffer();
+        self.ui_dirty = true;
     }
 
     fn update_ui(&mut self) {
@@ -749,7 +829,7 @@ impl State {
             self.edit_size, self.last_target, aspect, self.camera.forward(), self.camera.right(), self.camera.up(),
             self.cursor_free, &self.glb_settings, self.voxelize_progress, &self.voxelize_stage, self.camera.view_proj(aspect),
             error_msg, &self.tool_state, &hud_status, &hud_tools, &size_str, &glb_cost_str, self.bg_color,
-            self.focused_voxel_size, &self.preview_deltas, self.camera.position,
+            self.focused_voxel_size, &self.preview_deltas, self.camera.position, &self.octree,
         );
         let raw_bytes: &[u8] = bytemuck::cast_slice(&verts);
         if raw_bytes.len() > self.ui_buffer_capacity {
@@ -777,73 +857,6 @@ impl State {
             self.update_camera_buffer();
             self.ui_dirty = true;
         }
-    }
-
-    fn execute_tool_action(&mut self, is_removal: bool) {
-        let target_vec = match self.last_target {
-            Some(t) => Vec3::from(t),
-            None => return,
-        };
-        if self.tool_state.selection.is_floating {
-            let mut added = Vec::with_capacity(self.tool_state.selection.floating_voxels.len());
-            for &(rel, s, m) in &self.tool_state.selection.floating_voxels {
-                let v_pos = target_vec + rel;
-                self.octree.insert_cube_world(v_pos, s, m, false);
-                added.push((v_pos, s, m));
-            }
-            self.octree.collapse(self.octree.root_index as usize);
-            self.octree.recalculate_voxel_count();
-            self.history.record(HistoryAction { removed: Vec::new(), added });
-            self.tool_state.selection.is_floating = false;
-            self.clear_gizmo_state();
-            self.sync_svo_buffer_full();
-            self.ui_dirty = true;
-            return;
-        }
-        if self.tool_state.active_tool == ToolType::Select {
-            if let Some(anchor) = self.tool_state.selection.anchor.take() {
-                let min_b = anchor.min(target_vec);
-                let max_b = anchor.max(target_vec) + Vec3::splat(self.edit_size);
-                let mut captured = Vec::new();
-                self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, min_b, max_b, &mut captured);
-                self.tool_state.selection.bounds = Some((min_b, max_b));
-                self.tool_state.selection.captured_voxels = captured;
-            } else {
-                self.tool_state.selection.anchor = Some(target_vec);
-            }
-            self.ui_dirty = true;
-            return;
-        }
-        if matches!(self.tool_state.active_tool, ToolType::Box | ToolType::Line) && self.tool_state.pending_anchor.is_none() {
-            self.tool_state.pending_anchor = Some(target_vec);
-            self.ui_dirty = true;
-            return;
-        }
-        let mat = if is_removal { 0 } else { self.get_or_create_material(self.hotbar_colors[self.selected_slot]) };
-        let deltas = self.compute_preview_deltas(target_vec);
-        if deltas.is_empty() { return; }
-        let mut aabb_min = Vec3::splat(f32::MAX);
-        let mut aabb_max = Vec3::splat(f32::MIN);
-        for d in &deltas {
-            let p = Vec3::from(d.pos);
-            aabb_min = aabb_min.min(p);
-            aabb_max = aabb_max.max(p + Vec3::splat(d.size));
-        }
-        let mut removed = Vec::new();
-        self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut removed);
-        for mut d in deltas {
-            d.new_material = mat;
-            apply_deltas(&mut self.octree, &[d], true);
-        }
-        let mut added = Vec::new();
-        self.octree.capture_aabb(self.octree.root_index as usize, self.octree.world_min, self.octree.world_size, aabb_min, aabb_max, &mut added);
-        if self.tool_state.pending_anchor.is_some() {
-            self.tool_state.pending_anchor = None;
-        }
-        self.history.record(HistoryAction { removed, added });
-        self.sync_svo_buffer();
-        self.update_camera_buffer();
-        self.ui_dirty = true;
     }
 
     fn update(&mut self, _dt: f32) {
@@ -952,48 +965,103 @@ impl State {
             self.ui_dirty = true;
         }
 
-        // --- gizmo hover detection ---
-        if self.tool_state.selection.is_floating && self.tool_state.gizmo.dragging_axis.is_none() {
+        // --- Unified gizmo hover detection ---
+        if self.tool_state.selection.is_floating && self.tool_state.gizmo.dragging_handle.is_none() {
             let pivot = self.last_target.map(Vec3::from).unwrap_or(self.orbit_pivot);
             let dist = (pivot - self.camera.position).length().max(1.0);
-            let gizmo_len = dist * 0.10;
+            let gizmo_len = dist * 0.12;
             let vp = self.camera.view_proj(aspect);
+            let cur = [self.cursor_pos[0] * aspect, self.cursor_pos[1]];
 
-            let mut best: Option<(TransformAxis, f32)> = None;
-            for axis in [TransformAxis::X, TransformAxis::Y, TransformAxis::Z] {
-                let tip = pivot + axis.dir() * gizmo_len;
-                let vp_p = vp * glam::Vec4::new(pivot.x, pivot.y, pivot.z, 1.0);
-                let vp_t = vp * glam::Vec4::new(tip.x, tip.y, tip.z, 1.0);
-                if vp_p.w < 0.05 || vp_t.w < 0.05 { continue; }
-                let p_ndc = [vp_p.x / vp_p.w, vp_p.y / vp_p.w];
-                let t_ndc = [vp_t.x / vp_t.w, vp_t.y / vp_t.w];
-                let d = point_to_segment_dist(self.cursor_pos, p_ndc, t_ndc);
-                let threshold = 0.035;
-                if d < threshold {
-                    if best.map_or(true, |(_, bd)| d < bd) {
-                        best = Some((axis, d));
+            let mut best: Option<(GizmoTransformMode, TransformAxis, f32)> = None;
+            let axes = [TransformAxis::X, TransformAxis::Y, TransformAxis::Z];
+
+            // 1. Scale handles: cubes at 0.48 * gizmo_len
+            if self.tool_state.gizmo.mode == GizmoTransformMode::All || self.tool_state.gizmo.mode == GizmoTransformMode::Scale {
+                for axis in axes {
+                    let box_p = pivot + axis.dir() * (gizmo_len * 0.48);
+                    let v = vp * glam::Vec4::new(box_p.x, box_p.y, box_p.z, 1.0);
+                    if v.w > 0.05 {
+                        let ndc = [v.x / v.w * aspect, v.y / v.w];
+                        let d = ((cur[0] - ndc[0]).powi(2) + (cur[1] - ndc[1]).powi(2)).sqrt();
+                        if d < 0.045 && best.map_or(true, |(_, _, bd)| d < bd) {
+                            best = Some((GizmoTransformMode::Scale, axis, d));
+                        }
                     }
                 }
             }
-            let new_hover = best.map(|(a, _)| a);
-            if new_hover != self.tool_state.gizmo.hover_axis {
-                self.tool_state.gizmo.hover_axis = new_hover;
+
+            // 2. Rotate handles: rings at 0.80 * gizmo_len
+            if self.tool_state.gizmo.mode == GizmoTransformMode::All || self.tool_state.gizmo.mode == GizmoTransformMode::Rotate {
+                let ring_r = gizmo_len * 0.80;
+                let segments = 32;
+                for axis in axes {
+                    let up = if axis.dir().y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+                    let u = axis.dir().cross(up).normalize();
+                    let v_axis = axis.dir().cross(u).normalize();
+                    let mut prev_ndc: Option<[f32; 2]> = None;
+                    for i in 0..=segments {
+                        let t = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                        let p = pivot + u * (ring_r * t.cos()) + v_axis * (ring_r * t.sin());
+                        let v = vp * glam::Vec4::new(p.x, p.y, p.z, 1.0);
+                        if v.w > 0.05 {
+                            let pt_ndc = [v.x / v.w * aspect, v.y / v.w];
+                            if let Some(p0) = prev_ndc {
+                                let d = point_to_segment_dist(cur, p0, pt_ndc);
+                                if d < 0.038 && best.map_or(true, |(_, _, bd)| d < bd) {
+                                    best = Some((GizmoTransformMode::Rotate, axis, d));
+                                }
+                            }
+                            prev_ndc = Some(pt_ndc);
+                        } else {
+                            prev_ndc = None;
+                        }
+                    }
+                }
+            }
+
+            // 3. Move handles: arrows from 0.80 * gizmo_len to 1.25 * gizmo_len
+            if self.tool_state.gizmo.mode == GizmoTransformMode::All || self.tool_state.gizmo.mode == GizmoTransformMode::Move {
+                for axis in axes {
+                    let p0 = pivot + axis.dir() * (gizmo_len * 0.80);
+                    let p1 = pivot + axis.dir() * (gizmo_len * 1.25);
+                    let v0 = vp * glam::Vec4::new(p0.x, p0.y, p0.z, 1.0);
+                    let v1 = vp * glam::Vec4::new(p1.x, p1.y, p1.z, 1.0);
+                    if v0.w > 0.05 && v1.w > 0.05 {
+                        let a_ndc = [v0.x / v0.w * aspect, v0.y / v0.w];
+                        let b_ndc = [v1.x / v1.w * aspect, v1.y / v1.w];
+                        let d = point_to_segment_dist(cur, a_ndc, b_ndc);
+                        if d < 0.040 && best.map_or(true, |(_, _, bd)| d < bd) {
+                            best = Some((GizmoTransformMode::Move, axis, d));
+                        }
+                    }
+                }
+            }
+
+            let new_hover = best.map(|(m, a, _)| (m, a));
+            if new_hover != self.tool_state.gizmo.hover_handle {
+                self.tool_state.gizmo.hover_handle = new_hover;
                 self.ui_dirty = true;
             }
         } else if !self.tool_state.selection.is_floating {
-            if self.tool_state.gizmo.hover_axis.is_some() {
-                self.tool_state.gizmo.hover_axis = None;
+            if self.tool_state.gizmo.hover_handle.is_some() {
+                self.tool_state.gizmo.hover_handle = None;
                 self.ui_dirty = true;
             }
         }
 
-        // --- apply gizmo drag to floating voxels ---
-        if let Some(axis) = self.tool_state.gizmo.dragging_axis {
+        // --- Apply drag based on selected handle type ---
+        if let Some((mode, axis)) = self.tool_state.gizmo.dragging_handle {
             let pivot = self.tool_state.gizmo.drag_start_world;
             let cam_dir = (pivot - self.camera.position).normalize();
             let axis_dir = axis.dir();
-            let plane_n = axis_dir.cross(cam_dir).cross(axis_dir);
-            let plane_n = if plane_n.length_squared() > 1e-6 { plane_n.normalize() } else { cam_dir };
+            let plane_n = match mode {
+                GizmoTransformMode::Rotate => axis_dir,
+                _ => {
+                    let pn = axis_dir.cross(cam_dir).cross(axis_dir);
+                    if pn.length_squared() > 1e-6 { pn.normalize() } else { cam_dir }
+                }
+            };
 
             let (ray_o0, ray_d0) = self.camera.ray_from_ndc(
                 self.tool_state.gizmo.drag_start_cursor[0],
@@ -1014,7 +1082,7 @@ impl State {
                 let snap = self.input.ctrl_pressed;
                 let s = self.edit_size;
 
-                match self.tool_state.gizmo.mode {
+                match mode {
                     GizmoTransformMode::Move => {
                         let mut delta_along = world_delta.dot(axis_dir);
                         if snap { delta_along = (delta_along / s).round() * s; }
@@ -1037,7 +1105,6 @@ impl State {
                         } else { 0.0 };
                         let mut angle = angle;
                         if snap {
-                            // FIX: Replaced non-existent FRAC_PI_12 with PI / 12.0
                             let step = std::f32::consts::PI / 12.0; // 15°
                             angle = (angle / step).round() * step;
                         }
@@ -1046,14 +1113,13 @@ impl State {
                         self.tool_state.selection.floating_voxels = self.tool_state.gizmo.snapshot
                             .iter()
                             .map(|&(rel, sz, m)| {
-                                let r = rel - pivot;
+                                let r = rel;
                                 let k = axis_dir;
                                 let rotated = r * cos_a + k.cross(r) * sin_a + k * k.dot(r) * (1.0 - cos_a);
-                                let new_pos = pivot + rotated;
                                 let snapped = Vec3::new(
-                                    (new_pos.x / s).round() * s,
-                                    (new_pos.y / s).round() * s,
-                                    (new_pos.z / s).round() * s,
+                                    (rotated.x / s).round() * s,
+                                    (rotated.y / s).round() * s,
+                                    (rotated.z / s).round() * s,
                                 );
                                 (snapped, sz, m)
                             })
@@ -1062,17 +1128,17 @@ impl State {
                     GizmoTransformMode::Scale => {
                         let d0 = (p0 - pivot).dot(axis_dir);
                         let d1 = (p1 - pivot).dot(axis_dir);
-                        let mut factor = if d0.abs() > 1e-4 { d1 / d0 } else { 1.0 };
+                        let mut factor = if d0.abs() > 1e-4 { (d1 / d0).abs() } else { 1.0 };
                         if factor < 0.1 { factor = 0.1; }
                         if snap {
-                            factor = (factor / 1.0).round().max(1.0);
+                            factor = (factor / 0.5).round() * 0.5;
+                            if factor < 0.5 { factor = 0.5; }
                         }
                         self.tool_state.gizmo.accumulated_scale = factor;
                         self.tool_state.selection.floating_voxels = self.tool_state.gizmo.snapshot
                             .iter()
                             .map(|&(rel, sz, m)| {
-                                let r = rel - pivot;
-                                let scaled = pivot + r * factor;
+                                let scaled = rel * factor;
                                 let snapped = Vec3::new(
                                     (scaled.x / s).round() * s,
                                     (scaled.y / s).round() * s,
@@ -1082,6 +1148,7 @@ impl State {
                             })
                             .collect();
                     }
+                    GizmoTransformMode::All => {}
                 }
                 self.ui_dirty = true;
             }
@@ -1396,7 +1463,6 @@ impl ApplicationHandler for App {
                         match key_event.physical_key {
                             PhysicalKey::Code(KeyCode::KeyS) => { state.tool_state.active_tool = ToolType::Select; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyG) if !state.input.ctrl_pressed => { state.grab_selection(); return; }
-                            // FIX: R = voxel size *2, Shift+R = rotate 90°
                             PhysicalKey::Code(KeyCode::KeyR) if !state.input.ctrl_pressed && state.active_menu == ActiveMenu::None => {
                                 if state.input.shift_pressed {
                                     state.rotate_floating_or_selection();
@@ -1407,10 +1473,9 @@ impl ApplicationHandler for App {
                                 state.window.request_redraw();
                                 return;
                             }
-                            // FIX: W = cycle transform gizmo mode
                             PhysicalKey::Code(KeyCode::KeyW) if state.active_menu == ActiveMenu::None => {
                                 state.tool_state.gizmo.mode = state.tool_state.gizmo.mode.next();
-                                state.tool_state.gizmo.dragging_axis = None;
+                                state.tool_state.gizmo.dragging_handle = None;
                                 state.tool_state.gizmo.accumulated_move = Vec3::ZERO;
                                 state.tool_state.gizmo.accumulated_angle = 0.0;
                                 state.tool_state.gizmo.accumulated_scale = 1.0;
@@ -1488,7 +1553,7 @@ impl ApplicationHandler for App {
                                 state.window.request_redraw();
                                 return;
                             }
-                            if state.tool_state.gizmo.dragging_axis.is_some() {
+                            if state.tool_state.gizmo.dragging_handle.is_some() {
                                 state.tool_state.selection.floating_voxels = state.tool_state.gizmo.snapshot.clone();
                                 state.clear_gizmo_state();
                                 state.ui_dirty = true;
@@ -1504,6 +1569,13 @@ impl ApplicationHandler for App {
                             }
                             if state.tool_state.selection.anchor.is_some() {
                                 state.tool_state.selection.anchor = None;
+                                state.ui_dirty = true;
+                                state.window.request_redraw();
+                                return;
+                            }
+                            if state.tool_state.selection.bounds.is_some() {
+                                state.tool_state.selection.bounds = None;
+                                state.tool_state.selection.captured_voxels.clear();
                                 state.ui_dirty = true;
                                 state.window.request_redraw();
                                 return;
@@ -1549,13 +1621,12 @@ impl ApplicationHandler for App {
                     }
                     if button == MouseButton::Left {
                         if element_state == ElementState::Pressed {
-                            // --- gizmo: start drag if clicking on a handle ---
                             if state.tool_state.selection.is_floating
-                                && state.tool_state.gizmo.hover_axis.is_some()
+                                && state.tool_state.gizmo.hover_handle.is_some()
                                 && state.active_menu == ActiveMenu::None
                             {
-                                let axis = state.tool_state.gizmo.hover_axis.unwrap();
-                                state.tool_state.gizmo.dragging_axis = Some(axis);
+                                let handle = state.tool_state.gizmo.hover_handle.unwrap();
+                                state.tool_state.gizmo.dragging_handle = Some(handle);
                                 state.tool_state.gizmo.drag_start_cursor = [mx, my];
                                 state.tool_state.gizmo.snapshot = state.tool_state.selection.floating_voxels.clone();
                                 state.tool_state.gizmo.accumulated_move = Vec3::ZERO;
@@ -1663,8 +1734,7 @@ impl ApplicationHandler for App {
                                 }
                                 return;
                             }
-                            if state.tool_state.gizmo.dragging_axis.is_some() {
-                                // commit: floating_voxels already hold the transformed positions
+                            if state.tool_state.gizmo.dragging_handle.is_some() {
                                 state.clear_gizmo_state();
                                 state.ui_dirty = true;
                                 state.window.request_redraw();
@@ -1776,8 +1846,7 @@ impl ApplicationHandler for App {
                                     if mx >= wx1 - 0.14 && mx <= wx1 - 0.04 { state.glb_settings.palette_size = (state.glb_settings.palette_size * 2).min(8192); state.ui_dirty = true; state.window.request_redraw(); return; }
                                 }
                                 if mx >= wx0 + 0.04 && mx <= wx1 - 0.04 && my >= -0.39 && my <= -0.31 {
-                                    state.glb_settings.place_at_aim = !state.glb_settings.place_at_aim; state.ui_dirty = true; state.window.request_redraw(); return;
-                                }
+                                    state.glb_settings.place_at_aim = !state.glb_settings.place_at_aim; state.ui_dirty = true; state.window.request_redraw(); return; }
                                 if mx >= wx0 + 0.04 && mx <= wx1 - 0.04 && my >= -0.54 && my <= -0.44 {
                                     if state.glb_settings.is_safe() { state.start_nonblocking_voxelization(); }
                                     return;
@@ -1789,7 +1858,7 @@ impl ApplicationHandler for App {
                         }
                         ActiveMenu::Voxelizing => {}
                         ActiveMenu::None => {
-                            if element_state == ElementState::Pressed && !state.mmb_dragging && !state.hide_ui && state.tool_state.gizmo.dragging_axis.is_none() {
+                            if element_state == ElementState::Pressed && !state.mmb_dragging && !state.hide_ui && state.tool_state.gizmo.dragging_handle.is_none() {
                                 match button {
                                     MouseButton::Left => state.input.action_add = true,
                                     MouseButton::Right => state.input.action_remove = true,
@@ -1808,7 +1877,7 @@ impl ApplicationHandler for App {
                     state.update(dt);
                     state.render();
                     if state.voxelize_rx.is_some() || state.mmb_dragging || state.gimbal_dragging
-                        || state.tool_state.gizmo.dragging_axis.is_some() || state.error_banner.is_some()
+                        || state.tool_state.gizmo.dragging_handle.is_some() || state.error_banner.is_some()
                     {
                         state.window.request_redraw();
                     }

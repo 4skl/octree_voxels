@@ -401,18 +401,17 @@ pub fn draw_transform_gizmo(
     verts: &mut Vec<UIVertex>,
     pivot: Vec3,
     mode: GizmoTransformMode,
-    hover: Option<TransformAxis>,
-    dragging: Option<TransformAxis>,
+    hover: Option<(GizmoTransformMode, TransformAxis)>,
+    dragging: Option<(GizmoTransformMode, TransformAxis)>,
     camera_pos: Vec3,
     vp: Mat4,
     aspect: f32,
     accumulated_move: Vec3,
 ) {
     let dist = (pivot - camera_pos).length().max(1.0);
-    let arm = dist * 0.10;
+    let arm = dist * 0.12;
     let p = pivot + accumulated_move;
 
-    // draw order: back axes first (sorted by depth)
     let mut axes = [TransformAxis::X, TransformAxis::Y, TransformAxis::Z];
     let cam_to_p = (camera_pos - p).normalize();
     axes.sort_by(|a, b| {
@@ -422,30 +421,45 @@ pub fn draw_transform_gizmo(
     });
 
     for axis in axes {
-        let is_hover = hover == Some(axis);
-        let is_drag  = dragging == Some(axis);
-        let col = axis.color(is_hover, is_drag);
-        let tip = p + axis.dir() * arm;
+        let ax_col = axis.color(false, false);
 
-        match mode {
-            GizmoTransformMode::Move => {
-                draw_arrow(verts, p, tip, vp, aspect, col, 0.006, 0.025);
+        // 1. Scale Handles (Cubes on inner axis stems)
+        if mode == GizmoTransformMode::All || mode == GizmoTransformMode::Scale {
+            let is_hover = hover == Some((GizmoTransformMode::Scale, axis));
+            let is_drag = dragging == Some((GizmoTransformMode::Scale, axis));
+            let col = if is_drag { [1.0, 1.0, 0.2, 1.0] } else if is_hover { [1.0, 1.0, 1.0, 1.0] } else { ax_col };
+            let tip = p + axis.dir() * (arm * 0.48);
+            if let (Some(a), Some(b)) = (project_ndc(p, vp), project_ndc(tip, vp)) {
+                add_line(verts, a[0], a[1], b[0], b[1], 0.003, aspect, col);
             }
-            GizmoTransformMode::Rotate => {
-                let ring_r = arm * 0.95;
-                draw_ring(verts, p, axis.dir(), ring_r, vp, aspect, col, 48);
-            }
-            GizmoTransformMode::Scale => {
-                draw_arrow(verts, p, tip, vp, aspect, col, 0.005, 0.015);
-                draw_cube_preview(verts, tip - Vec3::splat(arm * 0.08), arm * 0.16, aspect, vp, col, col);
-            }
+            let cube_sz = arm * 0.09;
+            let cube_min = tip - Vec3::splat(cube_sz * 0.5);
+            draw_cube_preview(verts, cube_min, cube_sz, aspect, vp, col, [col[0], col[1], col[2], 1.0]);
+        }
+
+        // 2. Rotate Handles (Full 3D planar rings)
+        if mode == GizmoTransformMode::All || mode == GizmoTransformMode::Rotate {
+            let is_hover = hover == Some((GizmoTransformMode::Rotate, axis));
+            let is_drag = dragging == Some((GizmoTransformMode::Rotate, axis));
+            let col = if is_drag { [1.0, 1.0, 0.2, 1.0] } else if is_hover { [1.0, 1.0, 1.0, 1.0] } else { ax_col };
+            let ring_r = arm * 0.80;
+            draw_ring(verts, p, axis.dir(), ring_r, vp, aspect, col, 48);
+        }
+
+        // 3. Move Handles (Outer arrows with heads)
+        if mode == GizmoTransformMode::All || mode == GizmoTransformMode::Move {
+            let is_hover = hover == Some((GizmoTransformMode::Move, axis));
+            let is_drag = dragging == Some((GizmoTransformMode::Move, axis));
+            let col = if is_drag { [1.0, 1.0, 0.2, 1.0] } else if is_hover { [1.0, 1.0, 1.0, 1.0] } else { ax_col };
+            let from = p + axis.dir() * (arm * 0.80);
+            let to = p + axis.dir() * (arm * 1.25);
+            draw_arrow(verts, from, to, vp, aspect, col, 0.0055, 0.026);
         }
     }
 
-    // center marker
     if let Some(c) = project_ndc(p, vp) {
-        let r = 0.012;
-        add_quad(verts, c[0] - r / aspect, c[1] - r, c[0] + r / aspect, c[1] + r, [1.0, 1.0, 1.0, 0.95]);
+        let r = 0.009;
+        add_quad(verts, c[0] - r / aspect, c[1] - r, c[0] + r / aspect, c[1] + r, [1.0, 1.0, 1.0, 0.9]);
     }
 }
 
@@ -461,7 +475,7 @@ pub fn build_ui_vertices(
     tool_state: &ToolState, hud_status: &str, hud_tools: &str,
     size_str: &str, glb_cost_str: &str, bg_color: [f32; 3],
     focused_voxel_size: Option<f32>, preview_deltas: &[VoxelDelta],
-    camera_pos: Vec3,
+    camera_pos: Vec3, octree: &crate::engine::Octree,
 ) -> Vec<UIVertex> {
     let mut verts = Vec::new();
     let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let g_rad = GIZMO_RADIUS;
@@ -529,73 +543,83 @@ pub fn build_ui_vertices(
     }
 
     if active_menu == ActiveMenu::None {
-        let panel_top = LEFT_PALETTE_TOP_Y + 0.035;
-        let panel_bottom = get_left_mode_btn_bounds().1 - 0.010;
-        add_quad(&mut verts, LEFT_PALETTE_X0 - 0.006, panel_bottom - 0.004, LEFT_PALETTE_X1 + 0.006, panel_top + 0.004, [0.25, 0.32, 0.45, 0.75]);
-        add_quad(&mut verts, LEFT_PALETTE_X0 - 0.003, panel_bottom, LEFT_PALETTE_X1 + 0.003, panel_top, [0.08, 0.10, 0.15, 0.94]);
-        draw_text_centered(&mut verts, "VOXEL TOOLS", (LEFT_PALETTE_X0 + LEFT_PALETTE_X1) * 0.5, panel_top - 0.016, 0.95, aspect, [0.35, 0.90, 1.0, 1.0]);
+        // --- Left Tools HUD Palette ---
         for (i, &tool) in ALL_TOOLS.iter().enumerate() {
-            let (x0, y0, x1, y1) = get_left_tool_btn_bounds(i);
-            let is_cur = tool_state.active_tool == tool;
-            let bg = if is_cur { [0.20, 0.58, 0.88, 0.95] } else { [0.12, 0.14, 0.19, 0.85] };
-            let border = if is_cur { [1.0, 0.9, 0.2, 1.0] } else { [0.25, 0.30, 0.40, 0.75] };
-            add_quad(&mut verts, x0 - 0.002, y0 - 0.002, x1 + 0.002, y1 + 0.002, border);
-            add_quad(&mut verts, x0, y0, x1, y1, bg);
-            draw_text_centered(&mut verts, tool.name(), (x0 + x1) * 0.5, (y0 + y1) * 0.5, 0.80, aspect, [1.0, 1.0, 1.0, 1.0]);
+            let (tx0, ty0, tx1, ty1) = get_left_tool_btn_bounds(i);
+            let is_active = tool_state.active_tool == tool;
+            let border_col = if is_active { [1.0, 0.85, 0.2, 1.0] } else { [0.25, 0.30, 0.38, 0.7] };
+            let bg_col = if is_active { [0.22, 0.35, 0.50, 0.95] } else { [0.10, 0.12, 0.16, 0.85] };
+
+            add_quad(&mut verts, tx0 - 0.002, ty0 - 0.002, tx1 + 0.002, ty1 + 0.002, border_col);
+            add_quad(&mut verts, tx0, ty0, tx1, ty1, bg_col);
+
+            let text_col = if is_active { [1.0, 1.0, 1.0, 1.0] } else { [0.80, 0.85, 0.90, 0.9] };
+            draw_text_centered(&mut verts, tool.short_name(), (tx0 + tx1) * 0.5, (ty0 + ty1) * 0.5, 0.95, aspect, text_col);
         }
+
+        // --- Radius Controls [-] R [+] ---
         let (rx0, ry0, rx1, ry1) = get_left_radius_controls_bounds();
         let rad_minus_x1 = rx0 + 0.032;
         let rad_plus_x0 = rx1 - 0.032;
-        add_quad(&mut verts, rx0, ry0, rad_minus_x1, ry1, [0.20, 0.25, 0.35, 0.9]);
-        draw_text_centered(&mut verts, "-", (rx0 + rad_minus_x1) * 0.5, (ry0 + ry1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-        add_quad(&mut verts, rad_minus_x1 + 0.004, ry0, rad_plus_x0 - 0.004, ry1, [0.08, 0.10, 0.14, 0.9]);
-        draw_text_centered(&mut verts, &format!("R:{:.1}", tool_state.brush_radius), (rx0 + rx1) * 0.5, (ry0 + ry1) * 0.5, 0.9, aspect, [0.3, 0.9, 1.0, 1.0]);
-        add_quad(&mut verts, rad_plus_x0, ry0, rx1, ry1, [0.20, 0.25, 0.35, 0.9]);
-        draw_text_centered(&mut verts, "+", (rad_plus_x0 + rx1) * 0.5, (ry0 + ry1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-        let (mx0, my0, mx1, my1) = get_left_mode_btn_bounds();
-        let mode_bg = if tool_state.hollow { [0.70, 0.35, 0.15, 0.9] } else { [0.20, 0.45, 0.30, 0.9] };
-        add_quad(&mut verts, mx0, my0, mx1, my1, mode_bg);
-        draw_text_centered(&mut verts, if tool_state.hollow { "HOLLOW MODE" } else { "SOLID MODE" }, (mx0 + mx1) * 0.5, (my0 + my1) * 0.5, 0.85, aspect, [1.0, 1.0, 1.0, 1.0]);
+        add_quad(&mut verts, rx0 - 0.002, ry0 - 0.002, rx1 + 0.002, ry1 + 0.002, [0.25, 0.30, 0.38, 0.7]);
+        add_quad(&mut verts, rx0, ry0, rx1, ry1, [0.10, 0.12, 0.16, 0.85]);
+        add_quad(&mut verts, rx0, ry0, rad_minus_x1, ry1, [0.18, 0.22, 0.30, 0.9]);
+        draw_text_centered(&mut verts, "-", (rx0 + rad_minus_x1) * 0.5, (ry0 + ry1) * 0.5, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
+        draw_text_centered(&mut verts, &format!("R:{:.0}", tool_state.brush_radius), (rad_minus_x1 + rad_plus_x0) * 0.5, (ry0 + ry1) * 0.5, 0.85, aspect, [0.3, 0.9, 1.0, 1.0]);
+        add_quad(&mut verts, rad_plus_x0, ry0, rx1, ry1, [0.18, 0.22, 0.30, 0.9]);
+        draw_text_centered(&mut verts, "+", (rad_plus_x0 + rx1) * 0.5, (ry0 + ry1) * 0.5, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
 
-        // Selection bounds
-        if let Some((b_min, b_max)) = tool_state.selection.bounds {
-            draw_box_wireframe(&mut verts, b_min, b_max, aspect, view_proj, [0.95, 0.80, 0.10, 0.95]);
-            let s_dims = (b_max - b_min) / edit_size;
-            draw_text(&mut verts, &format!("SEL: {:.0}X{:.0}X{:.0} ({})", s_dims.x, s_dims.y, s_dims.z, tool_state.selection.captured_voxels.len()), -0.76, 0.70, 0.95, aspect, [1.0, 0.9, 0.2, 1.0]);
-        }
+        // --- Mode Toggle (SOLID / HOLLOW) ---
+        let (mx0, my0, mx1, my1) = get_left_mode_btn_bounds();
+        let mode_border = if tool_state.hollow { [0.95, 0.60, 0.20, 0.9] } else { [0.25, 0.30, 0.38, 0.7] };
+        let mode_bg = if tool_state.hollow { [0.35, 0.22, 0.12, 0.95] } else { [0.10, 0.12, 0.16, 0.85] };
+        add_quad(&mut verts, mx0 - 0.002, my0 - 0.002, mx1 + 0.002, my1 + 0.002, mode_border);
+        add_quad(&mut verts, mx0, my0, mx1, my1, mode_bg);
+        draw_text_centered(&mut verts, if tool_state.hollow { "HOLLOW" } else { "SOLID" }, (mx0 + mx1) * 0.5, (my0 + my1) * 0.5, 0.85, aspect, [1.0, 1.0, 1.0, 1.0]);
 
         // Floating voxels preview + transform gizmo
         if tool_state.selection.is_floating {
             if let Some(pos) = target_pos {
-                let p_anchor = Vec3::from(pos) + tool_state.gizmo.accumulated_move;
+                let p_anchor = Vec3::from(pos);
                 let mut f_min = Vec3::splat(f32::MAX);
                 let mut f_max = Vec3::splat(f32::MIN);
+                let mut inside_count = 0;
                 for &(rel, s, _) in &tool_state.selection.floating_voxels {
                     let v_pos = p_anchor + rel;
                     f_min = f_min.min(v_pos);
                     f_max = f_max.max(v_pos + Vec3::splat(s));
-                    draw_cube_preview(
-                        &mut verts, v_pos, s, aspect, view_proj,
-                        [0.2, 0.8, 1.0, 0.35], [0.3, 0.9, 1.0, 0.85],
-                    );
+                    let is_inside = octree.query_point(v_pos) != 0;
+                    if is_inside {
+                        inside_count += 1;
+                        draw_cube_preview(
+                            &mut verts, v_pos, s, aspect, view_proj,
+                            [1.0, 0.20, 0.15, 0.65], [1.0, 0.85, 0.20, 0.98],
+                        );
+                    } else {
+                        draw_cube_preview(
+                            &mut verts, v_pos, s, aspect, view_proj,
+                            [0.2, 0.8, 1.0, 0.35], [0.3, 0.9, 1.0, 0.85],
+                        );
+                    }
                 }
                 if f_min.x <= f_max.x {
-                    draw_box_wireframe(&mut verts, f_min, f_max, aspect, view_proj, [0.2, 0.9, 1.0, 0.9]);
+                    let box_border = if inside_count > 0 { [1.0, 0.4, 0.2, 0.9] } else { [0.2, 0.9, 1.0, 0.9] };
+                    draw_box_wireframe(&mut verts, f_min, f_max, aspect, view_proj, box_border);
                 }
 
-                // Draw the transform gizmo at the original pivot (before accumulated move)
                 let pivot = Vec3::from(pos);
                 draw_transform_gizmo(
                     &mut verts, pivot, tool_state.gizmo.mode,
-                    tool_state.gizmo.hover_axis, tool_state.gizmo.dragging_axis,
+                    tool_state.gizmo.hover_handle, tool_state.gizmo.dragging_handle,
                     camera_pos, view_proj, aspect, tool_state.gizmo.accumulated_move,
                 );
 
-                let snap_hint = if tool_state.gizmo.dragging_axis.is_some() {
-                    if tool_state.gizmo.mode == GizmoTransformMode::Rotate { "CTRL = SNAP 15DEG" }
+                let snap_hint = if tool_state.gizmo.dragging_handle.is_some() {
+                    let (mode, _) = tool_state.gizmo.dragging_handle.unwrap();
+                    if mode == GizmoTransformMode::Rotate { "CTRL = SNAP 15DEG" }
                     else { "CTRL = SNAP 1 VOXEL" }
                 } else {
-                    "DRAG AXIS | [W] CYCLE MODE"
+                    "DRAG ARROWS (MOVE) | RINGS (ROT) | BOXES (SCALE) | [W] FILTER"
                 };
                 draw_text(
                     &mut verts,
@@ -606,14 +630,36 @@ pub fn build_ui_vertices(
             }
         }
 
-        // Preview deltas
-        if target_pos.is_some() && !tool_state.selection.is_floating {
+        // Render completed selection bounds
+        if let Some((b_min, b_max)) = tool_state.selection.bounds {
+            draw_box_wireframe(&mut verts, b_min, b_max, aspect, view_proj, [0.3, 0.9, 1.0, 0.95]);
+        }
+
+        // Active selection drag box or initial cursor box
+        if tool_state.active_tool == ToolType::Select && !tool_state.selection.is_floating {
+            if let Some(anchor) = tool_state.selection.anchor {
+                if let Some(t_pos) = target_pos {
+                    let target_vec = Vec3::from(t_pos);
+                    let b_min = anchor.min(target_vec);
+                    let b_max = anchor.max(target_vec) + Vec3::splat(edit_size);
+                    draw_box_wireframe(&mut verts, b_min, b_max, aspect, view_proj, [1.0, 0.85, 0.2, 0.9]);
+                }
+            } else if let Some(t_pos) = target_pos {
+                draw_cube_preview(
+                    &mut verts, Vec3::from(t_pos), edit_size, aspect, view_proj,
+                    [0.3, 0.9, 1.0, 0.25], [0.3, 0.9, 1.0, 0.85],
+                );
+            }
+        }
+
+        // Preview deltas with inside vs outside color differentiation
+        if target_pos.is_some() && !tool_state.selection.is_floating && tool_state.active_tool != ToolType::Select {
             let cur_col = hotbar_colors[selected_slot];
             let max_voxels_rendered = 2500;
             let step = if preview_deltas.len() > max_voxels_rendered {
                 (preview_deltas.len() / max_voxels_rendered) + 1
             } else { 1 };
-            let mut cut_count = 0;
+            let mut inside_count = 0;
             for delta in preview_deltas.iter().step_by(step) {
                 let pos = Vec3::from(delta.pos);
                 let size = delta.size;
@@ -624,24 +670,16 @@ pub fn build_ui_vertices(
                         [cur_col[0], cur_col[1], cur_col[2], 0.85],
                     );
                 } else {
-                    cut_count += 1;
+                    inside_count += 1;
                     draw_cube_preview(
                         &mut verts, pos, size, aspect, view_proj,
-                        [1.0, 0.22, 0.15, 0.55],
+                        [1.0, 0.20, 0.15, 0.65],
                         [1.0, 0.85, 0.20, 0.98],
                     );
                 }
             }
-            if cut_count > 0 {
-                draw_text(&mut verts, &format!("CUT CROSSING: {} VOXELS INSIDE", cut_count * step), -0.76, 0.74, 1.0, aspect, [1.0, 0.35, 0.2, 1.0]);
-            }
-            if tool_state.active_tool == ToolType::Select {
-                if let Some(anchor) = tool_state.selection.anchor {
-                    let target_vec = Vec3::from(target_pos.unwrap());
-                    let b_min = anchor.min(target_vec);
-                    let b_max = anchor.max(target_vec) + Vec3::splat(edit_size);
-                    draw_box_wireframe(&mut verts, b_min, b_max, aspect, view_proj, [1.0, 0.85, 0.2, 0.9]);
-                }
+            if inside_count > 0 {
+                draw_text(&mut verts, &format!("PENETRATING: {} VOXELS INSIDE OBJECT", inside_count * step), -0.76, 0.74, 1.0, aspect, [1.0, 0.35, 0.2, 1.0]);
             }
         }
     }

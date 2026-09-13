@@ -105,26 +105,32 @@ impl TransformAxis {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GizmoTransformMode { Move, Rotate, Scale }
+pub enum GizmoTransformMode { All, Move, Rotate, Scale }
 
 impl GizmoTransformMode {
     pub fn next(self) -> Self {
         match self {
+            Self::All    => Self::Move,
             Self::Move   => Self::Rotate,
             Self::Rotate => Self::Scale,
-            Self::Scale  => Self::Move,
+            Self::Scale  => Self::All,
         }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Move => "MOVE", Self::Rotate => "ROTATE", Self::Scale => "SCALE" }
+        match self {
+            Self::All    => "ALL (TRANSFORM)",
+            Self::Move   => "MOVE",
+            Self::Rotate => "ROTATE",
+            Self::Scale  => "SCALE",
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct TransformGizmo {
     pub mode: GizmoTransformMode,
-    pub dragging_axis: Option<TransformAxis>,
-    pub hover_axis: Option<TransformAxis>,
+    pub dragging_handle: Option<(GizmoTransformMode, TransformAxis)>,
+    pub hover_handle: Option<(GizmoTransformMode, TransformAxis)>,
     pub drag_start_world: Vec3,
     pub drag_start_cursor: [f32; 2],
     pub accumulated_move: Vec3,
@@ -136,9 +142,9 @@ pub struct TransformGizmo {
 impl Default for TransformGizmo {
     fn default() -> Self {
         Self {
-            mode: GizmoTransformMode::Move,
-            dragging_axis: None,
-            hover_axis: None,
+            mode: GizmoTransformMode::All,
+            dragging_handle: None,
+            hover_handle: None,
             drag_start_world: Vec3::ZERO,
             drag_start_cursor: [0.0, 0.0],
             accumulated_move: Vec3::ZERO,
