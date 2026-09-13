@@ -56,13 +56,55 @@ struct DDAStackEntry {
 fn render_background(ray_orig: vec3<f32>, ray_dir: vec3<f32>) -> vec4<f32> {
     if (abs(ray_dir.y) > 1e-5) {
         let t_ground = (-ray_orig.y) / ray_dir.y;
-        if (t_ground > 0.0 && t_ground < 15000.0) {
+        if (t_ground > 0.0 && t_ground < 35000.0) {
             let p_world = ray_orig + ray_dir * t_ground;
-            let grid_coord = abs(fract(p_world.xz * 0.5) - 0.5);
-            let line = smoothstep(0.0, 0.04, min(grid_coord.x, grid_coord.y));
-            let grid_col = mix(camera.bg_color * 1.5, camera.bg_color * 0.7, line);
-            let fog = clamp(t_ground / 15000.0, 0.0, 1.0);
-            return vec4<f32>(mix(grid_col, camera.bg_color, fog), 1.0);
+
+            // Compute screen footprint to adaptively choose power-of-two grid scale
+            let d = fwidth(p_world.xz);
+            let pixel_size = max(max(d.x, d.y), 1e-5);
+
+            // Adaptive power-of-two scale aligned with voxel hierarchies
+            let log_s = log2(pixel_size * 28.0);
+            let k = floor(log_s);
+            let s1 = exp2(k);
+            let s2 = s1 * 2.0;
+            let s3 = s1 * 4.0;
+            let fade = fract(log_s);
+
+            let dist1 = abs(fract(p_world.xz / s1 - 0.5) - 0.5) * s1;
+            let dist2 = abs(fract(p_world.xz / s2 - 0.5) - 0.5) * s2;
+            let dist3 = abs(fract(p_world.xz / s3 - 0.5) - 0.5) * s3;
+
+            let line1 = clamp(1.2 - min(dist1.x / max(d.x, 1e-6), dist1.y / max(d.y, 1e-6)), 0.0, 1.0);
+            let line2 = clamp(1.2 - min(dist2.x / max(d.x, 1e-6), dist2.y / max(d.y, 1e-6)), 0.0, 1.0);
+            let line3 = clamp(1.2 - min(dist3.x / max(d.x, 1e-6), dist3.y / max(d.y, 1e-6)), 0.0, 1.0);
+
+            let grid_alpha = line1 * (1.0 - fade) * 0.25 + line2 * mix(0.25, 0.45, fade) + line3 * 0.35;
+
+            // Blender principal axes: Red for X (Z = 0), Blue for Z (X = 0)
+            let axis_x = clamp(1.4 - abs(p_world.z) / max(d.y, 1e-6), 0.0, 1.0);
+            let axis_z = clamp(1.4 - abs(p_world.x) / max(d.x, 1e-6), 0.0, 1.0);
+
+            let bg = camera.bg_color;
+            let bg_lum = dot(bg, vec3<f32>(0.299, 0.587, 0.114));
+            let line_color = select(bg + vec3<f32>(0.22), bg - vec3<f32>(0.22), bg_lum > 0.5);
+
+            var col = mix(bg, line_color, grid_alpha);
+            col = mix(col, vec3<f32>(0.85, 0.22, 0.22), axis_x * 0.90);
+            col = mix(col, vec3<f32>(0.22, 0.55, 0.95), axis_z * 0.90);
+
+            var fog: f32;
+            if (camera.is_ortho > 0.5) {
+                let dist_center = length(p_world.xz - camera.camera_pos.xz);
+                fog = clamp(dist_center / (camera.ortho_size * 2.5), 0.0, 1.0);
+            } else {
+                let dist = length(p_world - camera.camera_pos);
+                fog = clamp(dist / 14000.0, 0.0, 1.0);
+                let horizon_fade = clamp(abs(ray_dir.y) * 25.0, 0.0, 1.0);
+                fog = 1.0 - (1.0 - fog) * horizon_fade;
+            }
+
+            return vec4<f32>(mix(col, bg, fog), 1.0);
         }
     }
     return vec4<f32>(camera.bg_color, 1.0);

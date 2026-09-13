@@ -39,6 +39,7 @@ pub enum ActiveMenu {
     ImportParams,
     Voxelizing,
     Controls,
+    BgColorModal,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

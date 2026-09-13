@@ -366,7 +366,7 @@ fn get_glyph_5x7(c: char) -> [u8; 7] {
         ':' => [0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000], '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000, 0b00000], '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
         '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000], '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100], '%' => [0b11001, 0b11010, 0b00100, 0b01000, 0b01011, 0b10011, 0b00000],
         '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110], ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110], '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
-        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000], _ => [0; 7],
+        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000], '#' => [0b01010, 0b01010, 0b11111, 0b01010, 0b11111, 0b01010, 0b01010], _ => [0; 7],
     }
 }
 
@@ -430,8 +430,15 @@ fn get_gizmo_axes() -> [GizmoAxis; 6] {
 
 fn get_focus_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
     let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
-    let btn_w = 0.075 / aspect; let btn_h = 0.055;
-    let x1 = g_cx - disc_rx - 0.015; let x0 = x1 - btn_w; let y0 = g_cy - btn_h / 2.0; let y1 = g_cy + btn_h / 2.0;
+    let btn_w = 0.075 / aspect; let btn_h = 0.046;
+    let x1 = g_cx - disc_rx - 0.015; let x0 = x1 - btn_w; let y0 = g_cy + 0.008; let y1 = y0 + btn_h;
+    (x0, y0, x1, y1)
+}
+
+fn get_proj_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
+    let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
+    let btn_w = 0.075 / aspect; let btn_h = 0.046;
+    let x1 = g_cx - disc_rx - 0.015; let x0 = x1 - btn_w; let y1 = g_cy - 0.008; let y0 = y1 - btn_h;
     (x0, y0, x1, y1)
 }
 
@@ -441,25 +448,42 @@ fn format_voxel_count(count: usize) -> String {
     else { count.to_string() }
 }
 
+fn clip_line_segment(v0: &mut Vec4, v1: &mut Vec4, near_w: f32) -> bool {
+    if v0.w < near_w && v1.w < near_w {
+        return false;
+    }
+    if v0.w < near_w {
+        let t = (near_w - v0.w) / (v1.w - v0.w);
+        *v0 = *v0 + t * (*v1 - *v0);
+    } else if v1.w < near_w {
+        let t = (near_w - v1.w) / (v0.w - v1.w);
+        *v1 = *v1 + t * (*v0 - *v1);
+    }
+    true
+}
+
 fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspect: f32, view_proj: Mat4, color: [f32; 4]) {
     let edges = [
+        // 4 Horizontal edges along X
         (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, min_p.z)),
-        (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(min_p.x, max_p.y, min_p.z)),
-        (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(min_p.x, min_p.y, max_p.z)),
-        (Vec3::new(max_p.x, max_p.y, max_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
-        (Vec3::new(max_p.x, max_p.y, max_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
-        (Vec3::new(max_p.x, max_p.y, max_p.z), Vec3::new(max_p.x, max_p.y, min_p.z)),
         (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, min_p.z)),
-        (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
-        (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, min_p.z)),
-        (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
-        (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(min_p.x, min_p.y, max_p.z)),
         (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
+        (Vec3::new(min_p.x, max_p.y, max_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
+        // 4 Vertical edges along Y
+        (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(min_p.x, max_p.y, min_p.z)),
+        (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, min_p.z)),
+        (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
+        (Vec3::new(max_p.x, min_p.y, max_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
+        // 4 Horizontal edges along Z
+        (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(min_p.x, min_p.y, max_p.z)),
+        (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
+        (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
+        (Vec3::new(max_p.x, max_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
     ];
     for (p0, p1) in edges {
-        let v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
-        let v1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
-        if v0.w > 0.05 && v1.w > 0.05 {
+        let mut v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
+        let mut v1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
+        if clip_line_segment(&mut v0, &mut v1, 0.05) {
             let ndc0 = v0.truncate() / v0.w;
             let ndc1 = v1.truncate() / v1.w;
             add_line(verts, ndc0.x, ndc0.y, ndc1.x, ndc1.y, 0.003, aspect, color);
@@ -473,9 +497,9 @@ fn draw_circle_wireframe(verts: &mut Vec<UIVertex>, center: Vec3, radius: f32, a
         let a1 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
         let p0 = center + axis_u * (a0.cos() * radius) + axis_v * (a0.sin() * radius);
         let p1 = center + axis_u * (a1.cos() * radius) + axis_v * (a1.sin() * radius);
-        let v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
-        let v1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
-        if v0.w > 0.05 && v1.w > 0.05 {
+        let mut v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
+        let mut v1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
+        if clip_line_segment(&mut v0, &mut v1, 0.05) {
             let ndc0 = v0.truncate() / v0.w;
             let ndc1 = v1.truncate() / v1.w;
             add_line(verts, ndc0.x, ndc0.y, ndc1.x, ndc1.y, 0.003, aspect, color);
@@ -501,10 +525,20 @@ fn build_ui_vertices(
     add_quad(&mut verts, g_cx - disc_rx - 0.003, g_cy - disc_ry - 0.003, g_cx + disc_rx + 0.003, g_cy + disc_ry + 0.003, [0.25, 0.30, 0.38, 0.6]);
     add_quad(&mut verts, g_cx - disc_rx, g_cy - disc_ry, g_cx + disc_rx, g_cy + disc_ry, [0.08, 0.10, 0.14, 0.70]);
 
+    // Gimbal focus button [.]
     let (bx0, by0, bx1, by1) = get_focus_button_bounds(aspect);
     add_quad(&mut verts, bx0 - 0.003, by0 - 0.003, bx1 + 0.003, by1 + 0.003, [0.35, 0.40, 0.50, 0.8]);
     add_quad(&mut verts, bx0, by0, bx1, by1, [0.12, 0.15, 0.22, 0.90]);
-    draw_text_centered(&mut verts, "[.]", (bx0 + bx1) / 2.0, (by0 + by1) / 2.0, 1.1, aspect, [0.3, 0.9, 1.0, 1.0]);
+    draw_text_centered(&mut verts, "[.]", (bx0 + bx1) / 2.0, (by0 + by1) / 2.0, 1.05, aspect, [0.3, 0.9, 1.0, 1.0]);
+
+    // Gimbal projection toggle button [ISO] / [PER]
+    let (px0, py0, px1, py1) = get_proj_button_bounds(aspect);
+    let proj_border = if is_ortho { [0.3, 0.85, 1.0, 0.9] } else { [0.35, 0.40, 0.50, 0.8] };
+    let proj_bg = if is_ortho { [0.18, 0.45, 0.65, 0.95] } else { [0.12, 0.15, 0.22, 0.90] };
+    let proj_text = if is_ortho { "ISO" } else { "PER" };
+    add_quad(&mut verts, px0 - 0.003, py0 - 0.003, px1 + 0.003, py1 + 0.003, proj_border);
+    add_quad(&mut verts, px0, py0, px1, py1, proj_bg);
+    draw_text_centered(&mut verts, proj_text, (px0 + px1) / 2.0, (py0 + py1) / 2.0, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
 
     let mut axes_projected: Vec<(GizmoAxis, f32, f32, f32)> = get_gizmo_axes().into_iter().map(|ax| (ax, ax.dir.dot(camera_right), ax.dir.dot(camera_up), ax.dir.dot(camera_forward))).collect();
     axes_projected.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
@@ -594,9 +628,9 @@ fn build_ui_vertices(
                     draw_circle_wireframe(&mut verts, top_c, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [0.3, 0.9, 0.5, 0.9]);
                     let struts = [Vec3::new(r, 0.0, 0.0), Vec3::new(-r, 0.0, 0.0), Vec3::new(0.0, 0.0, r), Vec3::new(0.0, 0.0, -r)];
                     for off in struts {
-                        let v0 = view_proj * Vec4::new(bot_c.x + off.x, bot_c.y, bot_c.z + off.z, 1.0);
-                        let v1 = view_proj * Vec4::new(top_c.x + off.x, top_c.y, top_c.z + off.z, 1.0);
-                        if v0.w > 0.05 && v1.w > 0.05 {
+                        let mut v0 = view_proj * Vec4::new(bot_c.x + off.x, bot_c.y, bot_c.z + off.z, 1.0);
+                        let mut v1 = view_proj * Vec4::new(top_c.x + off.x, top_c.y, top_c.z + off.z, 1.0);
+                        if clip_line_segment(&mut v0, &mut v1, 0.05) {
                             let n0 = v0.truncate() / v0.w;
                             let n1 = v1.truncate() / v1.w;
                             add_line(&mut verts, n0.x, n0.y, n1.x, n1.y, 0.003, aspect, [0.3, 0.9, 0.5, 0.8]);
@@ -620,9 +654,9 @@ fn build_ui_vertices(
                 }
                 ToolType::Line => {
                     if let Some(anchor) = tool_state.pending_anchor {
-                        let v0 = view_proj * Vec4::new(anchor.x, anchor.y, anchor.z, 1.0);
-                        let v1 = view_proj * Vec4::new(p_target.x, p_target.y, p_target.z, 1.0);
-                        if v0.w > 0.05 && v1.w > 0.05 {
+                        let mut v0 = view_proj * Vec4::new(anchor.x, anchor.y, anchor.z, 1.0);
+                        let mut v1 = view_proj * Vec4::new(p_target.x, p_target.y, p_target.z, 1.0);
+                        if clip_line_segment(&mut v0, &mut v1, 0.05) {
                             let ndc0 = v0.truncate() / v0.w;
                             let ndc1 = v1.truncate() / v1.w;
                             add_line(&mut verts, ndc0.x, ndc0.y, ndc1.x, ndc1.y, 0.005, aspect, [1.0, 0.8, 0.2, 1.0]);
@@ -686,24 +720,56 @@ fn build_ui_vertices(
             add_quad(&mut verts, -0.30, -0.02, -0.02, 0.06, [0.25, 0.45, 0.35, 1.0]); draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, 0.02, -0.02, 0.30, 0.06, [0.35, 0.45, 0.25, 1.0]); draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
             
-            draw_text_centered(&mut verts, "CHOOSE BACKGROUND COLOR", 0.0, -0.09, 0.95, aspect, [0.85, 0.85, 0.9, 0.95]);
-            let bg_w = 0.068; let bg_gap = 0.008; let bg_tot = 8.0 * bg_w + 7.0 * bg_gap; let bg_start_x = -bg_tot / 2.0;
-            let bg_y0 = -0.19; let bg_y1 = -0.13;
-            for (i, &col) in PRESET_BG_COLORS.iter().enumerate() {
-                let x0 = bg_start_x + i as f32 * (bg_w + bg_gap);
-                let x1 = x0 + bg_w;
-                let is_sel = (col[0] - bg_color[0]).abs() < 0.01 && (col[1] - bg_color[1]).abs() < 0.01 && (col[2] - bg_color[2]).abs() < 0.01;
-                if is_sel {
-                    add_quad(&mut verts, x0 - 0.003, bg_y0 - 0.003, x1 + 0.003, bg_y1 + 0.003, [1.0, 0.9, 0.2, 1.0]);
-                } else {
-                    add_quad(&mut verts, x0 - 0.002, bg_y0 - 0.002, x1 + 0.002, bg_y1 + 0.002, [0.3, 0.35, 0.45, 0.8]);
-                }
-                add_quad(&mut verts, x0, bg_y0, x1, bg_y1, [col[0], col[1], col[2], 1.0]);
-            }
+            // Background color modal trigger button
+            add_quad(&mut verts, -0.30, -0.19, 0.30, -0.11, [0.22, 0.38, 0.52, 1.0]);
+            add_quad(&mut verts, -0.285, -0.175, -0.215, -0.125, [0.4, 0.45, 0.55, 1.0]);
+            add_quad(&mut verts, -0.280, -0.170, -0.220, -0.130, [bg_color[0], bg_color[1], bg_color[2], 1.0]);
+            draw_text_centered(&mut verts, "BACKGROUND COLOR (SLIDERS)...", 0.04, -0.15, 0.95, aspect, [1.0, 1.0, 1.0, 1.0]);
 
             add_quad(&mut verts, -0.30, -0.31, 0.30, -0.23, [0.25, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "CONTROLS", 0.0, -0.27, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, -0.30, -0.45, 0.30, -0.37, [0.20, 0.55, 0.30, 1.0]); draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.41, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, -0.30, -0.57, 0.30, -0.49, [0.55, 0.20, 0.20, 1.0]); draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.53, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+        }
+        ActiveMenu::BgColorModal => {
+            add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.02, 0.03, 0.05, 0.70]);
+            add_quad(&mut verts, -0.406, -0.426, 0.406, 0.426, [0.35, 0.45, 0.60, 1.0]);
+            add_quad(&mut verts, -0.400, -0.420, 0.400, 0.420, [0.10, 0.12, 0.16, 0.98]);
+
+            draw_text_centered(&mut verts, "BACKGROUND COLOR PICKER", 0.0, 0.35, 1.25, aspect, [1.0, 0.9, 0.2, 1.0]);
+
+            let [cur_r, cur_g, cur_b] = bg_color;
+            let s_x0 = -0.34;
+            let s_x1 = 0.08;
+
+            add_quad(&mut verts, 0.165, 0.105, 0.355, 0.295, [0.40, 0.45, 0.55, 1.0]);
+            add_quad(&mut verts, 0.170, 0.110, 0.350, 0.290, [cur_r, cur_g, cur_b, 1.0]);
+            draw_text_centered(&mut verts, "PREVIEW", 0.26, 0.315, 0.9, aspect, [0.85, 0.85, 0.85, 1.0]);
+            draw_text_centered(&mut verts, &format!("#{:02X}{:02X}{:02X}", (cur_r * 255.0).round() as u8, (cur_g * 255.0).round() as u8, (cur_b * 255.0).round() as u8), 0.26, 0.075, 0.85, aspect, [0.8, 0.85, 0.9, 1.0]);
+
+            for (lbl, val, y0, y1, bar_col) in [
+                ("R", cur_r, 0.24, 0.28, [0.90, 0.25, 0.25, 1.0]),
+                ("G", cur_g, 0.17, 0.21, [0.25, 0.85, 0.30, 1.0]),
+                ("B", cur_b, 0.10, 0.14, [0.25, 0.50, 0.95, 1.0]),
+            ] {
+                draw_text_centered(&mut verts, lbl, -0.365, (y0 + y1) * 0.5, 1.1, aspect, bar_col);
+                add_quad(&mut verts, s_x0, y0, s_x1, y1, [0.18, 0.20, 0.25, 1.0]);
+                let filled_x = s_x0 + val * (s_x1 - s_x0);
+                add_quad(&mut verts, s_x0, y0, filled_x, y1, bar_col);
+                add_quad(&mut verts, filled_x - 0.008, y0 - 0.005, filled_x + 0.008, y1 + 0.005, [1.0, 1.0, 1.0, 1.0]);
+                draw_text(&mut verts, &format!("{:.0}%", val * 100.0), s_x1 + 0.015, (y0 + y1) * 0.5 - 0.012, 0.85, aspect, [0.85, 0.85, 0.85, 1.0]);
+            }
+
+            draw_text_centered(&mut verts, "QUICK PRESETS", 0.0, 0.01, 0.95, aspect, [0.8, 0.85, 0.9, 1.0]);
+            let bg_w = 0.068; let bg_gap = 0.008; let bg_tot = 8.0 * bg_w + 7.0 * bg_gap; let bg_start_x = -bg_tot / 2.0;
+            let bg_y0 = -0.10; let bg_y1 = -0.04;
+            for (i, &col) in PRESET_BG_COLORS.iter().enumerate() {
+                let x0 = bg_start_x + i as f32 * (bg_w + bg_gap);
+                let x1 = x0 + bg_w;
+                add_quad(&mut verts, x0, bg_y0, x1, bg_y1, [col[0], col[1], col[2], 1.0]);
+            }
+
+            add_quad(&mut verts, -0.22, -0.23, 0.22, -0.15, [0.20, 0.55, 0.35, 1.0]);
+            draw_text_centered(&mut verts, "APPLY & CLOSE (ESC)", 0.0, -0.19, 1.05, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
         ActiveMenu::Controls => {
             add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.03, 0.04, 0.06, 0.95]);
@@ -1580,6 +1646,13 @@ impl ApplicationHandler for App {
                             state.ui_dirty = true;
                             state.window.request_redraw();
                         }
+                    } else if state.active_menu == ActiveMenu::BgColorModal {
+                        if let Some(channel) = state.active_slider {
+                            state.bg_color[channel] = ((mx - -0.34) / (0.08 - -0.34)).clamp(0.0, 1.0);
+                            state.update_camera_buffer();
+                            state.ui_dirty = true;
+                            state.window.request_redraw();
+                        }
                     } else if state.active_menu == ActiveMenu::None {
                         state.window.request_redraw();
                     }
@@ -1822,6 +1895,7 @@ impl ApplicationHandler for App {
                             }
                             match state.active_menu {
                                 ActiveMenu::None | ActiveMenu::ImportParams | ActiveMenu::Controls => state.set_menu(ActiveMenu::Pause),
+                                ActiveMenu::BgColorModal => state.set_menu(ActiveMenu::Pause),
                                 ActiveMenu::Voxelizing => {},
                                 _ => state.set_menu(ActiveMenu::None),
                             }
@@ -1860,6 +1934,10 @@ impl ApplicationHandler for App {
                         if element_state == ElementState::Pressed {
                             let (bx0, by0, bx1, by1) = get_focus_button_bounds(aspect);
                             if mx >= bx0 && mx <= bx1 && my >= by0 && my <= by1 { state.focus_on_scene(); state.window.request_redraw(); return; }
+
+                            let (px0, py0, px1, py1) = get_proj_button_bounds(aspect);
+                            if mx >= px0 && mx <= px1 && my >= py0 && my <= py1 { state.toggle_projection(); state.window.request_redraw(); return; }
+
                             if ((mx - GIZMO_CENTER_X) * aspect).powi(2) + (my - GIZMO_CENTER_Y).powi(2) <= (GIZMO_RADIUS + 0.02).powi(2) {
                                 state.gimbal_dragging = true;
                                 state.gimbal_drag_moved = false;
@@ -1984,8 +2062,34 @@ impl ApplicationHandler for App {
                                 if mx >= -0.30 && mx <= -0.02 && my >= -0.02 && my <= 0.06 { let _ = state.save_game("world_save.json"); return; }
                                 if mx >= 0.02 && mx <= 0.30 && my >= -0.02 && my <= 0.06 { let _ = state.load_game("world_save.json"); return; }
                                 
+                                // Open background color modal with sliders
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.19 && my <= -0.11 {
+                                    state.set_menu(ActiveMenu::BgColorModal);
+                                    return;
+                                }
+
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.31 && my <= -0.23 { state.set_menu(ActiveMenu::Controls); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.45 && my <= -0.37 { state.set_menu(ActiveMenu::None); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.57 && my <= -0.49 { event_loop.exit(); return; }
+                            }
+                        }
+                        ActiveMenu::BgColorModal => {
+                            if button == MouseButton::Left && element_state == ElementState::Pressed {
+                                if mx >= -0.36 && mx <= 0.12 {
+                                    state.active_slider = if my >= 0.22 && my <= 0.30 { Some(0) }
+                                        else if my >= 0.15 && my <= 0.23 { Some(1) }
+                                        else if my >= 0.08 && my <= 0.16 { Some(2) }
+                                        else { None };
+                                    if let Some(channel) = state.active_slider {
+                                        state.bg_color[channel] = ((mx - -0.34) / (0.08 - -0.34)).clamp(0.0, 1.0);
+                                        state.update_camera_buffer();
+                                        state.ui_dirty = true;
+                                        state.window.request_redraw();
+                                        return;
+                                    }
+                                }
                                 let bg_w = 0.068; let bg_gap = 0.008; let bg_tot = 8.0 * bg_w + 7.0 * bg_gap; let bg_start_x = -bg_tot / 2.0;
-                                let bg_y0 = -0.19; let bg_y1 = -0.13;
+                                let bg_y0 = -0.10; let bg_y1 = -0.04;
                                 if my >= bg_y0 && my <= bg_y1 {
                                     for (i, &col) in PRESET_BG_COLORS.iter().enumerate() {
                                         let x0 = bg_start_x + i as f32 * (bg_w + bg_gap);
@@ -1999,10 +2103,12 @@ impl ApplicationHandler for App {
                                         }
                                     }
                                 }
-
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.31 && my <= -0.23 { state.set_menu(ActiveMenu::Controls); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.45 && my <= -0.37 { state.set_menu(ActiveMenu::None); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.57 && my <= -0.49 { event_loop.exit(); return; }
+                                if mx >= -0.22 && mx <= 0.22 && my >= -0.23 && my <= -0.15 {
+                                    state.set_menu(ActiveMenu::Pause);
+                                    return;
+                                }
+                            } else if button == MouseButton::Left {
+                                state.active_slider = None;
                             }
                         }
                         ActiveMenu::Controls => {
