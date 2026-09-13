@@ -487,31 +487,113 @@ fn clip_line_segment(v0: &mut Vec4, v1: &mut Vec4, near_w: f32) -> bool {
     true
 }
 
+/// Liang-Barsky 2D clipper against screen bounds to prevent NDC explosion streaks
+fn clip_line_2d(p0: &mut [f32; 2], p1: &mut [f32; 2], bound: f32) -> bool {
+    let mut t0 = 0.0f32;
+    let mut t1 = 1.0f32;
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
+
+    let p = [-dx, dx, -dy, dy];
+    let q = [p0[0] + bound, bound - p0[0], p0[1] + bound, bound - p0[1]];
+
+    for i in 0..4 {
+        if p[i].abs() < 1e-6 {
+            if q[i] < 0.0 {
+                return false;
+            }
+        } else {
+            let r = q[i] / p[i];
+            if p[i] < 0.0 {
+                if r > t1 { return false; }
+                if r > t0 { t0 = r; }
+            } else {
+                if r < t0 { return false; }
+                if r < t1 { t1 = r; }
+            }
+        }
+    }
+
+    let new_p0 = [p0[0] + t0 * dx, p0[1] + t0 * dy];
+    let new_p1 = [p0[0] + t1 * dx, p0[1] + t1 * dy];
+    *p0 = new_p0;
+    *p1 = new_p1;
+    true
+}
+
+fn draw_quad_3d(verts: &mut Vec<UIVertex>, pts: [Vec3; 4], view_proj: Mat4, color: [f32; 4]) {
+    let mut ndc = [[0.0f32; 2]; 4];
+    for (i, p) in pts.iter().enumerate() {
+        let v = view_proj * Vec4::new(p.x, p.y, p.z, 1.0);
+        if v.w < 0.05 {
+            return; // Cull face if any vertex lies behind near plane
+        }
+        ndc[i] = [v.x / v.w, v.y / v.w];
+        if ndc[i][0].abs() > 2.0 || ndc[i][1].abs() > 2.0 {
+            return;
+        }
+    }
+    // Quad made of 2 triangles: (0, 1, 2) and (0, 2, 3)
+    verts.extend_from_slice(&[
+        UIVertex { position: ndc[0], color },
+        UIVertex { position: ndc[1], color },
+        UIVertex { position: ndc[2], color },
+        UIVertex { position: ndc[0], color },
+        UIVertex { position: ndc[2], color },
+        UIVertex { position: ndc[3], color },
+    ]);
+}
+
 fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspect: f32, view_proj: Mat4, color: [f32; 4]) {
-    let edges = [
-        // 4 Horizontal edges along X
-        (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, min_p.z)),
-        (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, min_p.z)),
-        (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
-        (Vec3::new(min_p.x, max_p.y, max_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
-        // 4 Vertical edges along Y
-        (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(min_p.x, max_p.y, min_p.z)),
-        (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, min_p.z)),
-        (Vec3::new(min_p.x, min_p.y, max_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
-        (Vec3::new(max_p.x, min_p.y, max_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
-        // 4 Horizontal edges along Z
-        (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(min_p.x, min_p.y, max_p.z)),
-        (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
-        (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
-        (Vec3::new(max_p.x, max_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
+    // 0.2% outward bias so cursor lines never Z-fight or disappear into placed voxels
+    let expand = (max_p - min_p) * 0.002;
+    let p0 = min_p - expand;
+    let p1 = max_p + expand;
+
+    let corners = [
+        Vec3::new(p0.x, p0.y, p0.z), // 0: 000
+        Vec3::new(p1.x, p0.y, p0.z), // 1: 100
+        Vec3::new(p0.x, p1.y, p0.z), // 2: 010
+        Vec3::new(p1.x, p1.y, p0.z), // 3: 110
+        Vec3::new(p0.x, p0.y, p1.z), // 4: 001
+        Vec3::new(p1.x, p0.y, p1.z), // 5: 101
+        Vec3::new(p0.x, p1.y, p1.z), // 6: 011
+        Vec3::new(p1.x, p1.y, p1.z), // 7: 111
     ];
-    for (p0, p1) in edges {
-        let mut v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
-        let mut v1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
+
+    // Translucent face fill to give immediate 3D volume perception
+    let face_col = [color[0], color[1], color[2], color[3] * 0.12];
+    let faces = [
+        [corners[0], corners[1], corners[3], corners[2]], // -Z face
+        [corners[4], corners[5], corners[7], corners[6]], // +Z face
+        [corners[0], corners[4], corners[6], corners[2]], // -X face
+        [corners[1], corners[5], corners[7], corners[3]], // +X face
+        [corners[0], corners[1], corners[5], corners[4]], // -Y face
+        [corners[2], corners[3], corners[7], corners[6]], // +Y face
+    ];
+    for face in faces {
+        draw_quad_3d(verts, face, view_proj, face_col);
+    }
+
+    // Exact 12 edges without duplicate or missing indices
+    let edges = [
+        // 4 X-axis edges
+        (0, 1), (2, 3), (4, 5), (6, 7),
+        // 4 Y-axis edges (edge (4, 6) restored)
+        (0, 2), (1, 3), (4, 6), (5, 7),
+        // 4 Z-axis edges
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ];
+
+    for (i0, i1) in edges {
+        let mut v0 = view_proj * Vec4::new(corners[i0].x, corners[i0].y, corners[i0].z, 1.0);
+        let mut v1 = view_proj * Vec4::new(corners[i1].x, corners[i1].y, corners[i1].z, 1.0);
         if clip_line_segment(&mut v0, &mut v1, 0.05) {
-            let ndc0 = v0.truncate() / v0.w;
-            let ndc1 = v1.truncate() / v1.w;
-            add_line(verts, ndc0.x, ndc0.y, ndc1.x, ndc1.y, 0.003, aspect, color);
+            let mut ndc0 = [v0.x / v0.w, v0.y / v0.w];
+            let mut ndc1 = [v1.x / v1.w, v1.y / v1.w];
+            if clip_line_2d(&mut ndc0, &mut ndc1, 1.3) {
+                add_line(verts, ndc0[0], ndc0[1], ndc1[0], ndc1[1], 0.0035, aspect, color);
+            }
         }
     }
 }
@@ -525,9 +607,11 @@ fn draw_circle_wireframe(verts: &mut Vec<UIVertex>, center: Vec3, radius: f32, a
         let mut v0 = view_proj * Vec4::new(p0.x, p0.y, p0.z, 1.0);
         let mut v1 = view_proj * Vec4::new(p1.x, p1.y, p1.z, 1.0);
         if clip_line_segment(&mut v0, &mut v1, 0.05) {
-            let ndc0 = v0.truncate() / v0.w;
-            let ndc1 = v1.truncate() / v1.w;
-            add_line(verts, ndc0.x, ndc0.y, ndc1.x, ndc1.y, 0.003, aspect, color);
+            let mut ndc0 = [v0.x / v0.w, v0.y / v0.w];
+            let mut ndc1 = [v1.x / v1.w, v1.y / v1.w];
+            if clip_line_2d(&mut ndc0, &mut ndc1, 1.3) {
+                add_line(verts, ndc0[0], ndc0[1], ndc1[0], ndc1[1], 0.003, aspect, color);
+            }
         }
     }
 }
