@@ -429,16 +429,41 @@ fn get_gizmo_axes() -> [GizmoAxis; 6] {
 }
 
 fn get_focus_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
-    let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
-    let btn_w = 0.075 / aspect; let btn_h = 0.046;
-    let x1 = g_cx - disc_rx - 0.015; let x0 = x1 - btn_w; let y0 = g_cy + 0.008; let y1 = y0 + btn_h;
+    let g_cx = GIZMO_CENTER_X;
+    let g_cy = GIZMO_CENTER_Y;
+    let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
+    let btn_w = 0.075 / aspect;
+    let btn_h = 0.046;
+    let x1 = g_cx - disc_rx - 0.015;
+    let x0 = x1 - btn_w;
+    let y0 = g_cy + 0.008;
+    let y1 = y0 + btn_h;
     (x0, y0, x1, y1)
 }
 
 fn get_proj_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
-    let g_cx = GIZMO_CENTER_X; let g_cy = GIZMO_CENTER_Y; let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
-    let btn_w = 0.075 / aspect; let btn_h = 0.046;
-    let x1 = g_cx - disc_rx - 0.015; let x0 = x1 - btn_w; let y1 = g_cy - 0.008; let y0 = y1 - btn_h;
+    let g_cx = GIZMO_CENTER_X;
+    let g_cy = GIZMO_CENTER_Y;
+    let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
+    let btn_w = 0.075 / aspect;
+    let btn_h = 0.046;
+    let x1 = g_cx - disc_rx - 0.015;
+    let x0 = x1 - btn_w;
+    let y1 = g_cy - 0.008;
+    let y0 = y1 - btn_h;
+    (x0, y0, x1, y1)
+}
+
+fn get_render_button_bounds(aspect: f32) -> (f32, f32, f32, f32) {
+    let g_cx = GIZMO_CENTER_X;
+    let g_cy = GIZMO_CENTER_Y;
+    let disc_rx = (GIZMO_RADIUS + 0.02) / aspect;
+    let btn_w = 0.075 / aspect;
+    let btn_h = 0.046;
+    let x1 = g_cx - disc_rx - 0.015;
+    let x0 = x1 - btn_w;
+    let y1 = g_cy - 0.008 - btn_h - 0.008;
+    let y0 = y1 - btn_h;
     (x0, y0, x1, y1)
 }
 
@@ -477,7 +502,7 @@ fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspec
         // 4 Horizontal edges along Z
         (Vec3::new(min_p.x, min_p.y, min_p.z), Vec3::new(min_p.x, min_p.y, max_p.z)),
         (Vec3::new(max_p.x, min_p.y, min_p.z), Vec3::new(max_p.x, min_p.y, max_p.z)),
-        (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(min_p.x, max_p.y, max_p.z)),
+        (Vec3::new(min_p.x, max_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
         (Vec3::new(max_p.x, max_p.y, min_p.z), Vec3::new(max_p.x, max_p.y, max_p.z)),
     ];
     for (p0, p1) in edges {
@@ -539,6 +564,12 @@ fn build_ui_vertices(
     add_quad(&mut verts, px0 - 0.003, py0 - 0.003, px1 + 0.003, py1 + 0.003, proj_border);
     add_quad(&mut verts, px0, py0, px1, py1, proj_bg);
     draw_text_centered(&mut verts, proj_text, (px0 + px1) / 2.0, (py0 + py1) / 2.0, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
+
+    // Gimbal Render Mode button [REN]
+    let (rx0, ry0, rx1, ry1) = get_render_button_bounds(aspect);
+    add_quad(&mut verts, rx0 - 0.003, ry0 - 0.003, rx1 + 0.003, ry1 + 0.003, [0.35, 0.40, 0.50, 0.8]);
+    add_quad(&mut verts, rx0, ry0, rx1, ry1, [0.12, 0.15, 0.22, 0.90]);
+    draw_text_centered(&mut verts, "REN", (rx0 + rx1) / 2.0, (ry0 + ry1) / 2.0, 1.0, aspect, [0.3, 0.95, 0.5, 1.0]);
 
     let mut axes_projected: Vec<(GizmoAxis, f32, f32, f32)> = get_gizmo_axes().into_iter().map(|ax| (ax, ax.dir.dot(camera_right), ax.dir.dot(camera_up), ax.dir.dot(camera_forward))).collect();
     axes_projected.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
@@ -715,7 +746,7 @@ fn build_ui_vertices(
             add_quad(&mut verts, -0.30, 0.48, 0.30, 0.56, [0.20, 0.55, 0.75, 1.0]); draw_text_centered(&mut verts, ">> IMPORT 3D MODEL (GLB) <<", 0.0, 0.52, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, -0.30, 0.38, 0.30, 0.46, [0.25, 0.35, 0.55, 1.0]); draw_text_centered(&mut verts, if play_mode == PlayMode::Flying { "PLAY MODE: FLYING (M)" } else { "PLAY MODE: REAL (M)" }, 0.0, 0.42, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, -0.30, 0.28, 0.30, 0.36, [0.22, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, if is_ortho { "VIEW: ORTHOGRAPHIC (P)" } else { "VIEW: PERSPECTIVE (P)" }, 0.0, 0.32, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, 0.18, 0.30, 0.26, [0.35, 0.25, 0.50, 1.0]); draw_text_centered(&mut verts, &format!("WORLD: {} (F2)", world_type.name()), 0.0, 0.22, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, 0.18, 0.30, 0.26, [0.35, 0.25, 0.50, 1.0]); draw_text_centered(&mut verts, &format!("WORLD: {}", world_type.name()), 0.0, 0.22, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, -0.30, 0.08, 0.30, 0.16, [0.60, 0.30, 0.20, 1.0]); draw_text_centered(&mut verts, "CLEAR SCENE", 0.0, 0.12, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, -0.30, -0.02, -0.02, 0.06, [0.25, 0.45, 0.35, 1.0]); draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, 0.02, -0.02, 0.30, 0.06, [0.35, 0.45, 0.25, 1.0]); draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
@@ -726,9 +757,17 @@ fn build_ui_vertices(
             add_quad(&mut verts, -0.280, -0.170, -0.220, -0.130, [bg_color[0], bg_color[1], bg_color[2], 1.0]);
             draw_text_centered(&mut verts, "BACKGROUND COLOR (SLIDERS)...", 0.04, -0.15, 0.95, aspect, [1.0, 1.0, 1.0, 1.0]);
 
-            add_quad(&mut verts, -0.30, -0.31, 0.30, -0.23, [0.25, 0.40, 0.55, 1.0]); draw_text_centered(&mut verts, "CONTROLS", 0.0, -0.27, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, -0.45, 0.30, -0.37, [0.20, 0.55, 0.30, 1.0]); draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.41, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
-            add_quad(&mut verts, -0.30, -0.57, 0.30, -0.49, [0.55, 0.20, 0.20, 1.0]); draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.53, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+            add_quad(&mut verts, -0.30, -0.29, 0.30, -0.21, [0.18, 0.45, 0.32, 1.0]);
+            draw_text_centered(&mut verts, "RENDER MODE / HIDE UI (F1)", 0.0, -0.25, 1.05, aspect, [1.0, 1.0, 1.0, 1.0]);
+
+            add_quad(&mut verts, -0.30, -0.39, 0.30, -0.31, [0.25, 0.40, 0.55, 1.0]);
+            draw_text_centered(&mut verts, "CONTROLS", 0.0, -0.35, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+
+            add_quad(&mut verts, -0.30, -0.51, 0.30, -0.43, [0.20, 0.55, 0.30, 1.0]);
+            draw_text_centered(&mut verts, "RESUME (ESC)", 0.0, -0.47, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+
+            add_quad(&mut verts, -0.30, -0.63, 0.30, -0.55, [0.55, 0.20, 0.20, 1.0]);
+            draw_text_centered(&mut verts, "QUIT TO DESKTOP", 0.0, -0.59, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
         ActiveMenu::BgColorModal => {
             add_quad(&mut verts, -1.0, -1.0, 1.0, 1.0, [0.02, 0.03, 0.05, 0.70]);
@@ -1882,11 +1921,20 @@ impl ApplicationHandler for App {
                         }
                         if key_event.physical_key == PhysicalKey::Code(KeyCode::F1) {
                             state.hide_ui = !state.hide_ui;
+                            if state.hide_ui {
+                                state.active_menu = ActiveMenu::None;
+                            }
                             state.ui_dirty = true;
                             state.window.request_redraw();
                             return;
                         }
                         if key_event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
+                            if state.hide_ui {
+                                state.hide_ui = false;
+                                state.ui_dirty = true;
+                                state.window.request_redraw();
+                                return;
+                            }
                             if state.tool_state.pending_anchor.is_some() {
                                 state.tool_state.pending_anchor = None;
                                 state.ui_dirty = true;
@@ -1902,7 +1950,6 @@ impl ApplicationHandler for App {
                             return;
                         }
                         match key_event.physical_key {
-                            PhysicalKey::Code(KeyCode::F2) => state.cycle_world_generator(),
                             PhysicalKey::Code(KeyCode::F5) => { let _ = state.save_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::F9) => { let _ = state.load_game("world_save.json"); },
                             PhysicalKey::Code(KeyCode::KeyF) => state.scale_voxel_size(false),
@@ -1937,6 +1984,15 @@ impl ApplicationHandler for App {
 
                             let (px0, py0, px1, py1) = get_proj_button_bounds(aspect);
                             if mx >= px0 && mx <= px1 && my >= py0 && my <= py1 { state.toggle_projection(); state.window.request_redraw(); return; }
+
+                            let (rx0, ry0, rx1, ry1) = get_render_button_bounds(aspect);
+                            if mx >= rx0 && mx <= rx1 && my >= ry0 && my <= ry1 {
+                                state.hide_ui = true;
+                                state.active_menu = ActiveMenu::None;
+                                state.ui_dirty = true;
+                                state.window.request_redraw();
+                                return;
+                            }
 
                             if ((mx - GIZMO_CENTER_X) * aspect).powi(2) + (my - GIZMO_CENTER_Y).powi(2) <= (GIZMO_RADIUS + 0.02).powi(2) {
                                 state.gimbal_dragging = true;
@@ -2068,9 +2124,17 @@ impl ApplicationHandler for App {
                                     return;
                                 }
 
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.31 && my <= -0.23 { state.set_menu(ActiveMenu::Controls); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.45 && my <= -0.37 { state.set_menu(ActiveMenu::None); return; }
-                                if mx >= -0.30 && mx <= 0.30 && my >= -0.57 && my <= -0.49 { event_loop.exit(); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.29 && my <= -0.21 {
+                                    state.hide_ui = true;
+                                    state.active_menu = ActiveMenu::None;
+                                    state.ui_dirty = true;
+                                    state.window.request_redraw();
+                                    return;
+                                }
+
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.39 && my <= -0.31 { state.set_menu(ActiveMenu::Controls); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.51 && my <= -0.43 { state.set_menu(ActiveMenu::None); return; }
+                                if mx >= -0.30 && mx <= 0.30 && my >= -0.63 && my <= -0.55 { event_loop.exit(); return; }
                             }
                         }
                         ActiveMenu::BgColorModal => {
@@ -2145,7 +2209,7 @@ impl ApplicationHandler for App {
                         }
                         ActiveMenu::Voxelizing => {}
                         ActiveMenu::None => {
-                            if element_state == ElementState::Pressed && !state.mmb_dragging {
+                            if element_state == ElementState::Pressed && !state.mmb_dragging && !state.hide_ui {
                                 match button {
                                     MouseButton::Left => state.input.action_add = true,
                                     MouseButton::Right => state.input.action_remove = true,
