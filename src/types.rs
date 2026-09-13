@@ -52,6 +52,10 @@ pub enum ToolType {
     Line,
     Paint,
     Replace,
+    Cone,
+    Pyramid,
+    Torus,
+    Bucket,
 }
 
 impl ToolType {
@@ -65,6 +69,10 @@ impl ToolType {
             ToolType::Line => "LINE/PIPE [L]",
             ToolType::Paint => "PAINT [K]",
             ToolType::Replace => "REPLACE [G]",
+            ToolType::Cone => "CONE [J]",
+            ToolType::Pyramid => "PYRAMID [N]",
+            ToolType::Torus => "TORUS [T]",
+            ToolType::Bucket => "BUCKET [I]",
         }
     }
 
@@ -78,6 +86,10 @@ impl ToolType {
             ToolType::Line => "LIN",
             ToolType::Paint => "PNT",
             ToolType::Replace => "REP",
+            ToolType::Cone => "CON",
+            ToolType::Pyramid => "PYR",
+            ToolType::Torus => "TOR",
+            ToolType::Bucket => "BCK",
         }
     }
 }
@@ -96,8 +108,8 @@ impl Default for ToolState {
     fn default() -> Self {
         Self {
             active_tool: ToolType::Pencil,
-            brush_radius: 2.0,
-            cylinder_height: 4.0,
+            brush_radius: 3.0,
+            cylinder_height: 5.0,
             line_radius: 0.0,
             hollow: false,
             pending_anchor: None,

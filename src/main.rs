@@ -415,6 +415,32 @@ const GIZMO_CENTER_X: f32 = 0.86;
 const GIZMO_CENTER_Y: f32 = 0.76;
 const GIZMO_RADIUS: f32 = 0.11;
 
+// Left-side tool palette geometry (widened for great legibility)
+const LEFT_PALETTE_X0: f32 = -0.985;
+const LEFT_PALETTE_X1: f32 = -0.835;
+const LEFT_PALETTE_TOP_Y: f32 = 0.72;
+const LEFT_TOOL_BTN_H: f32 = 0.043;
+const LEFT_TOOL_BTN_GAP: f32 = 0.005;
+
+fn get_left_tool_btn_bounds(index: usize) -> (f32, f32, f32, f32) {
+    let y1 = LEFT_PALETTE_TOP_Y - index as f32 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP);
+    let y0 = y1 - LEFT_TOOL_BTN_H;
+    (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
+}
+
+fn get_left_radius_controls_bounds() -> (f32, f32, f32, f32) {
+    let y1 = LEFT_PALETTE_TOP_Y - 12.0 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP) - 0.005;
+    let y0 = y1 - LEFT_TOOL_BTN_H;
+    (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
+}
+
+fn get_left_mode_btn_bounds() -> (f32, f32, f32, f32) {
+    let rad_y0 = LEFT_PALETTE_TOP_Y - 12.0 * (LEFT_TOOL_BTN_H + LEFT_TOOL_BTN_GAP) - 0.005 - LEFT_TOOL_BTN_H;
+    let y1 = rad_y0 - LEFT_TOOL_BTN_GAP;
+    let y0 = y1 - LEFT_TOOL_BTN_H;
+    (LEFT_PALETTE_X0, y0, LEFT_PALETTE_X1, y1)
+}
+
 #[derive(Clone, Copy)]
 struct GizmoAxis { dir: Vec3, name: &'static str, color: [f32; 4], yaw: f32, pitch: f32, is_positive: bool }
 fn get_gizmo_axes() -> [GizmoAxis; 6] {
@@ -487,7 +513,6 @@ fn clip_line_segment(v0: &mut Vec4, v1: &mut Vec4, near_w: f32) -> bool {
     true
 }
 
-/// Liang-Barsky 2D clipper against screen bounds to prevent NDC explosion streaks
 fn clip_line_2d(p0: &mut [f32; 2], p1: &mut [f32; 2], bound: f32) -> bool {
     let mut t0 = 0.0f32;
     let mut t1 = 1.0f32;
@@ -514,10 +539,8 @@ fn clip_line_2d(p0: &mut [f32; 2], p1: &mut [f32; 2], bound: f32) -> bool {
         }
     }
 
-    let new_p0 = [p0[0] + t0 * dx, p0[1] + t0 * dy];
-    let new_p1 = [p0[0] + t1 * dx, p0[1] + t1 * dy];
-    *p0 = new_p0;
-    *p1 = new_p1;
+    *p0 = [p0[0] + t0 * dx, p0[1] + t0 * dy];
+    *p1 = [p0[0] + t1 * dx, p0[1] + t1 * dy];
     true
 }
 
@@ -526,14 +549,13 @@ fn draw_quad_3d(verts: &mut Vec<UIVertex>, pts: [Vec3; 4], view_proj: Mat4, colo
     for (i, p) in pts.iter().enumerate() {
         let v = view_proj * Vec4::new(p.x, p.y, p.z, 1.0);
         if v.w < 0.05 {
-            return; // Cull face if any vertex lies behind near plane
+            return;
         }
         ndc[i] = [v.x / v.w, v.y / v.w];
         if ndc[i][0].abs() > 2.0 || ndc[i][1].abs() > 2.0 {
             return;
         }
     }
-    // Quad made of 2 triangles: (0, 1, 2) and (0, 2, 3)
     verts.extend_from_slice(&[
         UIVertex { position: ndc[0], color },
         UIVertex { position: ndc[1], color },
@@ -545,43 +567,37 @@ fn draw_quad_3d(verts: &mut Vec<UIVertex>, pts: [Vec3; 4], view_proj: Mat4, colo
 }
 
 fn draw_box_wireframe(verts: &mut Vec<UIVertex>, min_p: Vec3, max_p: Vec3, aspect: f32, view_proj: Mat4, color: [f32; 4]) {
-    // 0.2% outward bias so cursor lines never Z-fight or disappear into placed voxels
     let expand = (max_p - min_p) * 0.002;
     let p0 = min_p - expand;
     let p1 = max_p + expand;
 
     let corners = [
-        Vec3::new(p0.x, p0.y, p0.z), // 0: 000
-        Vec3::new(p1.x, p0.y, p0.z), // 1: 100
-        Vec3::new(p0.x, p1.y, p0.z), // 2: 010
-        Vec3::new(p1.x, p1.y, p0.z), // 3: 110
-        Vec3::new(p0.x, p0.y, p1.z), // 4: 001
-        Vec3::new(p1.x, p0.y, p1.z), // 5: 101
-        Vec3::new(p0.x, p1.y, p1.z), // 6: 011
-        Vec3::new(p1.x, p1.y, p1.z), // 7: 111
+        Vec3::new(p0.x, p0.y, p0.z),
+        Vec3::new(p1.x, p0.y, p0.z),
+        Vec3::new(p0.x, p1.y, p0.z),
+        Vec3::new(p1.x, p1.y, p0.z),
+        Vec3::new(p0.x, p0.y, p1.z),
+        Vec3::new(p1.x, p0.y, p1.z),
+        Vec3::new(p0.x, p1.y, p1.z),
+        Vec3::new(p1.x, p1.y, p1.z),
     ];
 
-    // Translucent face fill to give immediate 3D volume perception
     let face_col = [color[0], color[1], color[2], color[3] * 0.12];
     let faces = [
-        [corners[0], corners[1], corners[3], corners[2]], // -Z face
-        [corners[4], corners[5], corners[7], corners[6]], // +Z face
-        [corners[0], corners[4], corners[6], corners[2]], // -X face
-        [corners[1], corners[5], corners[7], corners[3]], // +X face
-        [corners[0], corners[1], corners[5], corners[4]], // -Y face
-        [corners[2], corners[3], corners[7], corners[6]], // +Y face
+        [corners[0], corners[1], corners[3], corners[2]],
+        [corners[4], corners[5], corners[7], corners[6]],
+        [corners[0], corners[4], corners[6], corners[2]],
+        [corners[1], corners[5], corners[7], corners[3]],
+        [corners[0], corners[1], corners[5], corners[4]],
+        [corners[2], corners[3], corners[7], corners[6]],
     ];
     for face in faces {
         draw_quad_3d(verts, face, view_proj, face_col);
     }
 
-    // Exact 12 edges without duplicate or missing indices
     let edges = [
-        // 4 X-axis edges
         (0, 1), (2, 3), (4, 5), (6, 7),
-        // 4 Y-axis edges (edge (4, 6) restored)
         (0, 2), (1, 3), (4, 6), (5, 7),
-        // 4 Z-axis edges
         (0, 4), (1, 5), (2, 6), (3, 7),
     ];
 
@@ -617,9 +633,10 @@ fn draw_circle_wireframe(verts: &mut Vec<UIVertex>, center: Vec3, radius: f32, a
 }
 
 const HOTBAR_LABELS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
-const ALL_TOOLS: [ToolType; 8] = [
-    ToolType::Pencil, ToolType::Sphere, ToolType::Cylinder, ToolType::Box,
-    ToolType::Line, ToolType::Disc, ToolType::Paint, ToolType::Replace
+const ALL_TOOLS: [ToolType; 12] = [
+    ToolType::Pencil, ToolType::Sphere, ToolType::Cylinder, ToolType::Disc,
+    ToolType::Box, ToolType::Line, ToolType::Cone, ToolType::Pyramid,
+    ToolType::Torus, ToolType::Paint, ToolType::Replace, ToolType::Bucket,
 ];
 
 fn build_ui_vertices(
@@ -670,6 +687,7 @@ fn build_ui_vertices(
         }
     }
 
+    // Bottom hotbar
     let num_slots = 10; let slot_w = 0.054; let slot_gap = 0.009; let total_w = num_slots as f32 * slot_w + (num_slots - 1) as f32 * slot_gap;
     let start_x = -total_w / 2.0; let y_bottom = -0.96; let y_top = -0.86;
     for (i, &rgb) in hotbar_colors.iter().enumerate() {
@@ -680,52 +698,51 @@ fn build_ui_vertices(
     }
 
     if active_menu == ActiveMenu::None {
-        let bar_y0 = -0.83;
-        let bar_y1 = -0.77;
-        let tb_w = 0.050;
-        let tb_gap = 0.006;
-        let total_tb_w = 8.0 * tb_w + 7.0 * tb_gap;
-        let tb_start_x = -total_tb_w / 2.0 - 0.10;
+        // Widened left-side tool palette container
+        let panel_top = LEFT_PALETTE_TOP_Y + 0.035;
+        let panel_bottom = get_left_mode_btn_bounds().1 - 0.010;
+        add_quad(&mut verts, LEFT_PALETTE_X0 - 0.006, panel_bottom - 0.004, LEFT_PALETTE_X1 + 0.006, panel_top + 0.004, [0.25, 0.32, 0.45, 0.75]);
+        add_quad(&mut verts, LEFT_PALETTE_X0 - 0.003, panel_bottom, LEFT_PALETTE_X1 + 0.003, panel_top, [0.08, 0.10, 0.15, 0.94]);
+        draw_text_centered(&mut verts, "VOXEL TOOLS", (LEFT_PALETTE_X0 + LEFT_PALETTE_X1) * 0.5, panel_top - 0.018, 0.95, aspect, [0.35, 0.90, 1.0, 1.0]);
 
+        // Tool buttons
         for (i, &tool) in ALL_TOOLS.iter().enumerate() {
-            let x0 = tb_start_x + i as f32 * (tb_w + tb_gap);
-            let x1 = x0 + tb_w;
+            let (x0, y0, x1, y1) = get_left_tool_btn_bounds(i);
             let is_cur = tool_state.active_tool == tool;
-            let bg = if is_cur { [0.20, 0.60, 0.85, 0.95] } else { [0.10, 0.12, 0.16, 0.85] };
-            let border = if is_cur { [1.0, 0.9, 0.2, 1.0] } else { [0.25, 0.30, 0.38, 0.8] };
-            add_quad(&mut verts, x0 - 0.002, bar_y0 - 0.002, x1 + 0.002, bar_y1 + 0.002, border);
-            add_quad(&mut verts, x0, bar_y0, x1, bar_y1, bg);
-            draw_text_centered(&mut verts, tool.short_name(), (x0 + x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 0.9, aspect, [1.0, 1.0, 1.0, 1.0]);
+            let bg = if is_cur { [0.20, 0.58, 0.88, 0.95] } else { [0.12, 0.14, 0.19, 0.85] };
+            let border = if is_cur { [1.0, 0.9, 0.2, 1.0] } else { [0.25, 0.30, 0.40, 0.75] };
+            add_quad(&mut verts, x0 - 0.002, y0 - 0.002, x1 + 0.002, y1 + 0.002, border);
+            add_quad(&mut verts, x0, y0, x1, y1, bg);
+            draw_text_centered(&mut verts, tool.name(), (x0 + x1) * 0.5, (y0 + y1) * 0.5, 0.82, aspect, [1.0, 1.0, 1.0, 1.0]);
         }
 
-        let ctrl_x0 = tb_start_x + total_tb_w + 0.015;
-        let rad_minus_x0 = ctrl_x0;
-        let rad_minus_x1 = rad_minus_x0 + 0.028;
-        add_quad(&mut verts, rad_minus_x0, bar_y0, rad_minus_x1, bar_y1, [0.20, 0.25, 0.35, 0.9]);
-        draw_text_centered(&mut verts, "-", (rad_minus_x0 + rad_minus_x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+        // Radius adjustment row
+        let (rx0, ry0, rx1, ry1) = get_left_radius_controls_bounds();
+        let rad_minus_x1 = rx0 + 0.032;
+        let rad_plus_x0 = rx1 - 0.032;
 
-        let rad_lbl_x0 = rad_minus_x1 + 0.004;
-        let rad_lbl_x1 = rad_lbl_x0 + 0.070;
-        add_quad(&mut verts, rad_lbl_x0, bar_y0, rad_lbl_x1, bar_y1, [0.08, 0.10, 0.14, 0.9]);
-        draw_text_centered(&mut verts, &format!("R:{:.1}", tool_state.brush_radius), (rad_lbl_x0 + rad_lbl_x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 0.9, aspect, [0.3, 0.9, 1.0, 1.0]);
+        add_quad(&mut verts, rx0, ry0, rad_minus_x1, ry1, [0.20, 0.25, 0.35, 0.9]);
+        draw_text_centered(&mut verts, "-", (rx0 + rad_minus_x1) * 0.5, (ry0 + ry1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
 
-        let rad_plus_x0 = rad_lbl_x1 + 0.004;
-        let rad_plus_x1 = rad_plus_x0 + 0.028;
-        add_quad(&mut verts, rad_plus_x0, bar_y0, rad_plus_x1, bar_y1, [0.20, 0.25, 0.35, 0.9]);
-        draw_text_centered(&mut verts, "+", (rad_plus_x0 + rad_plus_x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+        add_quad(&mut verts, rad_minus_x1 + 0.004, ry0, rad_plus_x0 - 0.004, ry1, [0.08, 0.10, 0.14, 0.9]);
+        draw_text_centered(&mut verts, &format!("R:{:.1}", tool_state.brush_radius), (rx0 + rx1) * 0.5, (ry0 + ry1) * 0.5, 0.9, aspect, [0.3, 0.9, 1.0, 1.0]);
 
-        let mode_x0 = rad_plus_x1 + 0.008;
-        let mode_x1 = mode_x0 + 0.065;
+        add_quad(&mut verts, rad_plus_x0, ry0, rx1, ry1, [0.20, 0.25, 0.35, 0.9]);
+        draw_text_centered(&mut verts, "+", (rad_plus_x0 + rx1) * 0.5, (ry0 + ry1) * 0.5, 1.1, aspect, [1.0, 1.0, 1.0, 1.0]);
+
+        // Mode row (Solid / Hollow)
+        let (mx0, my0, mx1, my1) = get_left_mode_btn_bounds();
         let mode_bg = if tool_state.hollow { [0.70, 0.35, 0.15, 0.9] } else { [0.20, 0.45, 0.30, 0.9] };
-        add_quad(&mut verts, mode_x0, bar_y0, mode_x1, bar_y1, mode_bg);
-        draw_text_centered(&mut verts, if tool_state.hollow { "HOLLOW" } else { "SOLID" }, (mode_x0 + mode_x1) * 0.5, (bar_y0 + bar_y1) * 0.5, 0.85, aspect, [1.0, 1.0, 1.0, 1.0]);
+        add_quad(&mut verts, mx0, my0, mx1, my1, mode_bg);
+        draw_text_centered(&mut verts, if tool_state.hollow { "HOLLOW MODE" } else { "SOLID MODE" }, (mx0 + mx1) * 0.5, (my0 + my1) * 0.5, 0.85, aspect, [1.0, 1.0, 1.0, 1.0]);
 
         if let Some(pos) = target_pos {
             let p_target = Vec3::from(pos);
             let p_center = p_target + Vec3::splat(edit_size * 0.5);
             match tool_state.active_tool {
-                ToolType::Pencil | ToolType::Paint => {
-                    draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, [0.3, 0.9, 1.0, 0.7]);
+                ToolType::Pencil | ToolType::Paint | ToolType::Bucket => {
+                    let col = if tool_state.active_tool == ToolType::Bucket { [0.2, 0.9, 0.7, 0.85] } else { [0.3, 0.9, 1.0, 0.7] };
+                    draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, col);
                 }
                 ToolType::Sphere => {
                     let r = tool_state.brush_radius;
@@ -756,13 +773,61 @@ fn build_ui_vertices(
                     let r = tool_state.brush_radius;
                     draw_circle_wireframe(&mut verts, p_center, r, Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.2, 0.8, 1.0, 0.95]);
                 }
+                ToolType::Cone => {
+                    let r = tool_state.brush_radius;
+                    let h = tool_state.cylinder_height;
+                    let bot_c = Vec3::new(p_target.x, p_target.y, p_target.z);
+                    let apex = bot_c + Vec3::new(0.0, h, 0.0);
+                    draw_circle_wireframe(&mut verts, bot_c, r, Vec3::X, Vec3::Z, 24, aspect, view_proj, [1.0, 0.6, 0.2, 0.9]);
+                    let struts = [Vec3::new(r, 0.0, 0.0), Vec3::new(-r, 0.0, 0.0), Vec3::new(0.0, 0.0, r), Vec3::new(0.0, 0.0, -r)];
+                    for off in struts {
+                        let mut v0 = view_proj * Vec4::new(bot_c.x + off.x, bot_c.y, bot_c.z + off.z, 1.0);
+                        let mut v1 = view_proj * Vec4::new(apex.x, apex.y, apex.z, 1.0);
+                        if clip_line_segment(&mut v0, &mut v1, 0.05) {
+                            let n0 = v0.truncate() / v0.w;
+                            let n1 = v1.truncate() / v1.w;
+                            add_line(&mut verts, n0.x, n0.y, n1.x, n1.y, 0.003, aspect, [1.0, 0.6, 0.2, 0.8]);
+                        }
+                    }
+                }
+                ToolType::Pyramid => {
+                    let r = tool_state.brush_radius;
+                    let h = tool_state.cylinder_height;
+                    let bot_c = Vec3::new(p_target.x, p_target.y, p_target.z);
+                    let apex = bot_c + Vec3::new(0.0, h, 0.0);
+                    let base_corners = [
+                        bot_c + Vec3::new(-r, 0.0, -r), bot_c + Vec3::new(r, 0.0, -r),
+                        bot_c + Vec3::new(r, 0.0, r), bot_c + Vec3::new(-r, 0.0, r),
+                    ];
+                    for i in 0..4 {
+                        let c0 = base_corners[i];
+                        let c1 = base_corners[(i + 1) % 4];
+                        let mut v0 = view_proj * Vec4::new(c0.x, c0.y, c0.z, 1.0);
+                        let mut v1 = view_proj * Vec4::new(c1.x, c1.y, c1.z, 1.0);
+                        if clip_line_segment(&mut v0, &mut v1, 0.05) {
+                            add_line(&mut verts, v0.x / v0.w, v0.y / v0.w, v1.x / v1.w, v1.y / v1.w, 0.003, aspect, [0.8, 0.4, 1.0, 0.9]);
+                        }
+                        let mut va0 = view_proj * Vec4::new(c0.x, c0.y, c0.z, 1.0);
+                        let mut va1 = view_proj * Vec4::new(apex.x, apex.y, apex.z, 1.0);
+                        if clip_line_segment(&mut va0, &mut va1, 0.05) {
+                            add_line(&mut verts, va0.x / va0.w, va0.y / va0.w, va1.x / va1.w, va1.y / va1.w, 0.003, aspect, [0.8, 0.4, 1.0, 0.8]);
+                        }
+                    }
+                }
+                ToolType::Torus => {
+                    let major_r = tool_state.brush_radius;
+                    let minor_r = (major_r * 0.35).max(1.0);
+                    draw_circle_wireframe(&mut verts, p_center, major_r, Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.3, 1.0, 0.4, 0.95]);
+                    draw_circle_wireframe(&mut verts, p_center, major_r + minor_r, Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.3, 1.0, 0.4, 0.6]);
+                    draw_circle_wireframe(&mut verts, p_center, (major_r - minor_r).max(0.1), Vec3::X, Vec3::Z, 32, aspect, view_proj, [0.3, 1.0, 0.4, 0.6]);
+                }
                 ToolType::Box => {
                     if let Some(anchor) = tool_state.pending_anchor {
                         let b_min = anchor.min(p_target);
                         let b_max = anchor.max(p_target) + Vec3::splat(edit_size);
                         draw_box_wireframe(&mut verts, b_min, b_max, aspect, view_proj, [0.3, 1.0, 0.5, 0.9]);
                         let dims = (b_max - b_min) / edit_size;
-                        draw_text(&mut verts, &format!("DIM: {:.0} X {:.0} X {:.0}", dims.x, dims.y, dims.z), -0.96, 0.74, 1.0, aspect, [0.4, 1.0, 0.6, 1.0]);
+                        draw_text(&mut verts, &format!("DIM: {:.0} X {:.0} X {:.0}", dims.x, dims.y, dims.z), -0.76, 0.74, 1.0, aspect, [0.4, 1.0, 0.6, 1.0]);
                     } else {
                         draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, [0.3, 1.0, 0.5, 0.6]);
                     }
@@ -777,7 +842,7 @@ fn build_ui_vertices(
                             add_line(&mut verts, ndc0.x, ndc0.y, ndc1.x, ndc1.y, 0.005, aspect, [1.0, 0.8, 0.2, 1.0]);
                         }
                         let dist = (p_target - anchor).length();
-                        draw_text(&mut verts, &format!("LEN: {:.1} BLOCKS", dist / edit_size), -0.96, 0.74, 1.0, aspect, [1.0, 0.8, 0.2, 1.0]);
+                        draw_text(&mut verts, &format!("LEN: {:.1} BLOCKS", dist / edit_size), -0.76, 0.74, 1.0, aspect, [1.0, 0.8, 0.2, 1.0]);
                     } else {
                         draw_box_wireframe(&mut verts, p_target, p_target + Vec3::splat(edit_size), aspect, view_proj, [1.0, 0.8, 0.2, 0.6]);
                     }
@@ -835,7 +900,6 @@ fn build_ui_vertices(
             add_quad(&mut verts, -0.30, -0.02, -0.02, 0.06, [0.25, 0.45, 0.35, 1.0]); draw_text_centered(&mut verts, "SAVE (F5)", -0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
             add_quad(&mut verts, 0.02, -0.02, 0.30, 0.06, [0.35, 0.45, 0.25, 1.0]); draw_text_centered(&mut verts, "LOAD (F9)", 0.16, 0.02, 1.0, aspect, [1.0, 1.0, 1.0, 1.0]);
             
-            // Background color modal trigger button
             add_quad(&mut verts, -0.30, -0.19, 0.30, -0.11, [0.22, 0.38, 0.52, 1.0]);
             add_quad(&mut verts, -0.285, -0.175, -0.215, -0.125, [0.4, 0.45, 0.55, 1.0]);
             add_quad(&mut verts, -0.280, -0.170, -0.220, -0.130, [bg_color[0], bg_color[1], bg_color[2], 1.0]);
@@ -900,7 +964,7 @@ fn build_ui_vertices(
             draw_text_centered(&mut verts, "MMB = ORBIT  |  SHIFT + MMB = PAN  |  CTRL + MMB / WHEEL = ZOOM", 0.0, 0.42, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
             draw_text_centered(&mut verts, "NUMPAD 2 / 4 / 6 / 8 = ORBIT (15 DEG)  |  NUMPAD 1/3/7/9 = VIEWS", 0.0, 0.32, 0.95, aspect, [0.3, 0.9, 1.0, 1.0]);
             draw_text_centered(&mut verts, "CTRL + Z = UNDO  |  CTRL + SHIFT + Z / CTRL + Y = REDO", 0.0, 0.22, 0.95, aspect, [1.0, 0.85, 0.3, 1.0]);
-            draw_text_centered(&mut verts, "V: PENCIL | O: SPHERE | Y: CYLINDER | B: BOX | L: LINE | U: DISC | K: PAINT | G: REPLACE", 0.0, 0.12, 0.85, aspect, [0.9, 0.9, 0.9, 1.0]);
+            draw_text_centered(&mut verts, "V: PEN | O: SPH | Y: CYL | U: DSC | B: BOX | L: LIN | J: CON | N: PYR | T: TOR | K: PNT | G: REP | I: BCK", 0.0, 0.12, 0.80, aspect, [0.9, 0.9, 0.9, 1.0]);
             draw_text_centered(&mut verts, "H = TOGGLE HOLLOW / SOLID  |  [ / ] = DECREASE / INCREASE RADIUS", 0.0, 0.02, 0.95, aspect, [0.3, 1.0, 0.5, 1.0]);
             draw_text_centered(&mut verts, "LMB = APPLY TOOL  |  RMB = ERASE TOOL  |  C = PICK COLOR AT CURSOR", 0.0, -0.08, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
             draw_text_centered(&mut verts, "NUMPAD . / [.] = FOCUS ON SCENE  |  NUMPAD 5 = ORTHO / PERSP", 0.0, -0.18, 0.95, aspect, [0.9, 0.9, 0.9, 1.0]);
@@ -1413,12 +1477,20 @@ impl State {
 
         let (aabb_min, aabb_max) = match self.tool_state.active_tool {
             ToolType::Sphere | ToolType::Replace => (target_vec - Vec3::splat(self.tool_state.brush_radius), target_vec + Vec3::splat(self.tool_state.brush_radius)),
-            ToolType::Cylinder => (target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius), target_vec + Vec3::new(self.tool_state.brush_radius, self.tool_state.cylinder_height, self.tool_state.brush_radius)),
+            ToolType::Cylinder | ToolType::Cone | ToolType::Pyramid => (
+                target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius),
+                target_vec + Vec3::new(self.tool_state.brush_radius, self.tool_state.cylinder_height, self.tool_state.brush_radius)
+            ),
+            ToolType::Torus => (
+                target_vec - Vec3::new(self.tool_state.brush_radius * 1.4, self.tool_state.brush_radius * 0.4, self.tool_state.brush_radius * 1.4),
+                target_vec + Vec3::new(self.tool_state.brush_radius * 1.4, self.tool_state.brush_radius * 0.4, self.tool_state.brush_radius * 1.4)
+            ),
             ToolType::Disc => (target_vec - Vec3::new(self.tool_state.brush_radius, 0.0, self.tool_state.brush_radius), target_vec + Vec3::new(self.tool_state.brush_radius, s, self.tool_state.brush_radius)),
             ToolType::Box | ToolType::Line => {
                 let anchor = self.tool_state.pending_anchor.unwrap_or(target_vec);
                 (anchor.min(target_vec), anchor.max(target_vec) + Vec3::splat(s))
             }
+            ToolType::Bucket => (target_vec - Vec3::splat(32.0 * s), target_vec + Vec3::splat(32.0 * s)),
             _ => (target_vec, target_vec + Vec3::splat(s)),
         };
 
@@ -1439,6 +1511,19 @@ impl State {
             }
             ToolType::Cylinder => {
                 let deltas = rasterize_cylinder(&self.octree, target_vec, self.tool_state.brush_radius, self.tool_state.cylinder_height, s, mat, self.tool_state.hollow);
+                if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
+            }
+            ToolType::Cone => {
+                let deltas = rasterize_cone(&self.octree, target_vec, self.tool_state.brush_radius, self.tool_state.cylinder_height, s, mat, self.tool_state.hollow);
+                if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
+            }
+            ToolType::Pyramid => {
+                let deltas = rasterize_pyramid(&self.octree, target_vec, self.tool_state.brush_radius, self.tool_state.cylinder_height, s, mat, self.tool_state.hollow);
+                if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
+            }
+            ToolType::Torus => {
+                let minor_r = (self.tool_state.brush_radius * 0.35).max(1.0);
+                let deltas = rasterize_torus(&self.octree, target_vec, self.tool_state.brush_radius, minor_r, s, mat, self.tool_state.hollow);
                 if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
             }
             ToolType::Disc => {
@@ -1470,6 +1555,10 @@ impl State {
                     let deltas = rasterize_replace(&self.octree, target_vec + Vec3::splat(s * 0.5), self.tool_state.brush_radius, s, target_mat, mat);
                     if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
                 }
+            }
+            ToolType::Bucket => {
+                let deltas = rasterize_bucket(&self.octree, target_vec, s, mat, 65536);
+                if !deltas.is_empty() { apply_deltas(&mut self.octree, &deltas, true); }
             }
         }
 
@@ -1572,7 +1661,7 @@ impl State {
 
         let prev_target = self.last_target;
         if let Some(ref h) = hit {
-            let p = if self.input.action_remove || matches!(self.tool_state.active_tool, ToolType::Paint | ToolType::Replace) {
+            let p = if self.input.action_remove || matches!(self.tool_state.active_tool, ToolType::Paint | ToolType::Replace | ToolType::Bucket) {
                 h.hit_pos - h.normal * (s * 0.5)
             } else {
                 h.hit_pos + h.normal * (s * 0.5)
@@ -1745,7 +1834,7 @@ impl ApplicationHandler for App {
                                 }
                             } else {
                                 state.camera.yaw += dx * 3.5;
-                                state.camera.pitch = (state.camera.pitch - dy * 3.5).clamp(-1.56, 1.56);
+                                state.camera.pitch = (state.camera.pitch + dy * 3.5).clamp(-1.56, 1.56);
                                 state.update_orbit_position();
                             }
                             state.update_camera_buffer();
@@ -1758,7 +1847,7 @@ impl ApplicationHandler for App {
                         if dx.abs() > 0.0005 || dy.abs() > 0.0005 {
                             state.gimbal_drag_moved = true;
                             state.camera.yaw += dx * 3.8;
-                            state.camera.pitch = (state.camera.pitch - dy * 3.8).clamp(-1.56, 1.56);
+                            state.camera.pitch = (state.camera.pitch + dy * 3.8).clamp(-1.56, 1.56);
                             state.update_orbit_position();
                             state.ui_dirty = true;
                             state.window.request_redraw();
@@ -1958,8 +2047,12 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::KeyU) => { state.tool_state.active_tool = ToolType::Disc; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyB) => { state.tool_state.active_tool = ToolType::Box; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyL) => { state.tool_state.active_tool = ToolType::Line; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyJ) => { state.tool_state.active_tool = ToolType::Cone; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyN) => { state.tool_state.active_tool = ToolType::Pyramid; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyT) => { state.tool_state.active_tool = ToolType::Torus; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyK) => { state.tool_state.active_tool = ToolType::Paint; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyG) => { state.tool_state.active_tool = ToolType::Replace; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
+                            PhysicalKey::Code(KeyCode::KeyI) => { state.tool_state.active_tool = ToolType::Bucket; state.tool_state.pending_anchor = None; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyH) => { state.tool_state.hollow = !state.tool_state.hollow; state.ui_dirty = true; state.window.request_redraw(); return; }
                             PhysicalKey::Code(KeyCode::KeyX) => { 
                                 state.input.wireframe_mode = !state.input.wireframe_mode; 
@@ -2083,6 +2176,8 @@ impl ApplicationHandler for App {
                                 state.gimbal_drag_moved = false;
                                 return;
                             }
+
+                            // Hotbar click
                             let num_slots = 10;
                             let slot_w = 0.054;
                             let slot_gap = 0.009;
@@ -2102,16 +2197,11 @@ impl ApplicationHandler for App {
                                 return;
                             }
 
-                            if state.active_menu == ActiveMenu::None && my >= -0.83 && my <= -0.77 {
-                                let tb_w = 0.050;
-                                let tb_gap = 0.006;
-                                let total_tb_w = 8.0 * tb_w + 7.0 * tb_gap;
-                                let tb_start_x = -total_tb_w / 2.0 - 0.10;
-
+                            // Left tool palette click handling
+                            if state.active_menu == ActiveMenu::None {
                                 for (i, &tool) in ALL_TOOLS.iter().enumerate() {
-                                    let x0 = tb_start_x + i as f32 * (tb_w + tb_gap);
-                                    let x1 = x0 + tb_w;
-                                    if mx >= x0 && mx <= x1 {
+                                    let (tx0, ty0, tx1, ty1) = get_left_tool_btn_bounds(i);
+                                    if mx >= tx0 && mx <= tx1 && my >= ty0 && my <= ty1 {
                                         state.tool_state.active_tool = tool;
                                         state.tool_state.pending_anchor = None;
                                         state.ui_dirty = true;
@@ -2120,34 +2210,29 @@ impl ApplicationHandler for App {
                                     }
                                 }
 
-                                let ctrl_x0 = tb_start_x + total_tb_w + 0.015;
-                                let rad_minus_x0 = ctrl_x0;
-                                let rad_minus_x1 = rad_minus_x0 + 0.028;
-                                if mx >= rad_minus_x0 && mx <= rad_minus_x1 {
-                                    state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
-                                    state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
-                                    state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0);
-                                    state.ui_dirty = true;
-                                    state.window.request_redraw();
-                                    return;
+                                let (rx0, ry0, rx1, ry1) = get_left_radius_controls_bounds();
+                                if my >= ry0 && my <= ry1 {
+                                    let rad_minus_x1 = rx0 + 0.032;
+                                    let rad_plus_x0 = rx1 - 0.032;
+                                    if mx >= rx0 && mx <= rad_minus_x1 {
+                                        state.tool_state.brush_radius = (state.tool_state.brush_radius - 1.0).max(1.0);
+                                        state.tool_state.cylinder_height = (state.tool_state.cylinder_height - 1.0).max(1.0);
+                                        state.tool_state.line_radius = (state.tool_state.line_radius - 0.5).max(0.0);
+                                        state.ui_dirty = true;
+                                        state.window.request_redraw();
+                                        return;
+                                    } else if mx >= rad_plus_x0 && mx <= rx1 {
+                                        state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
+                                        state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(32.0);
+                                        state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0);
+                                        state.ui_dirty = true;
+                                        state.window.request_redraw();
+                                        return;
+                                    }
                                 }
 
-                                let rad_lbl_x0 = rad_minus_x1 + 0.004;
-                                let rad_lbl_x1 = rad_lbl_x0 + 0.070;
-                                let rad_plus_x0 = rad_lbl_x1 + 0.004;
-                                let rad_plus_x1 = rad_plus_x0 + 0.028;
-                                if mx >= rad_plus_x0 && mx <= rad_plus_x1 {
-                                    state.tool_state.brush_radius = (state.tool_state.brush_radius + 1.0).min(32.0);
-                                    state.tool_state.cylinder_height = (state.tool_state.cylinder_height + 1.0).min(32.0);
-                                    state.tool_state.line_radius = (state.tool_state.line_radius + 0.5).min(16.0);
-                                    state.ui_dirty = true;
-                                    state.window.request_redraw();
-                                    return;
-                                }
-
-                                let mode_x0 = rad_plus_x1 + 0.008;
-                                let mode_x1 = mode_x0 + 0.065;
-                                if mx >= mode_x0 && mx <= mode_x1 {
+                                let (mx0, my0, mx1, my1) = get_left_mode_btn_bounds();
+                                if mx >= mx0 && mx <= mx1 && my >= my0 && my <= my1 {
                                     state.tool_state.hollow = !state.tool_state.hollow;
                                     state.ui_dirty = true;
                                     state.window.request_redraw();
@@ -2202,7 +2287,6 @@ impl ApplicationHandler for App {
                                 if mx >= -0.30 && mx <= -0.02 && my >= -0.02 && my <= 0.06 { let _ = state.save_game("world_save.json"); return; }
                                 if mx >= 0.02 && mx <= 0.30 && my >= -0.02 && my <= 0.06 { let _ = state.load_game("world_save.json"); return; }
                                 
-                                // Open background color modal with sliders
                                 if mx >= -0.30 && mx <= 0.30 && my >= -0.19 && my <= -0.11 {
                                     state.set_menu(ActiveMenu::BgColorModal);
                                     return;

@@ -633,6 +633,154 @@ pub fn rasterize_replace(octree: &Octree, center: Vec3, radius: f32, voxel_size:
     deltas
 }
 
+pub fn rasterize_cone(octree: &Octree, base_center: Vec3, radius: f32, height: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let h_vox = (height / voxel_size).ceil() as i32;
+    let r_vox = (radius / voxel_size).ceil() as i32;
+
+    for dy in 0..=h_vox {
+        let curr_y = dy as f32 * voxel_size;
+        let t = (1.0 - (curr_y / height.max(0.001))).clamp(0.0, 1.0);
+        let curr_r = radius * t;
+        let curr_r_sq = curr_r * curr_r;
+        let inner_r = (curr_r - voxel_size).max(0.0);
+        let inner_r_sq = inner_r * inner_r;
+        let is_cap = dy == 0;
+
+        for dx in -r_vox..=r_vox {
+            for dz in -r_vox..=r_vox {
+                let off_xz = Vec3::new(dx as f32, 0.0, dz as f32) * voxel_size;
+                let d_sq = off_xz.length_squared();
+                if d_sq <= curr_r_sq {
+                    let is_wall = d_sq >= inner_r_sq;
+                    if !hollow || is_wall || is_cap {
+                        let p = base_center + Vec3::new(off_xz.x, curr_y, off_xz.z);
+                        let old_mat = octree.query_point(p);
+                        if old_mat != material {
+                            deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_pyramid(octree: &Octree, base_center: Vec3, half_extent: f32, height: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let h_vox = (height / voxel_size).ceil() as i32;
+    let base_cells = (half_extent / voxel_size).ceil() as i32;
+
+    for dy in 0..=h_vox {
+        let curr_y = dy as f32 * voxel_size;
+        let t = (1.0 - (curr_y / height.max(0.001))).clamp(0.0, 1.0);
+        let cur_cells = (base_cells as f32 * t).round() as i32;
+        let is_cap = dy == 0;
+
+        for dx in -cur_cells..=cur_cells {
+            for dz in -cur_cells..=cur_cells {
+                let is_wall = dx.abs() == cur_cells || dz.abs() == cur_cells;
+                if !hollow || is_wall || is_cap {
+                    let p = base_center + Vec3::new(dx as f32 * voxel_size, curr_y, dz as f32 * voxel_size);
+                    let old_mat = octree.query_point(p);
+                    if old_mat != material {
+                        deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                    }
+                }
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_torus(octree: &Octree, center: Vec3, major_r: f32, minor_r: f32, voxel_size: f32, material: u16, hollow: bool) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let outer_vox = ((major_r + minor_r) / voxel_size).ceil() as i32;
+    let min_vox = (minor_r / voxel_size).ceil() as i32;
+    let r_tube_sq = minor_r * minor_r;
+    let inner_tube_r = (minor_r - voxel_size).max(0.0);
+    let inner_tube_r_sq = inner_tube_r * inner_tube_r;
+
+    for dx in -outer_vox..=outer_vox {
+        for dz in -outer_vox..=outer_vox {
+            let off_xz = Vec3::new(dx as f32, 0.0, dz as f32) * voxel_size;
+            let d_plane = off_xz.length();
+            let dist_from_ring = d_plane - major_r;
+
+            for dy in -min_vox..=min_vox {
+                let y = dy as f32 * voxel_size;
+                let d_sq = dist_from_ring * dist_from_ring + y * y;
+                if d_sq <= r_tube_sq {
+                    let is_surface = d_sq >= inner_tube_r_sq;
+                    if !hollow || is_surface {
+                        let p = center + Vec3::new(off_xz.x, y, off_xz.z);
+                        let old_mat = octree.query_point(p);
+                        if old_mat != material {
+                            deltas.push(VoxelDelta { pos: p.to_array(), size: voxel_size, old_material: old_mat, new_material: material });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    deltas
+}
+
+pub fn rasterize_bucket(octree: &Octree, seed_pos: Vec3, voxel_size: f32, new_material: u16, max_voxels: usize) -> Vec<VoxelDelta> {
+    let mut deltas = Vec::new();
+    let target_mat = octree.query_point(seed_pos);
+    if target_mat == 0 || target_mat == new_material {
+        return deltas;
+    }
+
+    let mut visited: HashSet<[i32; 3]> = HashSet::new();
+    let mut queue: std::collections::VecDeque<Vec3> = std::collections::VecDeque::new();
+
+    let start_key = [
+        (seed_pos.x / voxel_size).round() as i32,
+        (seed_pos.y / voxel_size).round() as i32,
+        (seed_pos.z / voxel_size).round() as i32,
+    ];
+    visited.insert(start_key);
+    queue.push_back(seed_pos);
+
+    let offsets = [
+        Vec3::new(voxel_size, 0.0, 0.0), Vec3::new(-voxel_size, 0.0, 0.0),
+        Vec3::new(0.0, voxel_size, 0.0), Vec3::new(0.0, -voxel_size, 0.0),
+        Vec3::new(0.0, 0.0, voxel_size), Vec3::new(0.0, 0.0, -voxel_size),
+    ];
+
+    while let Some(curr) = queue.pop_front() {
+        deltas.push(VoxelDelta {
+            pos: curr.to_array(),
+            size: voxel_size,
+            old_material: target_mat,
+            new_material,
+        });
+
+        if deltas.len() >= max_voxels {
+            break;
+        }
+
+        for off in offsets {
+            let next_p = curr + off;
+            let key = [
+                (next_p.x / voxel_size).round() as i32,
+                (next_p.y / voxel_size).round() as i32,
+                (next_p.z / voxel_size).round() as i32,
+            ];
+            if visited.insert(key) {
+                if octree.query_point(next_p) == target_mat {
+                    queue.push_back(next_p);
+                }
+            }
+        }
+    }
+
+    deltas
+}
+
 pub fn apply_deltas(octree: &mut Octree, deltas: &[VoxelDelta], use_new: bool) {
     if deltas.is_empty() { return; }
 
