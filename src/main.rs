@@ -1744,7 +1744,7 @@ impl ApplicationHandler for App {
                                     state.camera.position = state.orbit_pivot - dir * new_dist;
                                 }
                             } else {
-                                state.camera.yaw -= dx * 3.5;
+                                state.camera.yaw += dx * 3.5;
                                 state.camera.pitch = (state.camera.pitch - dy * 3.5).clamp(-1.56, 1.56);
                                 state.update_orbit_position();
                             }
@@ -1757,7 +1757,7 @@ impl ApplicationHandler for App {
                         let dy = my - state.prev_cursor_pos[1];
                         if dx.abs() > 0.0005 || dy.abs() > 0.0005 {
                             state.gimbal_drag_moved = true;
-                            state.camera.yaw -= dx * 3.8;
+                            state.camera.yaw += dx * 3.8;
                             state.camera.pitch = (state.camera.pitch - dy * 3.8).clamp(-1.56, 1.56);
                             state.update_orbit_position();
                             state.ui_dirty = true;
